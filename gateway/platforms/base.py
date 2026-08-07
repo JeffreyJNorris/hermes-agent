@@ -2260,6 +2260,7 @@ SEND_ERROR_KINDS = frozenset(
         "not_found",
         "rate_limited",
         "transient",
+        "unsupported",  # HERMES_INTERACTIVE_PROMPTS_V1_BASE
         "unknown",
     }
 )
@@ -3776,6 +3777,31 @@ class BasePlatformAdapter(ABC):
         route the callback (e.g. Telegram's ``_approval_state`` dict).
         """
         return SendResult(success=False, error="Not supported")
+
+    async def send_interactive_prompt(
+        self,
+        chat_id: str,
+        prompt: "InteractivePrompt",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Deliver a registered finite-choice prompt using native controls.
+
+        This phase-one extension is optional and intentionally non-abstract so
+        existing adapters remain source-compatible.  ``success=True`` means the
+        provider send completed and MUST include ``message_id``.  Implementations
+        render controls only; prompt state, validation, authorization scope,
+        replay protection, timeout, and resolution belong to
+        :mod:`gateway.interactive`.
+
+        Adapters must fail rather than silently remove options.  Unsupported
+        transports return the standard explicit optional-feature result below;
+        the gateway may then reserve and deliver the serialized text fallback.
+        """
+        return SendResult(
+            success=False,
+            error="Interactive prompts are not supported",
+            error_kind="unsupported",
+        )
 
     async def send_clarify(
         self,
@@ -5651,6 +5677,53 @@ class BasePlatformAdapter(ABC):
                 except Exception as e:
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
                 return
+
+            # Generic interactive text-fallback bypass.  Explicit bypass
+            # commands above retain first refusal.  When a domain tool is
+            # blocked on the registry waiter, a non-command reply must reach
+            # the gateway interceptor instead of being queued behind that same
+            # blocked turn.  Unrecognized conversational text is not consumed:
+            # the gateway interceptor returns None and normal busy handling
+            # continues inside the runner.
+            if not cmd:
+                try:
+                    from gateway.interactive import has_active_text_fallback
+                    _has_interactive_text_fallback = has_active_text_fallback(session_key)
+                except Exception:
+                    _has_interactive_text_fallback = False
+
+                if _has_interactive_text_fallback:
+                    logger.debug(
+                        "[%s] Routing message to interactive text fallback for %s",
+                        self.name,
+                        session_key,
+                    )
+                    try:
+                        _thread_meta = _thread_metadata_for_source(
+                            event.source, _reply_anchor_for_event(event)
+                        )
+                        response = await self._message_handler(event)
+                        _text, _eph_ttl = self._unwrap_ephemeral(response)
+                        if _text:
+                            _r = await self._send_with_retry(
+                                chat_id=event.source.chat_id,
+                                content=_text,
+                                reply_to=_reply_anchor_for_event(event),
+                                metadata=_mark_notify_metadata(_thread_meta),
+                            )
+                            if _eph_ttl > 0 and _r.success and _r.message_id:
+                                self._schedule_ephemeral_delete(
+                                    chat_id=event.source.chat_id,
+                                    message_id=_r.message_id,
+                                    ttl_seconds=_eph_ttl,
+                                )
+                    except Exception as exc:
+                        logger.error(
+                            "[%s] Interactive text-fallback dispatch failed (%s)",
+                            self.name,
+                            type(exc).__name__,
+                        )
+                    return
 
             # Clarify reply bypass: if the agent is blocked on a
             # clarify_tool call, the next non-command message in this

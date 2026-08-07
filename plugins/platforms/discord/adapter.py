@@ -165,6 +165,17 @@ from gateway.platforms.base import (
     validate_inbound_media_size,
 )
 from tools.url_safety import is_safe_url
+from gateway.interactive import (  # HERMES_INTERACTIVE_PROMPTS_V1_DISCORD
+    InteractivePrompt,
+    MAX_PROMPT_OPTIONS,
+    PromptStyle,
+    ResolveStatus,
+    expire_prompt,
+    make_component_id,
+    remaining_prompt_seconds,
+    render_native_prompt_content,
+    resolve_prompt,
+)
 
 
 async def _read_url_image_with_redirect_guard(
@@ -7154,6 +7165,74 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             return SendResult(success=False, error=str(e))
 
+    async def send_interactive_prompt(
+        self,
+        chat_id: str,
+        prompt: InteractivePrompt,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render a registered prompt as Discord buttons and return its message ID."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(success=False, error="Not connected")
+        if not isinstance(prompt, InteractivePrompt):
+            return SendResult(
+                success=False,
+                error="Invalid interactive prompt",
+                error_kind="bad_format",
+            )
+        if not prompt.options or len(prompt.options) > MAX_PROMPT_OPTIONS:
+            return SendResult(
+                success=False,
+                error="Unsupported interactive prompt option count",
+                error_kind="bad_format",
+            )
+
+        try:
+            target_id = (
+                metadata.get("thread_id")
+                if metadata and metadata.get("thread_id")
+                else chat_id
+            )
+            channel = self._client.get_channel(int(target_id))
+            if channel is None:
+                channel = await self._client.fetch_channel(int(target_id))
+            if channel is None:
+                return SendResult(
+                    success=False,
+                    error="Channel not found",
+                    error_kind="not_found",
+                )
+
+            content = render_native_prompt_content(prompt)
+            if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
+                return SendResult(
+                    success=False,
+                    error="Interactive prompt exceeds Discord message limit",
+                    error_kind="too_long",
+                )
+            view = InteractivePromptView(
+                prompt=prompt,
+                allowed_user_ids=self._allowed_user_ids,
+                allowed_role_ids=self._allowed_role_ids,
+            )
+            message = await channel.send(
+                content=content,
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            view._message = message
+            return SendResult(success=True, message_id=str(message.id))
+        except Exception as exc:
+            logger.warning(
+                "[%s] send_interactive_prompt failed (%s)",
+                self.name,
+                type(exc).__name__,
+            )
+            return SendResult(
+                success=False,
+                error="Discord interactive prompt delivery failed",
+            )
+
     async def send_clarify(
         self,
         chat_id: str,
@@ -7166,7 +7245,7 @@ class DiscordAdapter(BasePlatformAdapter):
         """Render a clarify prompt with one Discord button per choice.
 
         Multi-choice mode (``choices`` non-empty): renders a button per option
-        plus a final "✏️ Other (type answer)" button. Picking "Other" flips
+        plus a final "Other (type answer)" button. Picking "Other" flips
         the clarify entry into text-capture mode so the next user message in
         the session becomes the response. Numeric clicks resolve immediately
         via ``resolve_gateway_clarify(clarify_id, choice_text)``.
@@ -7245,7 +7324,7 @@ class DiscordAdapter(BasePlatformAdapter):
             if clean_choices:
                 embed.add_field(
                     name="Choices",
-                    value="Pick one below, or click ✏️ Other to type a custom answer.",
+                    value="Pick one below, or click Other to type a custom answer.",
                     inline=False,
                 )
                 view = ClarifyChoiceView(
@@ -7262,18 +7341,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 )
                 view = None
 
-            # Mirror the question in plain content — embeds are invisible on
-            # some clients (see send_exec_approval).
-            clarify_tail = (
-                "\n\nPick one below, or click ✏️ Other to type a custom answer."
-                if clean_choices
-                else "\n\nReply in this channel with your answer."
+            # Keep the clarify prompt in one visual representation. Sending
+            # the same question as both ordinary content and an embed makes
+            # Discord render the prompt twice above the buttons.
+            msg = (
+                await channel.send(embed=embed, view=view)
+                if view
+                else await channel.send(embed=embed)
             )
-            content = self._self_contained_prompt_content(
-                "❓ **Hermes needs your input**", str(question or "").strip(),
-                tail=clarify_tail,
-            )
-            msg = await channel.send(content=content, embed=embed, view=view) if view else await channel.send(content=content, embed=embed)
             if view:
                 view._message = msg  # store for on_timeout expiration editing
             return SendResult(success=True, message_id=str(msg.id))
@@ -8336,8 +8411,156 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+    global InteractivePromptView, ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
 
+    class InteractivePromptView(discord.ui.View):
+        """One-shot presentation of authoritative registry prompt state."""
+
+        def __init__(
+            self,
+            prompt: InteractivePrompt,
+            allowed_user_ids: set,
+            allowed_role_ids: Optional[set] = None,
+        ):
+            remaining = remaining_prompt_seconds(prompt.prompt_id)
+            timeout = prompt.timeout_seconds if remaining is None else remaining
+            super().__init__(timeout=max(0.001, float(timeout)))
+            self.prompt_id = prompt.prompt_id
+            self.allowed_user_ids = allowed_user_ids
+            self.allowed_role_ids = allowed_role_ids or set()
+            self._message = None
+
+            if len(prompt.options) > MAX_PROMPT_OPTIONS:
+                raise ValueError("interactive prompt has too many options")
+            for slot, option in enumerate(prompt.options, 1):
+                custom_id = make_component_id(prompt.prompt_id, slot)
+                style = {
+                    PromptStyle.PRIMARY: discord.ButtonStyle.primary,
+                    PromptStyle.SECONDARY: discord.ButtonStyle.secondary,
+                    PromptStyle.SUCCESS: discord.ButtonStyle.success,
+                    PromptStyle.DANGER: discord.ButtonStyle.danger,
+                }.get(option.style, discord.ButtonStyle.secondary)
+                button = discord.ui.Button(
+                    label=_truncate_discord_component_text(
+                        option.label,
+                        _DISCORD_BUTTON_LABEL_LIMIT,
+                    ),
+                    style=style,
+                    custom_id=custom_id,
+                )
+
+                async def _callback(interaction, _slot=str(slot)):
+                    await self._resolve(interaction, _slot)
+
+                button.callback = _callback
+                self.add_item(button)
+
+        async def _respond_ephemeral(self, interaction, message: str) -> None:
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(message, ephemeral=True)
+                else:
+                    await interaction.response.send_message(message, ephemeral=True)
+            except Exception as exc:
+                logger.debug(
+                    "Interactive prompt stale-response acknowledgement failed (%s)",
+                    type(exc).__name__,
+                    extra={
+                        "prompt_id": self.prompt_id,
+                        "exception_class": type(exc).__name__,
+                    },
+                )
+
+        async def _resolve(self, interaction: discord.Interaction, slot: str) -> None:
+            # General Hermes component authorization is always the first check.
+            if not _component_check_auth(
+                interaction,
+                self.allowed_user_ids,
+                self.allowed_role_ids,
+            ):
+                await self._respond_ephemeral(
+                    interaction,
+                    "You are not authorized to use this control.",
+                )
+                return
+
+            # Read only actual provider metadata.  Parent/thread claims from a
+            # callback payload are never trusted.
+            channel_id = getattr(interaction, "channel_id", None)
+            message = getattr(interaction, "message", None)
+            message_id = getattr(message, "id", None)
+            actor = getattr(interaction, "user", None)
+            actor_id = getattr(actor, "id", None)
+
+            result = resolve_prompt(
+                prompt_id=self.prompt_id,
+                option_token=slot,
+                platform="discord",
+                channel_id=str(channel_id) if channel_id is not None else "",
+                message_id=str(message_id) if message_id is not None else None,
+                actor_id=str(actor_id) if actor_id is not None else None,
+                source="native",
+            )
+            if result.status is ResolveStatus.RESOLVED:
+                # Record first, present second.  Editing is deliberately best
+                # effort and can never reopen or erase the stored decision.
+                for child in self.children:
+                    child.disabled = True
+                self.stop()
+                try:
+                    await interaction.response.edit_message(view=self)
+                except Exception as exc:
+                    logger.debug(
+                        "Interactive prompt resolved but Discord edit failed (%s)",
+                        type(exc).__name__,
+                        extra={
+                            "prompt_id": self.prompt_id,
+                            "exception_class": type(exc).__name__,
+                        },
+                    )
+                    try:
+                        if not interaction.response.is_done():
+                            await interaction.response.defer()
+                    except Exception:
+                        pass
+                return
+
+            stale_messages = {
+                ResolveStatus.ALREADY_RESOLVED: "This prompt was already answered.",
+                ResolveStatus.EXPIRED: "This prompt has expired.",
+                ResolveStatus.CANCELLED: "This prompt is no longer active.",
+                ResolveStatus.NOT_DELIVERED: "This prompt is not ready yet.",
+                ResolveStatus.WRONG_DELIVERY_MODE: "This prompt moved to text reply mode.",
+                ResolveStatus.SCOPE_MISMATCH: "This interaction does not match the prompt.",
+                ResolveStatus.INVALID_OPTION: "That option is invalid.",
+                ResolveStatus.NOT_FOUND: "This prompt is unknown or no longer available.",
+            }
+            await self._respond_ephemeral(
+                interaction,
+                stale_messages.get(result.status, "This prompt cannot be answered."),
+            )
+
+        async def on_timeout(self):
+            # The registry deadline is authoritative.  Do nothing destructive
+            # when another path already resolved or cancelled the prompt.
+            if not expire_prompt(self.prompt_id):
+                return
+            for child in self.children:
+                child.disabled = True
+            self.stop()
+            message = self._message
+            if message is not None:
+                try:
+                    await message.edit(view=self)
+                except Exception as exc:
+                    logger.debug(
+                        "Interactive prompt expired but Discord edit failed (%s)",
+                        type(exc).__name__,
+                        extra={
+                            "prompt_id": self.prompt_id,
+                            "exception_class": type(exc).__name__,
+                        },
+                    )
     class ExecApprovalView(discord.ui.View):
         """
         Interactive button view for exec approval of dangerous commands.
@@ -9136,7 +9359,7 @@ def _define_discord_view_classes() -> None:
     class ClarifyChoiceView(discord.ui.View):
         """Interactive button view for the clarify tool's multiple-choice prompts.
 
-        Renders one button per choice (max 24) plus a final ``✏️ Other`` button.
+        Renders one button per choice (max 24) plus a final ``Other`` button.
         Picking a numeric choice resolves the gateway clarify entry immediately;
         picking ``Other`` flips the entry into text-capture mode so the next
         user message in the session becomes the response (the gateway's
@@ -9214,7 +9437,7 @@ def _define_discord_view_classes() -> None:
                 self.add_item(button)
 
             other_btn = discord.ui.Button(
-                label="✏️ Other (type answer)",
+                label="Other (type answer)",
                 style=discord.ButtonStyle.secondary,
                 custom_id=f"clarify:{clarify_id}:other",
             )
@@ -9353,6 +9576,24 @@ def _define_discord_view_classes() -> None:
                     pass
 
         async def on_timeout(self):
+            # A choice or typed response may have completed while the view's
+            # lifetime timer was still running. Never overwrite that final
+            # state with an expiry message.
+            if self.resolved:
+                return
+
+            # The UI timeout must also release the agent-side clarify wait.
+            # Without this, Discord disables the controls while the worker
+            # remains blocked until the separate gateway timeout expires.
+            try:
+                from tools.clarify_gateway import resolve_gateway_clarify
+                resolve_gateway_clarify(self.clarify_id, "")
+            except Exception:
+                logger.debug(
+                    "Discord clarify timeout resolution failed for %s",
+                    self.clarify_id,
+                    exc_info=True,
+                )
             self.resolved = True
             for child in self.children:
                 child.disabled = True

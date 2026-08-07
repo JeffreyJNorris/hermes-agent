@@ -2258,6 +2258,17 @@ from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
+from gateway.interactive import (  # HERMES_INTERACTIVE_PROMPTS_V1_RUN
+    PromptOutcome,
+    PromptOutcomeStatus,
+    PromptScope,
+    ResolveStatus,
+    clear_all_interactive_prompts,
+    clear_interactive_platform,
+    clear_interactive_session,
+    resolve_text_fallback_for_session,
+)
+from gateway.interactive_bridge import InteractivePromptBridge
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
@@ -4950,6 +4961,70 @@ class TurnRunner:
 
         agent.clarify_callback = _clarify_callback_sync
 
+        # Provider-neutral finite-choice callback.  Scope is derived exclusively
+        # from the active inbound request; domain tools cannot supply or weaken it.
+        def _interactive_prompt_callback_sync(prompt):
+            if ctx._status_adapter is None or ctx._loop_for_step is None:
+                return PromptOutcome(
+                    PromptOutcomeStatus.UNSUPPORTED,
+                    reason="gateway_context_unavailable",
+                )
+
+            _session_key = str(ctx.session_key or "")
+            _platform = str(ctx.source.platform.value)
+            _chat_id = str(ctx.source.chat_id or "")
+            if not _session_key or not _platform or not _chat_id:
+                return PromptOutcome(
+                    PromptOutcomeStatus.UNSUPPORTED,
+                    reason="trusted_scope_unavailable",
+                )
+
+            _thread_id = (
+                str(ctx.source.thread_id)
+                if ctx.source.thread_id is not None
+                else None
+            )
+            _actor_id = (
+                str(ctx.source.user_id)
+                if ctx.source.user_id is not None
+                else None
+            )
+            _scope = PromptScope(
+                session_key=_session_key,
+                platform=_platform,
+                chat_id=_chat_id,
+                thread_id=_thread_id,
+                # Secure default: only the initiating actor may answer.  A
+                # broader operator policy requires an explicit trusted gateway
+                # decision in a future caller contract.
+                expected_actor_id=_actor_id,
+            )
+
+            async def _send_interactive_text_fallback(
+                chat_id: str,
+                content: str,
+                metadata: dict | None,
+            ):
+                return await ctx._status_adapter.send(
+                    chat_id=chat_id,
+                    content=content,
+                    metadata=metadata,
+                )
+
+            _bridge = InteractivePromptBridge(
+                adapter=ctx._status_adapter,
+                scope=_scope,
+                event_loop=ctx._loop_for_step,
+                metadata=ctx._status_thread_metadata,
+                fallback_sender=_send_interactive_text_fallback,
+            )
+            return _bridge.request_sync(prompt)
+
+        # Cached agents receive a fresh callback every turn.  Tools should use
+        # tools.interactive_prompt_context.require_interactive_prompt_callback()
+        # instead of depending on this attribute directly.
+        agent.interactive_prompt_callback = _interactive_prompt_callback_sync
+
         # Show assistant thinking between tool calls — independent of
         # tool_progress mode. Mattermost needs an explicit per-platform
         # opt-in so global scratch-text display does not leak into threads.
@@ -5264,6 +5339,13 @@ class TurnRunner:
 
         _approval_session_key = ctx.session_key or ""
         _approval_session_token = set_current_session_key(_approval_session_key)
+        from tools.interactive_prompt_context import (
+            bind_interactive_prompt_callback as _bind_interactive_prompt_callback,
+            reset_interactive_prompt_callback as _reset_interactive_prompt_callback,
+        )
+        _interactive_prompt_token = _bind_interactive_prompt_callback(
+            _interactive_prompt_callback_sync
+        )
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
         try:
             # If _prepare_inbound_message_text buffered image paths for native
@@ -5324,6 +5406,7 @@ class TurnRunner:
                 _clear_clarify_session(_approval_session_key)
             except Exception:
                 pass
+            _reset_interactive_prompt_callback(_interactive_prompt_token)
             reset_current_session_key(_approval_session_token)
         ctx.result_holder[0] = result
 
@@ -7205,6 +7288,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # A half-closed transport can wedge an adapter's native close()
             # indefinitely. Reuse the shutdown-path timeout so this runtime
             # fatal handler always reaches the reconnect queue.
+            clear_interactive_platform(str(adapter.platform.value))
             await self._safe_adapter_disconnect(adapter, adapter.platform)
 
         # Queue retryable failures for background reconnection
@@ -12681,6 +12765,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             self._running = False
             self._draining = True
+            # Cancel registry waiters before draining worker turns.
+            clear_all_interactive_prompts()
 
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):
@@ -13452,6 +13538,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return
         profile_map.pop(platform, None)
+        clear_interactive_platform(str(platform.value))
         await self._safe_adapter_disconnect(adapter, platform)
         if not self._running:
             return
@@ -14463,6 +14550,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         e,
                     )
                 _up_state.persistent.update_prompt_pending = False
+
+        # Generic finite-choice text fallback.  Explicit command routes have
+        # already had first refusal; the parser itself also ignores slash/bang
+        # command syntax.  Unrelated conversation returns None and continues to
+        # clarify or normal dispatch instead of being captured.
+        try:
+            _interactive_result = resolve_text_fallback_for_session(
+                session_key=_quick_key,
+                text=event.text or "",
+                platform=str(source.platform.value),
+                channel_id=str(source.thread_id or source.chat_id or ""),
+                actor_id=(
+                    str(source.user_id)
+                    if source.user_id is not None
+                    else None
+                ),
+            )
+        except Exception as exc:
+            logger.error(
+                "Interactive prompt text interception failed (%s)",
+                type(exc).__name__,
+                extra={
+                    "platform": str(source.platform.value),
+                    "exception_class": type(exc).__name__,
+                },
+            )
+            _interactive_result = None
+
+        if _interactive_result is not None:
+            if _interactive_result.status is ResolveStatus.RESOLVED:
+                # The waiting domain operation will produce the next user-facing
+                # response.  Do not double-post an acknowledgement here.
+                return ""
+            if _interactive_result.status is ResolveStatus.INVALID_OPTION:
+                return "That selection is not valid. Reply with one of the numbered options."
+            if _interactive_result.status is ResolveStatus.EXPIRED:
+                return "That prompt has expired."
+            if _interactive_result.status is ResolveStatus.CANCELLED:
+                return "That prompt is no longer active."
+            if _interactive_result.status is ResolveStatus.WRONG_DELIVERY_MODE:
+                return "That prompt must be answered using its active controls."
+            if _interactive_result.status is ResolveStatus.NOT_DELIVERED:
+                return "That prompt is not ready for a response yet."
+            if _interactive_result.status is ResolveStatus.SCOPE_MISMATCH:
+                return "That interaction cannot answer this prompt."
+            if _interactive_result.status is ResolveStatus.ALREADY_RESOLVED:
+                return "That prompt was already answered."
+            return "That prompt is unknown or no longer available."
 
         # Intercept messages that are responses to a pending clarify.
         # Open-ended prompts and "Other" responses are captured as free text;
@@ -22715,6 +22850,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Clear per-session control state that must not survive a boundary switch."""
         if not session_key:
             return
+
+        try:
+            clear_interactive_session(session_key)
+        except Exception as exc:
+            logger.error(
+                "Failed to clear interactive prompt state for session boundary (%s)",
+                type(exc).__name__,
+                extra={
+                    "session_key": session_key,
+                    "exception_class": type(exc).__name__,
+                },
+            )
 
         pending_skills_reload_notes = getattr(
             self, "_pending_skills_reload_notes", None
