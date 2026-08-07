@@ -1,9 +1,11 @@
 """Gateway-owned delivery bridge for provider-neutral interactive prompts.
 
 Domain tools call :meth:`InteractivePromptBridge.request_sync` from their worker
-thread and receive a terminal :class:`~gateway.interactive.PromptOutcome`.
-Adapters only render the registered prompt and report provider metadata; all
-state and decision validity remain in :mod:`gateway.interactive`.
+thread. Gateway-owned asynchronous code uses
+:meth:`InteractivePromptBridge.request_async`. Both paths return a terminal
+:class:`~gateway.interactive.PromptOutcome`. Adapters only render the
+registered prompt and report provider metadata; all state and decision
+validity remain in :mod:`gateway.interactive`.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Protocol
 
+from agent.async_utils import consume_detached_task_result
 from gateway.interactive import (
     InteractivePromptSpec,
     PromptHandle,
@@ -180,48 +183,62 @@ class InteractivePromptBridge:
         *,
         resolver: Callable[[PromptResponse], None] | None = None,
     ) -> PromptOutcome:
-        """Private non-blocking bridge for gateway-owned async callers."""
+        """Non-blocking bridge for gateway-owned asynchronous callers.
+
+        Cancelling the caller cancels only this prompt and re-raises
+        ``CancelledError``. A response that already resolved remains
+        authoritative.
+        """
+        if asyncio.get_running_loop() is not self._event_loop:
+            raise RuntimeError(
+                "interactive prompt async request must run on the gateway event loop"
+            )
         handle = register_prompt(prompt, scope=self._scope, resolver=resolver)
+        prompt_id = handle.prompt.prompt_id
         remaining = max(0.0, handle.deadline - time.monotonic())
         delivery_task = asyncio.create_task(self._deliver_registered(handle))
-        done, _pending = await asyncio.wait({delivery_task}, timeout=remaining)
-        if delivery_task not in done:
-            delivery_task.cancel()
-            # Consume cancellation without turning it into an infrastructure
-            # failure or leaking a "Task exception was never retrieved" warning.
-            try:
-                await delivery_task
-            except asyncio.CancelledError:
-                pass
-            expire_prompt(handle.prompt.prompt_id)
-            return await asyncio.to_thread(wait_for_prompt, handle)
-
         try:
-            decision = delivery_task.result()
-        except Exception as exc:
-            if cancel_prompt(
-                handle.prompt.prompt_id,
-                reason="delivery_bridge_failed",
-            ):
-                logger.error(
-                    "Interactive prompt async delivery bridge failed (%s)",
-                    type(exc).__name__,
-                    extra={
-                        "prompt_id": handle.prompt.prompt_id,
-                        "platform": self._scope.platform,
-                        "exception_class": type(exc).__name__,
-                    },
-                )
-                return PromptOutcome(
-                    PromptOutcomeStatus.DELIVERY_FAILED,
-                    reason="delivery_bridge_failed",
-                )
-            return await asyncio.to_thread(wait_for_prompt, handle)
+            done, _pending = await asyncio.wait({delivery_task}, timeout=remaining)
+            if delivery_task not in done:
+                delivery_task.cancel()
+                delivery_task.add_done_callback(consume_detached_task_result)
+                expire_prompt(prompt_id)
+                return await asyncio.to_thread(wait_for_prompt, handle)
 
-        if not decision.wait_for_resolution:
-            assert decision.outcome is not None
-            return decision.outcome
-        return await asyncio.to_thread(wait_for_prompt, handle)
+            try:
+                decision = delivery_task.result()
+            except Exception as exc:
+                if cancel_prompt(
+                    prompt_id,
+                    reason="delivery_bridge_failed",
+                ):
+                    logger.error(
+                        "Interactive prompt async delivery bridge failed (%s)",
+                        type(exc).__name__,
+                        extra={
+                            "prompt_id": prompt_id,
+                            "platform": self._scope.platform,
+                            "exception_class": type(exc).__name__,
+                        },
+                    )
+                    return PromptOutcome(
+                        PromptOutcomeStatus.DELIVERY_FAILED,
+                        reason="delivery_bridge_failed",
+                    )
+                return await asyncio.to_thread(wait_for_prompt, handle)
+
+            if not decision.wait_for_resolution:
+                assert decision.outcome is not None
+                return decision.outcome
+            return await asyncio.to_thread(wait_for_prompt, handle)
+        except asyncio.CancelledError:
+            # Registry state is authoritative. If a valid response won this race,
+            # cancel_prompt() is a no-op and the recorded decision stays terminal.
+            cancel_prompt(prompt_id, reason="async_request_cancelled")
+            if not delivery_task.done():
+                delivery_task.cancel()
+            delivery_task.add_done_callback(consume_detached_task_result)
+            raise
 
     def _assert_not_event_loop_thread(self) -> None:
         if (

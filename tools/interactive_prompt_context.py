@@ -2,6 +2,8 @@
 
 The callback is deliberately context-bound. A domain tool outside an active
 gateway request cannot reach provider adapters or prompt registry internals.
+Common typed choice and confirmation helpers live in
+``gateway.interactive_decisions``.
 """
 
 from __future__ import annotations
