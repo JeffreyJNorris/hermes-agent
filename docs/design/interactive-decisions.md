@@ -79,6 +79,43 @@ transport, and delivery failure. `destructive=True` changes only the visual
 style of the affirmative option; trusted actor and delivery scope continue to come
 from the gateway.
 
+## Model-facing finite choices
+
+The Discord agent exposes the provider-neutral primitive through the
+`request_decision` tool. The model supplies only display text and the complete
+set of two to five labels:
+
+```json
+{
+  "title": "Choose deployment target",
+  "question": "Which reviewed environment should I deploy to?",
+  "options": ["Staging", "Production", "Cancel"]
+}
+```
+
+The tool fixes the prompt kind and timeout and does not accept actor, platform,
+channel, message, option identifier, style, or delivery-mode fields. The
+gateway derives all trusted scope from the active request.
+
+A selection returns a one-based index and the full canonical label:
+
+```json
+{
+  "status": "selected",
+  "selected_index": 2,
+  "selected_label": "Production"
+}
+```
+
+Expiry, cancellation, unsupported delivery, and delivery failure are normal
+status results. Invalid arguments or use outside an active gateway request use
+the standard `{"error": "..."}` tool envelope. Prompt, message, channel, actor,
+and internal option identifiers are never returned.
+
+Use `clarify` instead when the answer may be open-ended, outside the offered
+choices, or multi-select. `request_decision` is not an alternative to terminal,
+execution, slash-command, or other security approval flows.
+
 ## Callback availability
 
 The synchronous helpers use the callback bound to the active gateway turn.

@@ -262,6 +262,12 @@ TOOLSETS = {
         "tools": ["clarify"],
         "includes": []
     },
+
+    "decision": {
+        "description": "Request one closed finite-choice decision from the active user",
+        "tools": ["request_decision"],
+        "includes": []
+    },
     
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
@@ -485,6 +491,7 @@ TOOLSETS = {
     "hermes-discord": {
         "description": "Discord bot toolset - full access (terminal has safety checks via dangerous command approval)",
         "tools": _HERMES_CORE_TOOLS + [
+            "request_decision",
             "discord",
             "discord_admin",
         ],
