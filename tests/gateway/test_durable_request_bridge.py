@@ -1,0 +1,335 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+import gateway.durable_request_bridge as bridge_module
+from gateway.durable_request_bridge import DurableRequestBridge
+from gateway.durable_requests import (
+    DurableRequestOption,
+    DurableRequestSpec,
+    DurableRequestStatus,
+    DurableRequestStore,
+    DurableRequestTarget,
+    DurableRequestsConfig,
+    DurableResponderMode,
+)
+from gateway.platforms.base import SendResult
+
+
+class Adapter:
+    def __init__(
+        self,
+        *,
+        send_result: SendResult | None = None,
+        restore_result: SendResult | None = None,
+        send_error: Exception | None = None,
+    ) -> None:
+        self.send_result = send_result or SendResult(success=True, message_id="m1")
+        self.restore_result = restore_result or SendResult(success=True, message_id="m1")
+        self.send_error = send_error
+        self.sent = []
+        self.restored = []
+
+    async def send_durable_request(self, chat_id, request, metadata=None):
+        self.sent.append((chat_id, request, metadata))
+        if self.send_error is not None:
+            raise self.send_error
+        return self.send_result
+
+    async def restore_durable_request(self, request):
+        self.restored.append(request)
+        return self.restore_result
+
+
+def _config() -> DurableRequestsConfig:
+    return DurableRequestsConfig(
+        enabled=True,
+        target=DurableRequestTarget("discord", "chat"),
+        default_ttl_seconds=86400,
+        max_ttl_seconds=604800,
+        terminal_retention_seconds=604800,
+        scheduled_responder_mode=DurableResponderMode.ANY_AUTHORIZED,
+    )
+
+
+def _create(store: DurableRequestStore, reference: str = "ref"):
+    return store.create(
+        DurableRequestSpec(
+            kind="test",
+            title="Choose",
+            body="Choose one.",
+            options=(
+                DurableRequestOption("a", "First"),
+                DurableRequestOption("b", "Second"),
+            ),
+            ttl_seconds=3600,
+            reference=reference,
+        ),
+        target=DurableRequestTarget("discord", "chat", "thread"),
+        responder_mode=DurableResponderMode.ANY_AUTHORIZED,
+        expected_actor_id=None,
+        origin_type="cron",
+        origin_id="job",
+    ).request
+
+
+@pytest.fixture
+def store(tmp_path: Path, monkeypatch) -> DurableRequestStore:
+    value = DurableRequestStore(tmp_path / "state.db")
+    monkeypatch.setattr(bridge_module, "get_durable_request_store", lambda: value)
+    monkeypatch.setattr(bridge_module, "load_durable_requests_config", _config)
+    return value
+
+
+@pytest.mark.asyncio
+async def test_successful_delivery_binds_exact_message_before_restore(
+    store: DurableRequestStore,
+) -> None:
+    request = _create(store)
+    adapter = Adapter(send_result=SendResult(success=True, message_id="message-7"))
+    bridge = DurableRequestBridge()
+
+    await bridge.process_once({"discord": adapter})
+    persisted = store.get(request_id=request.request_id)
+    await bridge.process_once({"discord": adapter})
+
+    assert persisted is not None
+    assert persisted.status is DurableRequestStatus.OPEN
+    assert persisted.message_id == "message-7"
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0][0] == "chat"
+    assert adapter.sent[0][2] == {"thread_id": "thread"}
+    assert adapter.restored == []
+
+
+@pytest.mark.asyncio
+async def test_new_bridge_restores_bound_view_after_restart(
+    store: DurableRequestStore,
+) -> None:
+    request = _create(store)
+    first = Adapter(send_result=SendResult(success=True, message_id="message-7"))
+    await DurableRequestBridge().process_once({"discord": first})
+
+    restarted_adapter = Adapter(
+        restore_result=SendResult(success=True, message_id="message-7")
+    )
+    await DurableRequestBridge().process_once({"discord": restarted_adapter})
+
+    assert [row.request_id for row in restarted_adapter.restored] == [
+        request.request_id
+    ]
+    assert restarted_adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_missing_message_id_is_delivery_unknown(store: DurableRequestStore) -> None:
+    request = _create(store)
+    adapter = Adapter(send_result=SendResult(success=True))
+
+    await DurableRequestBridge().process_once({"discord": adapter})
+    persisted = store.get(request_id=request.request_id)
+
+    assert persisted is not None
+    assert persisted.status is DurableRequestStatus.DELIVERY_UNKNOWN
+    assert persisted.terminal_reason == "missing_message_id"
+
+
+@pytest.mark.asyncio
+async def test_raised_provider_send_is_delivery_unknown(store: DurableRequestStore) -> None:
+    request = _create(store)
+    adapter = Adapter(send_error=RuntimeError("socket closed after send"))
+
+    await DurableRequestBridge().process_once({"discord": adapter})
+    persisted = store.get(request_id=request.request_id)
+
+    assert persisted is not None
+    assert persisted.status is DurableRequestStatus.DELIVERY_UNKNOWN
+    assert persisted.terminal_reason == "provider_send_outcome_unknown"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("result", "status"),
+    [
+        (
+            SendResult(
+                success=False,
+                error="unsupported",
+                error_kind="unsupported",
+            ),
+            DurableRequestStatus.UNSUPPORTED,
+        ),
+        (
+            SendResult(
+                success=False,
+                error="forbidden",
+                error_kind="forbidden",
+            ),
+            DurableRequestStatus.DELIVERY_FAILED,
+        ),
+        (
+            SendResult(
+                success=False,
+                error="ambiguous",
+                error_kind="delivery_unknown",
+            ),
+            DurableRequestStatus.DELIVERY_UNKNOWN,
+        ),
+    ],
+)
+async def test_explicit_delivery_results_map_to_terminal_status(
+    store: DurableRequestStore,
+    result: SendResult,
+    status: DurableRequestStatus,
+) -> None:
+    request = _create(store)
+
+    await DurableRequestBridge().process_once(
+        {"discord": Adapter(send_result=result)}
+    )
+
+    assert store.get(request_id=request.request_id).status is status
+
+
+@pytest.mark.asyncio
+async def test_permanently_missing_open_message_is_failed(
+    store: DurableRequestStore,
+) -> None:
+    request = _create(store)
+    await DurableRequestBridge().process_once(
+        {"discord": Adapter(send_result=SendResult(success=True, message_id="m"))}
+    )
+    restarted = Adapter(
+        restore_result=SendResult(
+            success=False,
+            error="Unknown Message",
+            error_kind="not_found",
+        )
+    )
+
+    await DurableRequestBridge().process_once({"discord": restarted})
+    persisted = store.get(request_id=request.request_id)
+
+    assert persisted.status is DurableRequestStatus.DELIVERY_FAILED
+    assert persisted.terminal_reason == "provider_message_missing"
+
+
+@pytest.mark.asyncio
+async def test_terminal_bound_request_is_restored_for_accurate_stale_clicks(
+    store: DurableRequestStore,
+) -> None:
+    request = _create(store)
+    await DurableRequestBridge().process_once(
+        {"discord": Adapter(send_result=SendResult(success=True, message_id="m"))}
+    )
+    store.cancel(
+        origin_type="cron",
+        origin_id="job",
+        request_id=request.request_id,
+    )
+    restarted = Adapter(restore_result=SendResult(success=True, message_id="m"))
+
+    await DurableRequestBridge().process_once({"discord": restarted})
+
+    assert len(restarted.restored) == 1
+    assert restarted.restored[0].status is DurableRequestStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_no_adapter_leaves_pending_request_unclaimed(
+    store: DurableRequestStore,
+) -> None:
+    request = _create(store)
+
+    await DurableRequestBridge().process_once({})
+    persisted = store.get(request_id=request.request_id)
+
+    assert persisted.status is DurableRequestStatus.PENDING_DELIVERY
+    assert persisted.delivery_claim is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_kind", ["transient", "rate_limited"])
+async def test_safe_pre_send_failure_is_requeued_without_tight_retry(
+    store: DurableRequestStore,
+    error_kind: str,
+) -> None:
+    request = _create(store)
+    adapter = Adapter(
+        send_result=SendResult(
+            success=False,
+            error="temporarily unavailable",
+            error_kind=error_kind,
+        )
+    )
+
+    await DurableRequestBridge().process_once({"discord": adapter})
+    persisted = store.get(request_id=request.request_id)
+
+    assert len(adapter.sent) == 1
+    assert persisted is not None
+    assert persisted.status is DurableRequestStatus.PENDING_DELIVERY
+    assert persisted.delivery_claim is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_kind", "reason"),
+    [
+        ("forbidden", "provider_message_unavailable"),
+        ("bad_format", "persistent_view_restore_failed"),
+    ],
+)
+async def test_permanent_restore_failure_closes_open_request(
+    store: DurableRequestStore,
+    error_kind: str,
+    reason: str,
+) -> None:
+    request = _create(store)
+    await DurableRequestBridge().process_once(
+        {"discord": Adapter(send_result=SendResult(success=True, message_id="m"))}
+    )
+    restarted = Adapter(
+        restore_result=SendResult(
+            success=False,
+            error="permanent restore failure",
+            error_kind=error_kind,
+        )
+    )
+
+    await DurableRequestBridge().process_once({"discord": restarted})
+    persisted = store.get(request_id=request.request_id)
+
+    assert persisted is not None
+    assert persisted.status is DurableRequestStatus.DELIVERY_FAILED
+    assert persisted.terminal_reason == reason
+
+
+@pytest.mark.asyncio
+async def test_disabled_feature_does_not_open_or_poll_the_ledger(monkeypatch) -> None:
+    monkeypatch.setattr(
+        bridge_module,
+        "load_durable_requests_config",
+        lambda: DurableRequestsConfig(
+            enabled=False,
+            target=None,
+            default_ttl_seconds=86400,
+            max_ttl_seconds=604800,
+            terminal_retention_seconds=604800,
+            scheduled_responder_mode=DurableResponderMode.ANY_AUTHORIZED,
+            reason="disabled",
+        ),
+    )
+
+    def fail_if_opened():
+        raise AssertionError("disabled durable requests must not open state.db")
+
+    monkeypatch.setattr(
+        bridge_module,
+        "get_durable_request_store",
+        fail_if_opened,
+    )
+
+    await DurableRequestBridge().process_once({"discord": Adapter()})

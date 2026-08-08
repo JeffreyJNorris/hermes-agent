@@ -19,6 +19,8 @@ from unittest.mock import patch
 
 
 _VIEW_NAMES = [
+    "DurableRequestView",
+    "InteractivePromptView",
     "ExecApprovalView",
     "SlashConfirmView",
     "UpdatePromptView",
@@ -31,7 +33,7 @@ class TestDefineDiscordViewClasses:
     """_define_discord_view_classes() registers all UI view classes in module globals."""
 
     def test_registers_all_five_view_classes(self, monkeypatch):
-        """Calling _define_discord_view_classes() must (re)define all 5 view classes."""
+        """Calling _define_discord_view_classes() must (re)define all view classes."""
         dp = importlib.import_module("plugins.platforms.discord.adapter")
 
         # Remove the classes to simulate the state where the module was loaded
@@ -48,4 +50,3 @@ class TestDefineDiscordViewClasses:
         for name in _VIEW_NAMES:
             assert hasattr(dp, name), f"{name} must be defined after _define_discord_view_classes()"
             assert isinstance(getattr(dp, name), type), f"{name} must be a class"
-

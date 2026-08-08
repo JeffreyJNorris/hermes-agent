@@ -143,3 +143,10 @@ remain independent.
 
 Titles, bodies, and labels are caller-controlled display content. They must be
 pre-redacted and safe to show to the scoped user.
+
+## Durable requests
+
+For questions that must outlive the current turn or gateway process, use the
+separate persisted request subsystem described in
+[`durable-requests.md`](durable-requests.md). Do not extend the in-memory prompt
+registry with long-lived waiters.

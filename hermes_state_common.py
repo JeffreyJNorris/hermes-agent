@@ -152,7 +152,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -338,6 +338,35 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     delivery_claimed_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS durable_requests (
+    request_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    options_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    platform TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    thread_id TEXT,
+    message_id TEXT,
+    responder_mode TEXT NOT NULL,
+    expected_actor_id TEXT,
+    origin_type TEXT NOT NULL,
+    origin_id TEXT NOT NULL,
+    reference TEXT,
+    selected_option_id TEXT,
+    resolved_by_actor_id TEXT,
+    resolved_at REAL,
+    terminal_reason TEXT,
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    delivery_claim TEXT,
+    delivery_claimed_at REAL,
+    delivered_at REAL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -357,6 +386,15 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
+CREATE INDEX IF NOT EXISTS idx_durable_requests_status_expiry
+    ON durable_requests(status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_durable_requests_delivery
+    ON durable_requests(status, delivery_claimed_at);
+CREATE INDEX IF NOT EXISTS idx_durable_requests_platform
+    ON durable_requests(platform, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_requests_origin_reference
+    ON durable_requests(origin_type, origin_id, reference)
+    WHERE reference IS NOT NULL;
 """
 
 

@@ -268,6 +268,12 @@ TOOLSETS = {
         "tools": ["request_decision"],
         "includes": []
     },
+
+    "durable_request": {
+        "description": "Post and inspect persisted finite-choice requests",
+        "tools": ["durable_request"],
+        "includes": []
+    },
     
     "code_execution": {
         "description": "Run Python scripts that call tools programmatically (reduces LLM round trips)",
@@ -478,7 +484,7 @@ TOOLSETS = {
         # homeassistant) are excluded by _get_platform_tools() unless
         # the user explicitly enables them.
         "description": "Default cron toolset - same core tools as hermes-cli; gated by `hermes tools`",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_CORE_TOOLS + ["durable_request"],
         "includes": []
     },
 
@@ -492,6 +498,7 @@ TOOLSETS = {
         "description": "Discord bot toolset - full access (terminal has safety checks via dangerous command approval)",
         "tools": _HERMES_CORE_TOOLS + [
             "request_decision",
+            "durable_request",
             "discord",
             "discord_admin",
         ],

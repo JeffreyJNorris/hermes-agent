@@ -2251,6 +2251,8 @@ class SendResult:
 #   not_found     the target chat/thread/message no longer exists.
 #   rate_limited  the platform throttled the send (flood control).
 #   transient     a connection-level failure that is safe to retry.
+#   delivery_unknown  a provider send may have completed but no bindable
+#                 message id was returned; consumers must not auto-retry.
 #   unknown       classification did not match any known shape.
 SEND_ERROR_KINDS = frozenset(
     {
@@ -2261,6 +2263,7 @@ SEND_ERROR_KINDS = frozenset(
         "rate_limited",
         "transient",
         "unsupported",  # HERMES_INTERACTIVE_PROMPTS_V1_BASE
+        "delivery_unknown",
         "unknown",
     }
 )
@@ -3800,6 +3803,46 @@ class BasePlatformAdapter(ABC):
         return SendResult(
             success=False,
             error="Interactive prompts are not supported",
+            error_kind="unsupported",
+        )
+
+    async def send_durable_request(
+        self,
+        chat_id: str,
+        request: "DurableRequest",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Deliver a persisted finite-choice request using native controls.
+
+        This optional method is separate from ``send_interactive_prompt``:
+        durable requests outlive the originating turn and the gateway process.
+        ``success=True`` means the provider send completed and MUST include the
+        exact provider ``message_id`` so the durable ledger can bind delivery.
+        ``transient`` and ``rate_limited`` results are retryable only when no
+        provider send was attempted; after a send attempt with an uncertain
+        outcome, implementations must return ``delivery_unknown``. Adapters
+        render controls only and never perform application mutations.
+        """
+        return SendResult(
+            success=False,
+            error="Durable requests are not supported",
+            error_kind="unsupported",
+        )
+
+    async def restore_durable_request(
+        self,
+        request: "DurableRequest",
+    ) -> SendResult:
+        """Restore native handling for an already-bound durable request.
+
+        Providers with persistent component registration should override this
+        method, reconcile the exact stored message, and register its callbacks.
+        A permanently missing message returns ``error_kind="not_found"``.
+        Transient failures must not mutate the durable ledger.
+        """
+        return SendResult(
+            success=False,
+            error="Durable request restoration is not supported",
             error_kind="unsupported",
         )
 

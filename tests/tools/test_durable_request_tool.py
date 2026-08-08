@@ -1,0 +1,413 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from agent.tool_dispatch_helpers import _NEVER_PARALLEL_TOOLS
+from gateway.durable_requests import (
+    DurableRequestStatus,
+    DurableResponderMode,
+    get_durable_request_store,
+    reset_durable_request_store_cache,
+)
+from gateway.session_context import (
+    clear_session_vars,
+    reset_session_vars,
+    set_session_vars,
+)
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from tools.durable_request_tool import (
+    DURABLE_REQUEST_SCHEMA,
+    check_durable_request_requirements,
+    durable_request_tool,
+)
+from tools.registry import registry
+from tools.tool_search import is_deferrable_tool_name
+from toolsets import TOOLSETS, _HERMES_CORE_TOOLS, resolve_toolset
+
+
+@pytest.fixture
+def configured_home(tmp_path: Path):
+    (tmp_path / "config.yaml").write_text(
+        """durable_requests:
+  enabled: true
+  inbox:
+    platform: discord
+    chat_id: "123456789012345678"
+    thread_id: "123456789012345679"
+  default_ttl_seconds: 3600
+  max_ttl_seconds: 7200
+  terminal_retention_seconds: 86400
+  scheduled_responder_policy: any_authorized
+""",
+        encoding="utf-8",
+    )
+    token = set_hermes_home_override(tmp_path)
+    reset_durable_request_store_cache()
+    reset_session_vars()
+    try:
+        yield tmp_path
+    finally:
+        reset_session_vars()
+        reset_durable_request_store_cache()
+        reset_hermes_home_override(token)
+
+
+def _bind_live_session(*, session_key: str = "discord:guild:user", actor: str = "42"):
+    return set_session_vars(
+        platform="discord",
+        session_key=session_key,
+        user_id=actor,
+        cron_session="",
+        cron_job_id="",
+    )
+
+
+def _bind_cron(*, job_id: str = "job-17"):
+    return set_session_vars(
+        platform="",
+        session_key="",
+        user_id="",
+        cron_session="1",
+        cron_job_id=job_id,
+        async_delivery=False,
+    )
+
+
+def test_tool_registers_with_narrow_toolset() -> None:
+    entry = registry.get_entry("durable_request")
+
+    assert entry is not None
+    assert entry.toolset == "durable_request"
+    assert entry.schema is DURABLE_REQUEST_SCHEMA
+    assert entry.is_async is False
+    assert entry.check_fn is check_durable_request_requirements
+
+
+def test_schema_does_not_expose_delivery_or_authorization_scope() -> None:
+    properties = DURABLE_REQUEST_SCHEMA["parameters"]["properties"]
+
+    assert DURABLE_REQUEST_SCHEMA["parameters"]["required"] == ["action"]
+    for forbidden in (
+        "platform",
+        "chat_id",
+        "thread_id",
+        "actor_id",
+        "message_id",
+        "style",
+        "command",
+        "callback",
+    ):
+        assert forbidden not in properties
+
+
+def test_tool_is_exposed_to_discord_and_cron_only() -> None:
+    assert "durable_request" in resolve_toolset("hermes-discord")
+    assert "durable_request" in resolve_toolset("hermes-cron")
+    assert "durable_request" not in resolve_toolset("hermes-cli")
+    assert "durable_request" not in resolve_toolset("hermes-telegram")
+    assert "durable_request" not in _HERMES_CORE_TOOLS
+    assert TOOLSETS["durable_request"]["tools"] == ["durable_request"]
+
+
+def test_tool_is_never_parallel_and_not_deferred() -> None:
+    assert "durable_request" in _NEVER_PARALLEL_TOOLS
+    assert is_deferrable_tool_name("durable_request") is False
+
+
+def test_live_post_derives_target_origin_and_actor_from_trusted_context(
+    configured_home: Path,
+) -> None:
+    tokens = _bind_live_session()
+    try:
+        payload = json.loads(
+            durable_request_tool(
+                action="post",
+                title="Approve release",
+                question="Should the reviewed release continue?",
+                options=["Approve", "Reject"],
+                reference="release-42",
+            )
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    request = get_durable_request_store().get(request_id=payload["request_id"])
+    assert payload["status"] == "pending"
+    assert payload["delivery"] == "queued"
+    assert payload["created"] is True
+    assert request is not None
+    assert request.target.platform == "discord"
+    assert request.target.chat_id == "123456789012345678"
+    assert request.target.thread_id == "123456789012345679"
+    assert request.origin_type == "session"
+    assert request.origin_id == "discord:guild:user"
+    assert request.responder_mode is DurableResponderMode.INITIATOR
+    assert request.expected_actor_id == "42"
+
+    serialized = json.dumps(payload)
+    for forbidden in (
+        "123456789012345678",
+        "123456789012345679",
+        "discord:guild:user",
+        "actor_id",
+        "message_id",
+        "option_1",
+    ):
+        assert forbidden not in serialized
+
+
+def test_cron_requires_reference_and_is_idempotent(configured_home: Path) -> None:
+    tokens = _bind_cron()
+    try:
+        missing = json.loads(
+            durable_request_tool(
+                action="post",
+                title="Release",
+                question="Continue?",
+                options=["Approve", "Reject"],
+            )
+        )
+        first = json.loads(
+            durable_request_tool(
+                action="post",
+                title="Release",
+                question="Continue?",
+                options=["Approve", "Reject"],
+                reference="weekly-2026-W32",
+            )
+        )
+        second = json.loads(
+            durable_request_tool(
+                action="post",
+                title="Changed display text is ignored by idempotency",
+                question="Continue now?",
+                options=["Yes", "No"],
+                reference="weekly-2026-W32",
+            )
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert missing == {"error": "reference is required for scheduled requests"}
+    assert first["created"] is True
+    assert second["created"] is False
+    assert second["request_id"] == first["request_id"]
+    request = get_durable_request_store().get(request_id=first["request_id"])
+    assert request.origin_type == "cron"
+    assert request.origin_id == "job-17"
+    assert request.responder_mode is DurableResponderMode.ANY_AUTHORIZED
+    assert request.expected_actor_id is None
+
+
+def test_status_returns_selected_index_and_full_label(configured_home: Path) -> None:
+    tokens = _bind_live_session()
+    try:
+        posted = json.loads(
+            durable_request_tool(
+                action="post",
+                title="Target",
+                question="Choose target.",
+                options=["Staging", "Production"],
+                reference="target",
+            )
+        )
+        store = get_durable_request_store()
+        claim = store.claim_next_pending(["discord"])
+        assert claim is not None
+        bound = store.bind_delivery(
+            request_id=posted["request_id"],
+            claim_id=claim.claim_id,
+            platform="discord",
+            message_id="message-1",
+        )
+        assert bound is not None
+        result = store.resolve(
+            request_id=posted["request_id"],
+            option_token="2",
+            platform="discord",
+            channel_id="123456789012345679",
+            message_id="message-1",
+            actor_id="42",
+        )
+        assert result.request is not None
+
+        payload = json.loads(
+            durable_request_tool(action="status", reference="target")
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert payload["status"] == "selected"
+    assert payload["selected_index"] == 2
+    assert payload["selected_label"] == "Production"
+    assert "resolved_at" in payload
+
+
+def test_lookup_and_cancel_are_origin_scoped(configured_home: Path) -> None:
+    first_tokens = _bind_live_session(session_key="session-a", actor="1")
+    try:
+        posted = json.loads(
+            durable_request_tool(
+                action="post",
+                title="Choose",
+                question="Choose one.",
+                options=["A", "B"],
+                reference="same",
+            )
+        )
+    finally:
+        clear_session_vars(first_tokens)
+
+    second_tokens = _bind_live_session(session_key="session-b", actor="2")
+    try:
+        hidden = json.loads(
+            durable_request_tool(action="status", request_id=posted["request_id"])
+        )
+        cancelled = json.loads(
+            durable_request_tool(action="cancel", request_id=posted["request_id"])
+        )
+    finally:
+        clear_session_vars(second_tokens)
+
+    assert hidden == {"status": "not_found"}
+    assert cancelled == {"status": "not_found"}
+    assert (
+        get_durable_request_store().get(request_id=posted["request_id"]).status
+        is DurableRequestStatus.PENDING_DELIVERY
+    )
+
+
+def test_cancel_returns_terminal_normal_result(configured_home: Path) -> None:
+    tokens = _bind_live_session()
+    try:
+        posted = json.loads(
+            durable_request_tool(
+                action="post",
+                title="Choose",
+                question="Choose one.",
+                options=["A", "B"],
+            )
+        )
+        payload = json.loads(
+            durable_request_tool(
+                action="cancel",
+                request_id=posted["request_id"],
+            )
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert payload["status"] == "cancelled"
+    assert payload["reason"] == "cancelled_by_origin"
+    assert "error" not in payload
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        ({"action": "bad"}, "action must be post, status, or cancel"),
+        (
+            {
+                "action": "post",
+                "title": "T",
+                "question": "Q",
+                "options": ["only"],
+            },
+            "options must contain between 2 and 5 choices",
+        ),
+        (
+            {
+                "action": "post",
+                "title": "T",
+                "question": "Q",
+                "options": [" First ", "first"],
+            },
+            "options must have unique labels",
+        ),
+        (
+            {"action": "status"},
+            "provide exactly one of request_id or reference",
+        ),
+        (
+            {
+                "action": "status",
+                "request_id": "drq_x",
+                "reference": "both",
+            },
+            "provide exactly one of request_id or reference",
+        ),
+    ],
+)
+def test_invalid_arguments_return_tool_error(
+    configured_home: Path,
+    arguments: dict[str, object],
+    message: str,
+) -> None:
+    tokens = _bind_live_session()
+    try:
+        payload = json.loads(durable_request_tool(**arguments))
+    finally:
+        clear_session_vars(tokens)
+
+    assert payload == {"error": message}
+
+
+def test_disabled_configuration_hides_and_rejects_tool(tmp_path: Path) -> None:
+    (tmp_path / "config.yaml").write_text(
+        "durable_requests:\n  enabled: false\n",
+        encoding="utf-8",
+    )
+    token = set_hermes_home_override(tmp_path)
+    reset_durable_request_store_cache()
+    try:
+        assert check_durable_request_requirements() is False
+        payload = json.loads(
+            durable_request_tool(
+                action="post",
+                title="Choose",
+                question="Choose one.",
+                options=["A", "B"],
+            )
+        )
+    finally:
+        reset_durable_request_store_cache()
+        reset_hermes_home_override(token)
+
+    assert payload == {"error": "durable requests are not configured"}
+
+
+def test_invalid_discord_inbox_hides_tool(tmp_path: Path) -> None:
+    (tmp_path / "config.yaml").write_text(
+        """durable_requests:
+  enabled: true
+  inbox:
+    platform: discord
+    chat_id: not-a-channel-id
+""",
+        encoding="utf-8",
+    )
+    token = set_hermes_home_override(tmp_path)
+    reset_durable_request_store_cache()
+    try:
+        assert check_durable_request_requirements() is False
+        payload = json.loads(
+            durable_request_tool(
+                action="post",
+                title="Choose",
+                question="Choose one.",
+                options=["A", "B"],
+            )
+        )
+    finally:
+        reset_durable_request_store_cache()
+        reset_hermes_home_override(token)
+
+    assert payload == {
+        "error": (
+            "durable requests are unavailable: durable request inbox chat_id "
+            "must be a Discord channel id"
+        )
+    }

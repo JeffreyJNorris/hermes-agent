@@ -6198,6 +6198,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        # Per-profile durable request bridges. The rows live in each
+        # profile's state.db and intentionally survive gateway shutdown.
+        self._durable_request_bridges: Dict[str, Any] = {}
+        self._durable_request_home = Path(get_hermes_home())
+        self._durable_request_task: Optional[asyncio.Task] = None
 
         # Event-loop liveness heartbeat (#66892): rewritten every 30s while
         # the loop is dispatching. External supervisors use the file mtime /
@@ -10626,6 +10631,80 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 logger.debug("Failed to cancel gateway loop floor timer", exc_info=True)
 
+    def _start_durable_request_worker(self) -> None:
+        """Start the profile-aware durable outbox/reconciliation loop."""
+        existing = getattr(self, "_durable_request_task", None)
+        if existing is not None and not existing.done():
+            return
+        self._durable_request_task = self._spawn_supervised(
+            self._run_durable_request_worker,
+            "durable_request_worker",
+            on_spawn=lambda task: setattr(self, "_durable_request_task", task),
+        )
+
+    async def _run_durable_request_worker(self) -> None:
+        from gateway.durable_request_bridge import DurableRequestBridge
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        try:
+            while self._running and not self._shutdown_event.is_set():
+                profiles: list[tuple[str, Path, Dict[Platform, BasePlatformAdapter]]] = [
+                    (
+                        "primary",
+                        Path(getattr(self, "_durable_request_home", get_hermes_home())),
+                        dict(self.adapters),
+                    )
+                ]
+                if getattr(self.config, "multiplex_profiles", False):
+                    try:
+                        from hermes_cli.profiles import get_profile_dir
+
+                        profiles.extend(
+                            (name, Path(get_profile_dir(name)), dict(adapters))
+                            for name, adapters in list(
+                                getattr(self, "_profile_adapters", {}).items()
+                            )
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Could not enumerate durable-request profile scopes",
+                            exc_info=True,
+                        )
+
+                for profile_name, profile_home, adapters in profiles:
+                    token = set_hermes_home_override(profile_home)
+                    try:
+                        bridge = self._durable_request_bridges.get(profile_name)
+                        if bridge is None:
+                            bridge = DurableRequestBridge()
+                            self._durable_request_bridges[profile_name] = bridge
+                        await bridge.process_once(adapters)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "Durable request worker pass failed",
+                            extra={
+                                "profile": profile_name,
+                                "exception_class": type(exc).__name__,
+                            },
+                        )
+                    finally:
+                        reset_hermes_home_override(token)
+
+                try:
+                    await asyncio.wait_for(
+                        self._shutdown_event.wait(),
+                        timeout=2.0,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            self._durable_request_task = None
+
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -11315,6 +11394,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._running = True
         self._update_runtime_status("running")
+        self._start_durable_request_worker()
 
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
         # stops refreshing ``state/gateway.heartbeat``. Cancelled with the

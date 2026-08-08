@@ -63,7 +63,7 @@ BRIDGE_TOOL_NAMES = frozenset({TOOL_SEARCH_NAME, TOOL_DESCRIBE_NAME, TOOL_CALL_N
 # _HERMES_CORE_TOOLS. They must stay eager so the model can choose them at the
 # point a conversation needs user input, without first discovering them
 # through another tool call.
-_ALWAYS_VISIBLE_BUILTIN_TOOLS = frozenset({"request_decision"})
+_ALWAYS_VISIBLE_BUILTIN_TOOLS = frozenset({"request_decision", "durable_request"})
 
 # When estimating tokens from char count without a real tokenizer, this is
 # the cheap rule of thumb that's stable across providers. Roughly 4 chars

@@ -1,0 +1,515 @@
+from __future__ import annotations
+
+import sqlite3
+import threading
+from pathlib import Path
+
+import pytest
+
+from gateway.durable_requests import (
+    DEFAULT_DURABLE_TERMINAL_RETENTION_SECONDS,
+    DurableRequestError,
+    DurableRequestOption,
+    DurableRequestSpec,
+    DurableRequestStatus,
+    DurableRequestStore,
+    DurableRequestTarget,
+    DurableResponderMode,
+    DurableResolveStatus,
+    PromptStyle,
+)
+
+
+class Clock:
+    def __init__(self, value: float = 1_000.0) -> None:
+        self.value = value
+
+    def __call__(self) -> float:
+        return self.value
+
+
+def _store(tmp_path: Path, clock: Clock) -> DurableRequestStore:
+    return DurableRequestStore(tmp_path / "state.db", wall_clock=clock)
+
+
+def _spec(*, reference: str | None = "weekly") -> DurableRequestSpec:
+    return DurableRequestSpec(
+        kind="test.release",
+        title="Choose release action",
+        body="The checks passed. Choose the next action.",
+        options=(
+            DurableRequestOption("approve", "Approve", PromptStyle.SUCCESS),
+            DurableRequestOption("reject", "Reject", PromptStyle.DANGER),
+        ),
+        ttl_seconds=60,
+        reference=reference,
+    )
+
+
+def _create(
+    store: DurableRequestStore,
+    *,
+    reference: str | None = "weekly",
+    actor: str | None = "actor-1",
+    origin_id: str = "session-1",
+):
+    return store.create(
+        _spec(reference=reference),
+        target=DurableRequestTarget("discord", "chat-1", "thread-1"),
+        responder_mode=(
+            DurableResponderMode.INITIATOR
+            if actor is not None
+            else DurableResponderMode.ANY_AUTHORIZED
+        ),
+        expected_actor_id=actor,
+        origin_type="session",
+        origin_id=origin_id,
+    )
+
+
+def _bind(store: DurableRequestStore, request_id: str, message_id: str = "msg-1"):
+    claim = store.claim_next_pending(["discord"])
+    assert claim is not None
+    assert claim.request.request_id == request_id
+    bound = store.bind_delivery(
+        request_id=request_id,
+        claim_id=claim.claim_id,
+        platform="discord",
+        message_id=message_id,
+    )
+    assert bound is not None
+    return bound
+
+
+def test_request_id_is_random_and_contains_no_scope_identifiers(tmp_path: Path) -> None:
+    clock = Clock()
+    store = _store(tmp_path, clock)
+
+    first = _create(store, reference="one").request
+    second = _create(store, reference="two").request
+
+    assert first.request_id.startswith("drq_")
+    assert first.request_id != second.request_id
+    for forbidden in ("session-1", "chat-1", "thread-1", "actor-1"):
+        assert forbidden not in first.request_id
+
+
+def test_origin_reference_is_idempotent(tmp_path: Path) -> None:
+    clock = Clock()
+    store = _store(tmp_path, clock)
+
+    first = _create(store)
+    second = _create(store)
+
+    assert first.created is True
+    assert second.created is False
+    assert second.request.request_id == first.request.request_id
+
+
+def test_same_reference_is_independent_across_origins(tmp_path: Path) -> None:
+    clock = Clock()
+    store = _store(tmp_path, clock)
+
+    first = _create(store, origin_id="session-a")
+    second = _create(store, origin_id="session-b")
+
+    assert first.request.request_id != second.request.request_id
+
+
+@pytest.mark.parametrize(
+    "spec, message",
+    [
+        (
+            DurableRequestSpec(
+                kind="k",
+                title="t",
+                body="b",
+                options=(),
+                ttl_seconds=10,
+            ),
+            "options must contain",
+        ),
+        (
+            DurableRequestSpec(
+                kind="k",
+                title="t",
+                body="b",
+                options=(
+                    DurableRequestOption("same", "A"),
+                    DurableRequestOption("same", "B"),
+                ),
+                ttl_seconds=10,
+            ),
+            "option ids must be unique",
+        ),
+        (
+            DurableRequestSpec(
+                kind="k",
+                title="t",
+                body="b",
+                options=(
+                    DurableRequestOption("a", "A"),
+                    DurableRequestOption("b", "B"),
+                ),
+                ttl_seconds=0,
+            ),
+            "ttl_seconds must be positive",
+        ),
+    ],
+)
+def test_validation_rejects_invalid_specs(
+    tmp_path: Path,
+    spec: DurableRequestSpec,
+    message: str,
+) -> None:
+    store = _store(tmp_path, Clock())
+
+    with pytest.raises(DurableRequestError, match=message):
+        store.create(
+            spec,
+            target=DurableRequestTarget("discord", "chat"),
+            responder_mode=DurableResponderMode.ANY_AUTHORIZED,
+            expected_actor_id=None,
+            origin_type="cron",
+            origin_id="job",
+        )
+
+
+def test_response_before_delivery_is_rejected(tmp_path: Path) -> None:
+    store = _store(tmp_path, Clock())
+    request = _create(store).request
+
+    result = store.resolve(
+        request_id=request.request_id,
+        option_token="1",
+        platform="discord",
+        channel_id="thread-1",
+        message_id="msg-1",
+        actor_id="actor-1",
+    )
+
+    assert result.status is DurableResolveStatus.NOT_DELIVERED
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"platform": "telegram"},
+        {"channel_id": "chat-1"},
+        {"message_id": "other"},
+        {"actor_id": "actor-2"},
+    ],
+)
+def test_resolution_validates_exact_provider_scope(
+    tmp_path: Path,
+    overrides: dict[str, str],
+) -> None:
+    store = _store(tmp_path, Clock())
+    request = _create(store).request
+    _bind(store, request.request_id)
+    arguments = {
+        "request_id": request.request_id,
+        "option_token": "1",
+        "platform": "discord",
+        "channel_id": "thread-1",
+        "message_id": "msg-1",
+        "actor_id": "actor-1",
+    }
+    arguments.update(overrides)
+
+    result = store.resolve(**arguments)
+
+    assert result.status is DurableResolveStatus.SCOPE_MISMATCH
+
+
+def test_resolution_is_exactly_once_and_survives_store_restart(tmp_path: Path) -> None:
+    clock = Clock()
+    store = _store(tmp_path, clock)
+    request = _create(store).request
+    _bind(store, request.request_id)
+
+    result = store.resolve(
+        request_id=request.request_id,
+        option_token="2",
+        platform="discord",
+        channel_id="thread-1",
+        message_id="msg-1",
+        actor_id="actor-1",
+    )
+    restarted = DurableRequestStore(tmp_path / "state.db", wall_clock=clock)
+    replay = restarted.resolve(
+        request_id=request.request_id,
+        option_token="1",
+        platform="discord",
+        channel_id="thread-1",
+        message_id="msg-1",
+        actor_id="actor-1",
+    )
+    persisted = restarted.get(
+        request_id=request.request_id,
+        origin_type="session",
+        origin_id="session-1",
+    )
+
+    assert result.status is DurableResolveStatus.RESOLVED
+    assert result.request is not None
+    assert result.request.selected_option_id == "reject"
+    assert replay.status is DurableResolveStatus.ALREADY_RESOLVED
+    assert persisted is not None
+    assert persisted.selected_option_id == "reject"
+
+
+def test_any_authorized_mode_accepts_authorized_actor_metadata(tmp_path: Path) -> None:
+    store = _store(tmp_path, Clock())
+    request = _create(store, actor=None).request
+    _bind(store, request.request_id)
+
+    result = store.resolve(
+        request_id=request.request_id,
+        option_token="1",
+        platform="discord",
+        channel_id="thread-1",
+        message_id="msg-1",
+        actor_id="another-authorized-user",
+    )
+
+    assert result.status is DurableResolveStatus.RESOLVED
+
+
+def test_expiry_uses_persisted_absolute_deadline_across_restart(tmp_path: Path) -> None:
+    clock = Clock()
+    store = _store(tmp_path, clock)
+    request = _create(store).request
+    _bind(store, request.request_id)
+    clock.value = request.expires_at
+
+    restarted = DurableRequestStore(tmp_path / "state.db", wall_clock=clock)
+    result = restarted.resolve(
+        request_id=request.request_id,
+        option_token="1",
+        platform="discord",
+        channel_id="thread-1",
+        message_id="msg-1",
+        actor_id="actor-1",
+    )
+
+    assert result.status is DurableResolveStatus.EXPIRED
+    assert restarted.get(request_id=request.request_id).status is DurableRequestStatus.EXPIRED
+
+
+def test_stale_delivery_claim_becomes_unknown_and_is_not_requeued(tmp_path: Path) -> None:
+    clock = Clock()
+    store = _store(tmp_path, clock)
+    request = _create(store).request
+    claim = store.claim_next_pending(["discord"])
+    assert claim is not None
+    clock.value += 6
+
+    assert store.recover_stale_delivery_claims(stale_after_seconds=5) == 1
+    persisted = store.get(request_id=request.request_id)
+
+    assert persisted is not None
+    assert persisted.status is DurableRequestStatus.DELIVERY_UNKNOWN
+    assert store.claim_next_pending(["discord"]) is None
+
+
+def test_cancel_is_origin_scoped_and_terminal(tmp_path: Path) -> None:
+    store = _store(tmp_path, Clock())
+    request = _create(store).request
+
+    assert (
+        store.cancel(
+            origin_type="session",
+            origin_id="other",
+            request_id=request.request_id,
+        )
+        is None
+    )
+    cancelled = store.cancel(
+        origin_type="session",
+        origin_id="session-1",
+        request_id=request.request_id,
+    )
+
+    assert cancelled is not None
+    assert cancelled.status is DurableRequestStatus.CANCELLED
+
+
+def test_bound_terminal_rows_remain_restorable_for_stale_clicks(tmp_path: Path) -> None:
+    store = _store(tmp_path, Clock())
+    request = _create(store).request
+    _bind(store, request.request_id)
+    store.cancel(
+        origin_type="session",
+        origin_id="session-1",
+        request_id=request.request_id,
+    )
+
+    rows = store.list_bound_requests(["discord"])
+
+    assert [row.request_id for row in rows] == [request.request_id]
+    assert rows[0].status is DurableRequestStatus.CANCELLED
+
+
+def test_terminal_retention_prunes_content_and_reference(tmp_path: Path) -> None:
+    clock = Clock()
+    store = _store(tmp_path, clock)
+    request = _create(store).request
+    store.cancel(
+        origin_type="session",
+        origin_id="session-1",
+        request_id=request.request_id,
+    )
+    clock.value += DEFAULT_DURABLE_TERMINAL_RETENTION_SECONDS + 1
+
+    assert store.prune_terminal(DEFAULT_DURABLE_TERMINAL_RETENTION_SECONDS) == 1
+    assert store.get(request_id=request.request_id) is None
+    with sqlite3.connect(tmp_path / "state.db") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM durable_requests").fetchone()[0] == 0
+
+
+def test_safe_pre_send_failure_can_release_delivery_claim(tmp_path: Path) -> None:
+    store = _store(tmp_path, Clock())
+    request = _create(store).request
+    claim = store.claim_next_pending(["discord"])
+
+    assert claim is not None
+    assert store.release_delivery_claim(
+        request_id=request.request_id,
+        claim_id=claim.claim_id,
+    ) is True
+
+    persisted = store.get(request_id=request.request_id)
+    assert persisted is not None
+    assert persisted.status is DurableRequestStatus.PENDING_DELIVERY
+    assert persisted.delivery_claim is None
+    assert persisted.delivery_claimed_at is None
+
+    retry = store.claim_next_pending(["discord"])
+    assert retry is not None
+    assert retry.request.request_id == request.request_id
+    assert retry.claim_id != claim.claim_id
+
+
+def test_wrong_delivery_claim_cannot_be_released(tmp_path: Path) -> None:
+    store = _store(tmp_path, Clock())
+    request = _create(store).request
+    claim = store.claim_next_pending(["discord"])
+
+    assert claim is not None
+    assert store.release_delivery_claim(
+        request_id=request.request_id,
+        claim_id="wrong-claim",
+    ) is False
+
+    persisted = store.get(request_id=request.request_id)
+    assert persisted is not None
+    assert persisted.delivery_claim == claim.claim_id
+
+
+def test_central_state_schema_contains_durable_request_ledger(tmp_path: Path) -> None:
+    from hermes_state_common import SCHEMA_SQL, SCHEMA_VERSION
+
+    conn = sqlite3.connect(tmp_path / "central-state.db")
+    try:
+        conn.executescript(SCHEMA_SQL)
+        table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("durable_requests",),
+        ).fetchone()
+        index = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
+            ("idx_durable_requests_origin_reference",),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert SCHEMA_VERSION >= 26
+    assert table == ("durable_requests",)
+    assert index == ("idx_durable_requests_origin_reference",)
+
+
+def test_delivery_message_is_bound_when_expiry_wins_send_race(tmp_path: Path) -> None:
+    clock = Clock()
+    store = _store(tmp_path, clock)
+    request = _create(store).request
+    claim = store.claim_next_pending(["discord"])
+    assert claim is not None
+
+    clock.value = request.expires_at
+    bound = store.bind_delivery(
+        request_id=request.request_id,
+        claim_id=claim.claim_id,
+        platform="discord",
+        message_id="late-message",
+    )
+
+    assert bound is not None
+    assert bound.status is DurableRequestStatus.EXPIRED
+    assert bound.message_id == "late-message"
+
+
+def test_delivery_message_is_bound_when_cancellation_wins_send_race(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path, Clock())
+    request = _create(store).request
+    claim = store.claim_next_pending(["discord"])
+    assert claim is not None
+
+    cancelled = store.cancel(
+        origin_type="session",
+        origin_id="session-1",
+        request_id=request.request_id,
+    )
+    assert cancelled is not None
+    assert cancelled.status is DurableRequestStatus.CANCELLED
+
+    bound = store.bind_delivery(
+        request_id=request.request_id,
+        claim_id=claim.claim_id,
+        platform="discord",
+        message_id="cancelled-message",
+    )
+
+    assert bound is not None
+    assert bound.status is DurableRequestStatus.CANCELLED
+    assert bound.message_id == "cancelled-message"
+
+
+def test_concurrent_store_instances_resolve_exactly_once(tmp_path: Path) -> None:
+    clock = Clock()
+    first_store = _store(tmp_path, clock)
+    request = _create(first_store).request
+    _bind(first_store, request.request_id)
+    second_store = DurableRequestStore(tmp_path / "state.db", wall_clock=clock)
+    barrier = threading.Barrier(2)
+    results = []
+
+    def resolve(store: DurableRequestStore, token: str) -> None:
+        barrier.wait()
+        results.append(
+            store.resolve(
+                request_id=request.request_id,
+                option_token=token,
+                platform="discord",
+                channel_id="thread-1",
+                message_id="msg-1",
+                actor_id="actor-1",
+            ).status
+        )
+
+    threads = [
+        threading.Thread(target=resolve, args=(first_store, "1")),
+        threading.Thread(target=resolve, args=(second_store, "2")),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert sorted(status.value for status in results) == [
+        DurableResolveStatus.ALREADY_RESOLVED.value,
+        DurableResolveStatus.RESOLVED.value,
+    ]

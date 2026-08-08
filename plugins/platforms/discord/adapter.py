@@ -153,6 +153,7 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    classify_send_error,
     cache_image_from_url,
     cache_image_from_bytes,
     cache_audio_from_url,
@@ -175,6 +176,13 @@ from gateway.interactive import (  # HERMES_INTERACTIVE_PROMPTS_V1_DISCORD
     remaining_prompt_seconds,
     render_native_prompt_content,
     resolve_prompt,
+)
+from gateway.durable_requests import (
+    DurableRequest,
+    DurableResolveStatus,
+    get_durable_request_store,
+    make_durable_component_id,
+    render_durable_request_content,
 )
 
 
@@ -7233,6 +7241,174 @@ class DiscordAdapter(BasePlatformAdapter):
                 error="Discord interactive prompt delivery failed",
             )
 
+    async def send_durable_request(
+        self,
+        chat_id: str,
+        request: DurableRequest,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a persisted finite-choice request with persistent controls."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(
+                success=False,
+                error="Not connected",
+                error_kind="transient",
+            )
+        if not isinstance(request, DurableRequest):
+            return SendResult(
+                success=False,
+                error="Invalid durable request",
+                error_kind="bad_format",
+            )
+        if not request.options or len(request.options) > MAX_PROMPT_OPTIONS:
+            return SendResult(
+                success=False,
+                error="Unsupported durable request option count",
+                error_kind="bad_format",
+            )
+
+        target_id = (
+            metadata.get("thread_id")
+            if metadata and metadata.get("thread_id")
+            else chat_id
+        )
+        try:
+            channel = self._client.get_channel(int(target_id))
+            if channel is None:
+                channel = await self._client.fetch_channel(int(target_id))
+            if channel is None:
+                return SendResult(
+                    success=False,
+                    error="Channel not found",
+                    error_kind="not_found",
+                )
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error="Discord durable request target lookup failed",
+                error_kind=classify_send_error(exc),
+            )
+
+        content = render_durable_request_content(request)
+        if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
+            return SendResult(
+                success=False,
+                error="Durable request exceeds Discord message limit",
+                error_kind="too_long",
+            )
+        try:
+            view = DurableRequestView(
+                request=request,
+                allowed_user_ids=self._allowed_user_ids,
+                allowed_role_ids=self._allowed_role_ids,
+                store=get_durable_request_store(),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] durable request view construction failed (%s)",
+                self.name,
+                type(exc).__name__,
+                extra={
+                    "request_id": request.request_id,
+                    "exception_class": type(exc).__name__,
+                },
+            )
+            return SendResult(
+                success=False,
+                error="Discord durable request is invalid",
+                error_kind="bad_format",
+            )
+
+        try:
+            message = await channel.send(
+                content=content,
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception as exc:
+            # Once channel.send() has been attempted the provider outcome may
+            # be ambiguous.  The durable bridge will never auto-retry this row.
+            logger.warning(
+                "[%s] send_durable_request failed (%s)",
+                self.name,
+                type(exc).__name__,
+                extra={
+                    "request_id": request.request_id,
+                    "exception_class": type(exc).__name__,
+                },
+            )
+            return SendResult(
+                success=False,
+                error="Discord durable request delivery outcome is unknown",
+                error_kind="delivery_unknown",
+            )
+
+        view._message = message
+        return SendResult(success=True, message_id=str(message.id))
+
+    async def restore_durable_request(
+        self,
+        request: DurableRequest,
+    ) -> SendResult:
+        """Reconcile the stored message and register its persistent view."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(
+                success=False,
+                error="Not connected",
+                error_kind="transient",
+            )
+        if not isinstance(request, DurableRequest) or not request.message_id:
+            return SendResult(
+                success=False,
+                error="Invalid bound durable request",
+                error_kind="bad_format",
+            )
+
+        try:
+            channel = self._client.get_channel(int(request.delivery_channel_id))
+            if channel is None:
+                channel = await self._client.fetch_channel(
+                    int(request.delivery_channel_id)
+                )
+            if channel is None:
+                return SendResult(
+                    success=False,
+                    error="Channel not found",
+                    error_kind="not_found",
+                )
+            message = await channel.fetch_message(int(request.message_id))
+            view = DurableRequestView(
+                request=request,
+                allowed_user_ids=self._allowed_user_ids,
+                allowed_role_ids=self._allowed_role_ids,
+                store=get_durable_request_store(),
+            )
+            view._message = message
+            self._client.add_view(view, message_id=int(request.message_id))
+            return SendResult(success=True, message_id=str(request.message_id))
+        except Exception as exc:
+            kind = classify_send_error(exc)
+            if (
+                getattr(exc, "status", None) == 404
+                or type(exc).__name__.lower() == "notfound"
+            ):
+                kind = "not_found"
+            logger.debug(
+                "[%s] durable request restore failed (%s)",
+                self.name,
+                type(exc).__name__,
+                extra={
+                    "request_id": request.request_id,
+                    "exception_class": type(exc).__name__,
+                    "error_kind": kind,
+                },
+            )
+            return SendResult(
+                success=False,
+                error="Discord durable request restoration failed",
+                error_kind=kind,
+            )
+
     async def send_clarify(
         self,
         chat_id: str,
@@ -8411,7 +8587,155 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global InteractivePromptView, ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+    global DurableRequestView, InteractivePromptView, ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+
+    class DurableRequestView(discord.ui.View):
+        """Persistent presentation of one SQLite-authoritative request."""
+
+        def __init__(
+            self,
+            request: DurableRequest,
+            allowed_user_ids: set,
+            allowed_role_ids: Optional[set] = None,
+            store=None,
+        ):
+            super().__init__(timeout=None)
+            self.request_id = request.request_id
+            self.allowed_user_ids = allowed_user_ids
+            self.allowed_role_ids = allowed_role_ids or set()
+            self._store = store or get_durable_request_store()
+            self._message = None
+
+            if len(request.options) > MAX_PROMPT_OPTIONS:
+                raise ValueError("durable request has too many options")
+            for slot, option in enumerate(request.options, 1):
+                custom_id = make_durable_component_id(request.request_id, slot)
+                style = {
+                    PromptStyle.PRIMARY: discord.ButtonStyle.primary,
+                    PromptStyle.SECONDARY: discord.ButtonStyle.secondary,
+                    PromptStyle.SUCCESS: discord.ButtonStyle.success,
+                    PromptStyle.DANGER: discord.ButtonStyle.danger,
+                }.get(option.style, discord.ButtonStyle.secondary)
+                button = discord.ui.Button(
+                    label=_truncate_discord_component_text(
+                        option.label,
+                        _DISCORD_BUTTON_LABEL_LIMIT,
+                    ),
+                    style=style,
+                    custom_id=custom_id,
+                )
+
+                async def _callback(interaction, _slot=str(slot)):
+                    await self._resolve(interaction, _slot)
+
+                button.callback = _callback
+                self.add_item(button)
+
+        async def _respond_ephemeral(self, interaction, message: str) -> None:
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(message, ephemeral=True)
+                else:
+                    await interaction.response.send_message(message, ephemeral=True)
+            except Exception as exc:
+                logger.debug(
+                    "Durable request acknowledgement failed (%s)",
+                    type(exc).__name__,
+                    extra={
+                        "request_id": self.request_id,
+                        "exception_class": type(exc).__name__,
+                    },
+                )
+
+        async def _resolve(self, interaction: discord.Interaction, slot: str) -> None:
+            # General Hermes component authorization is always the first check.
+            if not _component_check_auth(
+                interaction,
+                self.allowed_user_ids,
+                self.allowed_role_ids,
+            ):
+                await self._respond_ephemeral(
+                    interaction,
+                    "You are not authorized to use this control.",
+                )
+                return
+
+            channel_id = getattr(interaction, "channel_id", None)
+            message = getattr(interaction, "message", None)
+            message_id = getattr(message, "id", None)
+            actor = getattr(interaction, "user", None)
+            actor_id = getattr(actor, "id", None)
+
+            result = self._store.resolve(
+                request_id=self.request_id,
+                option_token=slot,
+                platform="discord",
+                channel_id=str(channel_id) if channel_id is not None else "",
+                message_id=str(message_id) if message_id is not None else None,
+                actor_id=str(actor_id) if actor_id is not None else None,
+            )
+            if result.status is DurableResolveStatus.RESOLVED:
+                # The transaction commits before presentation is edited.
+                for child in self.children:
+                    child.disabled = True
+                try:
+                    await interaction.response.edit_message(view=self)
+                except Exception as exc:
+                    logger.debug(
+                        "Durable request resolved but Discord edit failed (%s)",
+                        type(exc).__name__,
+                        extra={
+                            "request_id": self.request_id,
+                            "exception_class": type(exc).__name__,
+                        },
+                    )
+                    # Keep the persistent view registered. If the provider
+                    # message still exposes enabled controls, a later click can
+                    # receive an accurate already-resolved response.
+                    try:
+                        if not interaction.response.is_done():
+                            await interaction.response.defer()
+                    except Exception:
+                        pass
+                else:
+                    self.stop()
+                return
+
+            stale_messages = {
+                DurableResolveStatus.ALREADY_RESOLVED: (
+                    "This request was already answered."
+                ),
+                DurableResolveStatus.EXPIRED: "This request has expired.",
+                DurableResolveStatus.CANCELLED: (
+                    "This request is no longer active."
+                ),
+                DurableResolveStatus.UNSUPPORTED: (
+                    "This request could not be delivered."
+                ),
+                DurableResolveStatus.DELIVERY_FAILED: (
+                    "This request could not be delivered."
+                ),
+                DurableResolveStatus.DELIVERY_UNKNOWN: (
+                    "This request is no longer answerable."
+                ),
+                DurableResolveStatus.NOT_DELIVERED: (
+                    "This request is not ready yet."
+                ),
+                DurableResolveStatus.SCOPE_MISMATCH: (
+                    "This interaction does not match the request."
+                ),
+                DurableResolveStatus.INVALID_OPTION: "That option is invalid.",
+                DurableResolveStatus.NOT_FOUND: (
+                    "This request is unknown or no longer available."
+                ),
+            }
+            await self._respond_ephemeral(
+                interaction,
+                stale_messages.get(
+                    result.status,
+                    "This request cannot be answered.",
+                ),
+            )
 
     class InteractivePromptView(discord.ui.View):
         """One-shot presentation of authoritative registry prompt state."""

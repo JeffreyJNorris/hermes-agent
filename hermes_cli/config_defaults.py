@@ -2026,6 +2026,22 @@ DEFAULT_CONFIG = {
         "allowed_rooms": "",           # If set, bot ONLY responds in these room IDs (whitelist)
     },
 
+    # Durable finite-choice requests. This is a detached inbox, not a
+    # replacement for terminal or application authorization checks. Disabled by
+    # default because the destination and responder policy are operator-owned.
+    "durable_requests": {
+        "enabled": False,
+        "inbox": {
+            "platform": "discord",
+            "chat_id": "",
+            "thread_id": None,
+        },
+        "default_ttl_seconds": 86400,
+        "max_ttl_seconds": 604800,
+        "terminal_retention_seconds": 604800,
+        "scheduled_responder_policy": "any_authorized",
+    },
+
     # Approval mode for dangerous commands:
     #   manual — always prompt the user
     #   smart  — use auxiliary LLM to auto-approve low-risk commands (default)
