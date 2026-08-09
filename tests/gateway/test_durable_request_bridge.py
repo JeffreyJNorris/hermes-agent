@@ -5,7 +5,11 @@ from pathlib import Path
 import pytest
 
 import gateway.durable_request_bridge as bridge_module
-from gateway.durable_request_bridge import DurableRequestBridge
+from gateway.durable_request_bridge import (
+    DurableRequestBridge,
+    DurableWakeDispatchResult,
+    DurableWakeDisposition,
+)
 from gateway.durable_requests import (
     DurableRequestOption,
     DurableRequestSpec,
@@ -14,6 +18,7 @@ from gateway.durable_requests import (
     DurableRequestTarget,
     DurableRequestsConfig,
     DurableResponderMode,
+    DurableWakeStatus,
 )
 from gateway.platforms.base import SendResult
 
@@ -54,7 +59,12 @@ def _config() -> DurableRequestsConfig:
     )
 
 
-def _create(store: DurableRequestStore, reference: str = "ref"):
+def _create(
+    store: DurableRequestStore,
+    reference: str = "ref",
+    *,
+    wake_on_terminal: bool = False,
+):
     return store.create(
         DurableRequestSpec(
             kind="test",
@@ -72,6 +82,7 @@ def _create(store: DurableRequestStore, reference: str = "ref"):
         expected_actor_id=None,
         origin_type="cron",
         origin_id="job",
+        wake_on_terminal=wake_on_terminal,
     ).request
 
 
@@ -333,3 +344,138 @@ async def test_disabled_feature_does_not_open_or_poll_the_ledger(monkeypatch) ->
     )
 
     await DurableRequestBridge().process_once({"discord": Adapter()})
+
+
+@pytest.mark.asyncio
+async def test_terminal_wake_is_acknowledged_after_handler_accepts(
+    store: DurableRequestStore,
+) -> None:
+    request = _create(store, wake_on_terminal=True)
+    store.cancel(
+        origin_type="cron",
+        origin_id="job",
+        request_id=request.request_id,
+    )
+    calls = []
+
+    async def handler(claim):
+        calls.append(claim)
+        return DurableWakeDispatchResult(DurableWakeDisposition.DELIVERED)
+
+    bridge = DurableRequestBridge()
+    bridge.set_wake_handler(handler)
+    await bridge.process_once({})
+    persisted = store.get(request_id=request.request_id)
+
+    assert len(calls) == 1
+    assert calls[0].request.request_id == request.request_id
+    assert persisted is not None
+    assert persisted.status is DurableRequestStatus.CANCELLED
+    assert persisted.wake_status is DurableWakeStatus.DELIVERED
+
+
+@pytest.mark.asyncio
+async def test_retryable_wake_is_released_without_tight_loop(
+    store: DurableRequestStore,
+) -> None:
+    request = _create(store, wake_on_terminal=True)
+    store.cancel(
+        origin_type="cron",
+        origin_id="job",
+        request_id=request.request_id,
+    )
+    calls = 0
+
+    async def handler(_claim):
+        nonlocal calls
+        calls += 1
+        return DurableWakeDispatchResult(
+            DurableWakeDisposition.RETRY,
+            "origin_adapter_unavailable",
+        )
+
+    bridge = DurableRequestBridge()
+    bridge.set_wake_handler(handler)
+    await bridge.process_once({})
+    persisted = store.get(request_id=request.request_id)
+
+    assert calls == 1
+    assert persisted is not None
+    assert persisted.wake_status is DurableWakeStatus.PENDING
+    assert persisted.wake_claim is None
+
+
+@pytest.mark.asyncio
+async def test_permanently_undeliverable_wake_is_dropped(
+    store: DurableRequestStore,
+) -> None:
+    request = _create(store, wake_on_terminal=True)
+    store.cancel(
+        origin_type="cron",
+        origin_id="job",
+        request_id=request.request_id,
+    )
+
+    async def handler(_claim):
+        return DurableWakeDispatchResult(
+            DurableWakeDisposition.DROPPED,
+            "origin_job_missing",
+        )
+
+    bridge = DurableRequestBridge()
+    bridge.set_wake_handler(handler)
+    await bridge.process_once({})
+    persisted = store.get(request_id=request.request_id)
+
+    assert persisted is not None
+    assert persisted.wake_status is DurableWakeStatus.DROPPED
+    assert persisted.wake_reason == "origin_job_missing"
+
+
+@pytest.mark.asyncio
+async def test_handler_exception_releases_wake_for_later_retry(
+    store: DurableRequestStore,
+) -> None:
+    request = _create(store, wake_on_terminal=True)
+    store.cancel(
+        origin_type="cron",
+        origin_id="job",
+        request_id=request.request_id,
+    )
+
+    async def handler(_claim):
+        raise RuntimeError("temporary routing failure")
+
+    bridge = DurableRequestBridge()
+    bridge.set_wake_handler(handler)
+    await bridge.process_once({})
+    persisted = store.get(request_id=request.request_id)
+
+    assert persisted is not None
+    assert persisted.wake_status is DurableWakeStatus.PENDING
+    assert persisted.wake_claim is None
+
+
+@pytest.mark.asyncio
+async def test_worker_cancellation_leaves_ambiguous_wake_claimed(
+    store: DurableRequestStore,
+) -> None:
+    request = _create(store, wake_on_terminal=True)
+    store.cancel(
+        origin_type="cron",
+        origin_id="job",
+        request_id=request.request_id,
+    )
+
+    async def cancelled_handler(_claim):
+        raise __import__("asyncio").CancelledError
+
+    bridge = DurableRequestBridge()
+    bridge.set_wake_handler(cancelled_handler)
+    with pytest.raises(__import__("asyncio").CancelledError):
+        await bridge.process_once({})
+    persisted = store.get(request_id=request.request_id)
+
+    assert persisted is not None
+    assert persisted.wake_status is DurableWakeStatus.CLAIMED
+    assert persisted.wake_claim is not None

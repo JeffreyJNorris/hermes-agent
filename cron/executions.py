@@ -12,12 +12,15 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
-EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
+_IMPORT_HERMES_HOME = get_hermes_home().resolve()
+EXECUTIONS_FILE = _IMPORT_HERMES_HOME / "cron" / "executions.db"
+_IMPORT_EXECUTIONS_FILE = EXECUTIONS_FILE
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
@@ -25,8 +28,21 @@ _PROCESS_ID = uuid.uuid4().hex
 
 
 def _connect() -> sqlite3.Connection:
-    EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(EXECUTIONS_FILE, timeout=5)
+    path = _current_executions_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(path, timeout=5)
+
+
+def _current_executions_file() -> Path:
+    """Return the active profile's ledger while preserving test overrides."""
+
+    configured = Path(EXECUTIONS_FILE)
+    if configured != _IMPORT_EXECUTIONS_FILE:
+        return configured
+    home = get_hermes_home().resolve()
+    if home == _IMPORT_HERMES_HOME:
+        return configured
+    return home / "cron" / "executions.db"
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -41,6 +57,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              id TEXT PRIMARY KEY,
              job_id TEXT NOT NULL,
              source TEXT NOT NULL,
+             trigger_id TEXT,
              process_id TEXT NOT NULL,
              pid INTEGER NOT NULL,
              process_started_at INTEGER,
@@ -52,6 +69,11 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              error TEXT
            )"""
     )
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(executions)").fetchall()
+    }
+    if "trigger_id" not in columns:
+        conn.execute("ALTER TABLE executions ADD COLUMN trigger_id TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -59,6 +81,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
         "ON executions(status, claimed_at DESC, id DESC)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_source_trigger "
+        "ON executions(source, trigger_id) WHERE trigger_id IS NOT NULL"
     )
 
 
@@ -152,6 +178,72 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
     record = _record(row)
     _emit_execution_state(record)
     return record  # type: ignore[return-value]
+
+
+def create_triggered_execution(
+    job_id: str,
+    *,
+    source: str,
+    trigger_id: str,
+) -> tuple[Dict[str, Any], bool]:
+    """Create one idempotent execution reservation for an external trigger."""
+
+    normalized_trigger = str(trigger_id).strip()
+    if not normalized_trigger:
+        raise ValueError("trigger_id is required")
+    now = _hermes_now().isoformat()
+    execution_id = uuid.uuid4().hex
+    pid = os.getpid()
+    with _transaction() as conn:
+        existing = conn.execute(
+            "SELECT * FROM executions WHERE source=? AND trigger_id=?",
+            (str(source), normalized_trigger),
+        ).fetchone()
+        if existing is not None:
+            return dict(existing), False
+        try:
+            conn.execute(
+                """INSERT INTO executions
+                   (id, job_id, source, trigger_id, process_id, pid,
+                    process_started_at, status, claimed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'claimed', ?)""",
+                (
+                    execution_id,
+                    str(job_id),
+                    str(source),
+                    normalized_trigger,
+                    _PROCESS_ID,
+                    pid,
+                    _process_start_time(pid),
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            existing = conn.execute(
+                "SELECT * FROM executions WHERE source=? AND trigger_id=?",
+                (str(source), normalized_trigger),
+            ).fetchone()
+            if existing is None:
+                raise
+            return dict(existing), False
+        row = conn.execute(
+            "SELECT * FROM executions WHERE id=?",
+            (execution_id,),
+        ).fetchone()
+    record = _record(row)
+    _emit_execution_state(record)
+    return record, True  # type: ignore[return-value]
+
+
+def abandon_claimed_execution(execution_id: str) -> bool:
+    """Remove a reservation when executor submission definitely did not occur."""
+
+    with _transaction() as conn:
+        deleted = conn.execute(
+            "DELETE FROM executions WHERE id=? AND status='claimed'",
+            (str(execution_id),),
+        ).rowcount
+    return deleted == 1
 
 
 def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:

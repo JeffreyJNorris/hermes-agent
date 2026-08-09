@@ -9,6 +9,7 @@ from agent.tool_dispatch_helpers import _NEVER_PARALLEL_TOOLS
 from gateway.durable_requests import (
     DurableRequestStatus,
     DurableResponderMode,
+    DurableWakeStatus,
     get_durable_request_store,
     reset_durable_request_store_cache,
 )
@@ -55,21 +56,32 @@ def configured_home(tmp_path: Path):
         reset_hermes_home_override(token)
 
 
-def _bind_live_session(*, session_key: str = "discord:guild:user", actor: str = "42"):
+def _bind_live_session(
+    *,
+    session_key: str = "discord:guild:user",
+    actor: str = "42",
+    session_id: str = "",
+    ui_session_id: str = "",
+    profile: str = "",
+):
     return set_session_vars(
         platform="discord",
         session_key=session_key,
+        session_id=session_id,
+        ui_session_id=ui_session_id,
+        profile=profile,
         user_id=actor,
         cron_session="",
         cron_job_id="",
     )
 
 
-def _bind_cron(*, job_id: str = "job-17"):
+def _bind_cron(*, job_id: str = "job-17", profile: str = ""):
     return set_session_vars(
         platform="",
         session_key="",
         user_id="",
+        profile=profile,
         cron_session="1",
         cron_job_id=job_id,
         async_delivery=False,
@@ -411,3 +423,194 @@ def test_invalid_discord_inbox_hides_tool(tmp_path: Path) -> None:
             "must be a Discord channel id"
         )
     }
+
+
+def test_live_wake_post_captures_trusted_session_lineage(
+    configured_home: Path,
+) -> None:
+    tokens = _bind_live_session(
+        session_id="physical-session",
+        ui_session_id="ui-session",
+        profile="operations",
+    )
+    try:
+        payload = json.loads(
+            durable_request_tool(
+                action="post",
+                title="Release",
+                question="Continue?",
+                options=["Approve", "Reject"],
+                reference="wake-live",
+                wake_on_terminal=True,
+            )
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    request = get_durable_request_store().get(request_id=payload["request_id"])
+    assert payload["wake"] == "requested"
+    assert request is not None
+    assert request.wake_requested is True
+    assert request.wake_status is DurableWakeStatus.NOT_REQUESTED
+    assert request.origin_session_id == "physical-session"
+    assert request.origin_ui_session_id == "ui-session"
+    assert request.origin_profile == "operations"
+
+
+def test_poll_only_post_does_not_persist_wake_routing_metadata(
+    configured_home: Path,
+) -> None:
+    tokens = _bind_live_session(
+        session_id="physical-session",
+        ui_session_id="ui-session",
+        profile="operations",
+    )
+    try:
+        payload = json.loads(
+            durable_request_tool(
+                action="post",
+                title="Release",
+                question="Continue?",
+                options=["Approve", "Reject"],
+                reference="poll-only",
+            )
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    request = get_durable_request_store().get(request_id=payload["request_id"])
+    assert payload["wake"] == "not_requested"
+    assert request is not None
+    assert request.origin_session_id is None
+    assert request.origin_ui_session_id is None
+    assert request.origin_profile is None
+
+
+def test_live_wake_post_fails_closed_without_physical_session_id(
+    configured_home: Path,
+) -> None:
+    tokens = _bind_live_session()
+    try:
+        payload = json.loads(
+            durable_request_tool(
+                action="post",
+                title="Release",
+                question="Continue?",
+                options=["Approve", "Reject"],
+                wake_on_terminal=True,
+            )
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert payload == {
+        "error": "session wake-up requires a durable origin session id"
+    }
+
+
+def test_cron_wake_post_uses_scheduler_owned_origin_and_profile(
+    configured_home: Path,
+) -> None:
+    tokens = _bind_cron(profile="operations")
+    try:
+        payload = json.loads(
+            durable_request_tool(
+                action="post",
+                title="Release",
+                question="Continue?",
+                options=["Approve", "Reject"],
+                reference="wake-cron",
+                wake_on_terminal=True,
+            )
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    request = get_durable_request_store().get(request_id=payload["request_id"])
+    assert payload["wake"] == "requested"
+    assert request is not None
+    assert request.origin_type == "cron"
+    assert request.origin_id == "job-17"
+    assert request.origin_profile == "operations"
+    assert request.origin_session_id is None
+
+
+def test_wake_status_is_structural_and_hides_routing_metadata(
+    configured_home: Path,
+) -> None:
+    tokens = _bind_live_session(session_id="physical-session")
+    try:
+        posted = json.loads(
+            durable_request_tool(
+                action="post",
+                title="Target",
+                question="Choose target.",
+                options=["Staging", "Production"],
+                reference="wake-status",
+                wake_on_terminal=True,
+            )
+        )
+        store = get_durable_request_store()
+        claim = store.claim_next_pending(["discord"])
+        assert claim is not None
+        assert store.bind_delivery(
+            request_id=posted["request_id"],
+            claim_id=claim.claim_id,
+            platform="discord",
+            message_id="message-1",
+        ) is not None
+        assert store.resolve(
+            request_id=posted["request_id"],
+            option_token="2",
+            platform="discord",
+            channel_id="123456789012345679",
+            message_id="message-1",
+            actor_id="42",
+        ).request is not None
+
+        pending = json.loads(
+            durable_request_tool(action="status", reference="wake-status")
+        )
+        wake_claim = store.claim_next_wake()
+        assert wake_claim is not None
+        assert store.complete_wake(
+            request_id=posted["request_id"],
+            claim_id=wake_claim.claim_id,
+        )
+        delivered = json.loads(
+            durable_request_tool(action="status", reference="wake-status")
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert pending["wake"] == "pending"
+    assert delivered["wake"] == "delivered"
+    serialized = json.dumps(delivered)
+    for forbidden in (
+        "physical-session",
+        "message-1",
+        "123456789012345679",
+        "wake_claim",
+        "origin_session_id",
+    ):
+        assert forbidden not in serialized
+
+
+def test_invalid_wake_flag_uses_standard_tool_error(
+    configured_home: Path,
+) -> None:
+    tokens = _bind_live_session(session_id="physical-session")
+    try:
+        payload = json.loads(
+            durable_request_tool(
+                action="post",
+                title="Release",
+                question="Continue?",
+                options=["Approve", "Reject"],
+                wake_on_terminal="yes",
+            )
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert payload == {"error": "wake_on_terminal must be a boolean"}

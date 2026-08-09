@@ -34,7 +34,7 @@ durable_requests:
   scheduled_responder_policy: any_authorized
 ```
 
-Phase one supports a Discord inbox only. The model cannot choose the platform,
+Current delivery support uses a Discord inbox only. The model cannot choose the platform,
 channel, thread, responder policy, or actor scope. Disabling the feature pauses
 outbox delivery and restart reconciliation without deleting persisted rows; they
 can resume if the same profile is enabled again.
@@ -59,9 +59,14 @@ Post a request:
   "question": "The release checks passed. What should happen next?",
   "options": ["Approve", "Reject"],
   "reference": "weekly-release-2026-W32",
-  "expires_in_seconds": 86400
+  "expires_in_seconds": 86400,
+  "wake_on_terminal": true
 }
 ```
+
+`wake_on_terminal` is optional and defaults to `false`. Poll-only callers keep
+the original behavior. When enabled, the request still returns immediately;
+its eventual terminal result is delivered to the trusted origin as a new turn.
 
 Posting is durable before the tool returns. A queued response looks like:
 
@@ -72,6 +77,7 @@ Posting is durable before the tool returns. A queued response looks like:
   "delivery": "queued",
   "reference": "weekly-release-2026-W32",
   "expires_at": "2026-08-09T03:00:00Z",
+  "wake": "requested",
   "created": true
 }
 ```
@@ -99,9 +105,29 @@ A resolved request returns the one-based option index and canonical label:
   "selected_index": 1,
   "selected_label": "Approve",
   "resolved_at": "2026-08-08T04:31:20Z",
-  "expires_at": "2026-08-09T03:00:00Z"
+  "expires_at": "2026-08-09T03:00:00Z",
+  "wake": "delivered"
 }
 ```
+
+Wake state is intentionally structural:
+
+```text
+not_requested
+requested
+pending
+delivered
+dropped
+```
+
+`dropped` means the result remains persisted but its original session or job
+was no longer a safe continuation target. The response may include a bounded
+structural `wake_reason`; it never exposes session IDs, provider message IDs,
+actors, delivery claims, or channel routing.
+
+`delivered` means the fresh conversation turn or cron execution was accepted
+by its runtime. It does not assert that the follow-up agent run completed or
+that any downstream operation succeeded.
 
 Cancel by receipt or reference:
 
@@ -139,9 +165,76 @@ stored message IDs. The database rechecks expiry, platform, channel, message,
 option slot, and responder scope in one write transaction. Resolution commits
 before any best-effort Discord edit.
 
-## Scheduled workflow pattern
+## Terminal wake-up
 
-Phase one uses polling rather than attempting to resume an old Python stack:
+Wake delivery is a second persisted outbox on the same authoritative request
+row. Every terminal transition atomically records both the request outcome and,
+when requested, `wake_status=pending`. The worker then claims, dispatches, and
+acknowledges that wake without changing or reopening the request result.
+
+Terminal outcomes that can wake an origin are:
+
+```text
+selected
+expired
+cancelled
+unsupported
+delivery_failed
+delivery_unknown
+```
+
+Pending and claimed wakes are protected from terminal-retention pruning. A
+gateway restart recovers stale wake claims and resumes delivery. Disabling the
+durable-request feature pauses both provider delivery and wake delivery without
+deleting their rows.
+
+### Conversation origins
+
+A live Discord post records the exact physical gateway session that created
+it. A terminal result is injected as a fresh internal turn in the original
+conversation. Hermes follows verified compression lineage, but it fails closed
+after `/new`, reset, an unknown session, or another non-compression session
+boundary. A replacement conversation is never selected merely because it now
+occupies the same channel.
+
+The injected event includes the request receipt, reference, terminal status,
+display-safe question, and selected label or terminal reason. It states that
+the result is persisted user input rather than authorization. Provider message,
+channel, and responder identifiers are omitted.
+
+Adapter acceptance is the wake acknowledgement boundary. As with the existing
+detached-completion rail, a process death after adapter acceptance but before
+the SQLite acknowledgement can cause an at-least-once replay. Consequential
+follow-up must therefore re-check current state and remain idempotent.
+
+### Scheduled origins
+
+A cron-origin wake starts a new execution for the scheduler-owned job ID. It
+does not resume the original Python stack. The continuation uses the job's
+current model, toolsets, working directory, profile, and delivery settings,
+while removing the schedule's data-collection script and `context_from`
+replay. Its prompt combines the current job prompt with the durable terminal
+event.
+
+The continuation is schedule-neutral:
+
+- It does not advance `next_run_at`.
+- It does not consume a finite dispatch or repeat count.
+- It does not re-enable a paused or disabled job.
+- It does not alter the completed state of a retained one-shot.
+- It receives its own execution-ledger row with source `durable_request`.
+
+Acceptance is idempotent by durable request ID. Hermes records the continuation
+execution before executor submission, favoring at-most-once automatic execution
+over an unsafe duplicate after an ambiguous crash. A definitely failed submit
+removes its unstarted reservation and remains retryable. If Hermes cannot prove
+that reservation cleanup succeeded, it does not create a second execution; the
+execution ledger remains the audit record. A paused, removed, or non-agent
+origin is terminally dropped; the durable result remains queryable.
+
+## Scheduled workflow patterns
+
+Polling remains supported and is the default:
 
 1. Query a stable occurrence reference.
 2. Post when no record exists.
@@ -151,6 +244,12 @@ Phase one uses polling rather than attempting to resume an old Python stack:
 
 The result may be observed more than once, so downstream scheduled operations
 must be idempotent.
+
+For an event-driven schedule, set `wake_on_terminal=true`. The original run can
+finish after posting. Hermes later starts one fresh, schedule-neutral
+continuation when the request terminates. The continuation must query or trust
+only the authoritative request result, revalidate current application state,
+and retain all normal approval gates before mutation.
 
 ## Security and privacy
 
@@ -164,5 +263,6 @@ prunes the row. Callers must provide pre-redacted, display-safe content. Hermes
 disables Discord mention expansion and logs structural fields rather than
 request content at ordinary log levels.
 
-Phase one deliberately excludes text fallback, automatic continuation,
-multiselect, forms, modals, and arbitrary provider components.
+This phase deliberately excludes serialized callbacks, arbitrary continuation
+payloads, automatic application mutations, text fallback, multiselect, forms,
+modals, and arbitrary provider components.

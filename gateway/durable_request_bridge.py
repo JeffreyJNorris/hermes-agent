@@ -4,18 +4,40 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Mapping
+from dataclasses import dataclass
+from enum import Enum
+from typing import Any, Awaitable, Callable, Mapping
 
 from gateway.durable_requests import (
     DELIVERY_CLAIM_STALE_SECONDS,
     MAX_DELIVERY_BATCH,
+    MAX_WAKE_BATCH,
+    WAKE_CLAIM_STALE_SECONDS,
     DurableRequest,
     DurableRequestStatus,
+    DurableWakeClaim,
     get_durable_request_store,
     load_durable_requests_config,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class DurableWakeDisposition(str, Enum):
+    DELIVERED = "delivered"
+    RETRY = "retry"
+    DROPPED = "dropped"
+
+
+@dataclass(frozen=True)
+class DurableWakeDispatchResult:
+    disposition: DurableWakeDisposition
+    reason: str | None = None
+
+
+DurableWakeHandler = Callable[
+    [DurableWakeClaim], Awaitable[DurableWakeDispatchResult]
+]
 
 
 class DurableRequestBridge:
@@ -27,6 +49,12 @@ class DurableRequestBridge:
 
     def __init__(self) -> None:
         self._restored: set[tuple[int, str, str]] = set()
+        self._wake_handler: DurableWakeHandler | None = None
+
+    def set_wake_handler(self, handler: DurableWakeHandler | None) -> None:
+        """Set the profile-scoped terminal wake dispatcher."""
+
+        self._wake_handler = handler
 
     async def process_once(self, adapters: Mapping[Any, Any]) -> None:
         config = load_durable_requests_config()
@@ -41,7 +69,9 @@ class DurableRequestBridge:
         store.recover_stale_delivery_claims(
             stale_after_seconds=DELIVERY_CLAIM_STALE_SECONDS
         )
-        store.prune_terminal(config.terminal_retention_seconds)
+        store.recover_stale_wake_claims(
+            stale_after_seconds=WAKE_CLAIM_STALE_SECONDS
+        )
 
         if platforms:
             await self._restore_bound_requests(
@@ -52,6 +82,63 @@ class DurableRequestBridge:
                 store=store,
                 adapters_by_platform=adapters_by_platform,
             )
+        if self._wake_handler is not None:
+            await self._deliver_terminal_wakes(
+                store=store,
+                wake_handler=self._wake_handler,
+            )
+        store.prune_terminal(config.terminal_retention_seconds)
+
+    async def _deliver_terminal_wakes(
+        self,
+        *,
+        store,
+        wake_handler: DurableWakeHandler,
+    ) -> None:
+        for _ in range(MAX_WAKE_BATCH):
+            claim = store.claim_next_wake()
+            if claim is None:
+                return
+            try:
+                result = await wake_handler(claim)
+            except asyncio.CancelledError:
+                # The target may have accepted the new turn. Keep the claim so
+                # stale-claim recovery makes the ambiguity visible on restart.
+                raise
+            except Exception as exc:
+                store.release_wake_claim(
+                    request_id=claim.request.request_id,
+                    claim_id=claim.claim_id,
+                )
+                logger.warning(
+                    "Durable request wake dispatch raised",
+                    extra={
+                        "request_id": claim.request.request_id,
+                        "origin_type": claim.request.origin_type,
+                        "exception_class": type(exc).__name__,
+                    },
+                )
+                return
+
+            if result.disposition is DurableWakeDisposition.DELIVERED:
+                store.complete_wake(
+                    request_id=claim.request.request_id,
+                    claim_id=claim.claim_id,
+                )
+                continue
+            if result.disposition is DurableWakeDisposition.DROPPED:
+                store.drop_wake(
+                    request_id=claim.request.request_id,
+                    claim_id=claim.claim_id,
+                    reason=result.reason or "origin_unavailable",
+                )
+                continue
+            store.release_wake_claim(
+                request_id=claim.request.request_id,
+                claim_id=claim.claim_id,
+            )
+            # Avoid a tight retry loop within the same worker pass.
+            return
 
     async def _restore_bound_requests(
         self,
@@ -248,4 +335,9 @@ def _adapters_by_platform(adapters: Mapping[Any, Any]) -> dict[str, Any]:
     return result
 
 
-__all__ = ["DurableRequestBridge"]
+__all__ = [
+    "DurableRequestBridge",
+    "DurableWakeDispatchResult",
+    "DurableWakeDisposition",
+    "DurableWakeHandler",
+]

@@ -364,7 +364,17 @@ CREATE TABLE IF NOT EXISTS durable_requests (
     delivery_attempts INTEGER NOT NULL DEFAULT 0,
     delivery_claim TEXT,
     delivery_claimed_at REAL,
-    delivered_at REAL
+    delivered_at REAL,
+    wake_requested INTEGER NOT NULL DEFAULT 0,
+    wake_status TEXT NOT NULL DEFAULT 'not_requested',
+    wake_attempts INTEGER NOT NULL DEFAULT 0,
+    wake_claim TEXT,
+    wake_claimed_at REAL,
+    wake_delivered_at REAL,
+    wake_reason TEXT,
+    origin_session_id TEXT,
+    origin_ui_session_id TEXT,
+    origin_profile TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -415,6 +425,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_handoff_state
     ON sessions(handoff_state, started_at);
 CREATE INDEX IF NOT EXISTS idx_sessions_system_prompt_hash
     ON sessions(system_prompt_hash);
+CREATE INDEX IF NOT EXISTS idx_durable_requests_wake
+    ON durable_requests(wake_status, resolved_at, request_id);
 """
 
 

@@ -53,6 +53,8 @@ MAX_ACTIVE_DURABLE_REQUESTS = 1_000
 MAX_TERMINAL_DURABLE_REQUESTS = 4_096
 DELIVERY_CLAIM_STALE_SECONDS = 5 * 60.0
 MAX_DELIVERY_BATCH = 10
+WAKE_CLAIM_STALE_SECONDS = 5 * 60.0
+MAX_WAKE_BATCH = 10
 
 _REQUEST_ID_RE = re.compile(r"^drq_[A-Za-z0-9_-]+$")
 _OPTION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
@@ -73,6 +75,14 @@ class DurableRequestStatus(str, Enum):
 class DurableResponderMode(str, Enum):
     INITIATOR = "initiator"
     ANY_AUTHORIZED = "any_authorized"
+
+
+class DurableWakeStatus(str, Enum):
+    NOT_REQUESTED = "not_requested"
+    PENDING = "pending"
+    CLAIMED = "claimed"
+    DELIVERED = "delivered"
+    DROPPED = "dropped"
 
 
 class DurableResolveStatus(str, Enum):
@@ -152,6 +162,11 @@ class DurableRequest:
     origin_type: str
     origin_id: str
     reference: str | None
+    wake_requested: bool = False
+    wake_status: DurableWakeStatus = DurableWakeStatus.NOT_REQUESTED
+    origin_session_id: str | None = None
+    origin_ui_session_id: str | None = None
+    origin_profile: str | None = None
     message_id: str | None = None
     selected_option_id: str | None = None
     resolved_by_actor_id: str | None = None
@@ -161,6 +176,11 @@ class DurableRequest:
     delivery_claim: str | None = None
     delivery_claimed_at: float | None = None
     delivered_at: float | None = None
+    wake_attempts: int = 0
+    wake_claim: str | None = None
+    wake_claimed_at: float | None = None
+    wake_delivered_at: float | None = None
+    wake_reason: str | None = None
 
     @property
     def delivery_channel_id(self) -> str:
@@ -184,6 +204,12 @@ class DurableCreateResult:
 
 @dataclass(frozen=True)
 class DurableDeliveryClaim:
+    request: DurableRequest
+    claim_id: str
+
+
+@dataclass(frozen=True)
+class DurableWakeClaim:
     request: DurableRequest
     claim_id: str
 
@@ -482,6 +508,21 @@ class DurableRequestStore:
             conn = self._connect()
             try:
                 conn.executescript(_DURABLE_SCHEMA_SQL)
+                existing_columns = {
+                    row["name"]
+                    for row in conn.execute(
+                        "PRAGMA table_info(durable_requests)"
+                    ).fetchall()
+                }
+                for column, ddl in _DURABLE_WAKE_COLUMN_DDL.items():
+                    if column not in existing_columns:
+                        conn.execute(
+                            f"ALTER TABLE durable_requests ADD COLUMN {column} {ddl}"
+                        )
+                conn.execute(
+                    """CREATE INDEX IF NOT EXISTS idx_durable_requests_wake
+                       ON durable_requests(wake_status, resolved_at, request_id)"""
+                )
                 conn.commit()
             finally:
                 conn.close()
@@ -495,6 +536,10 @@ class DurableRequestStore:
         expected_actor_id: str | None,
         origin_type: str,
         origin_id: str,
+        wake_on_terminal: bool = False,
+        origin_session_id: str | None = None,
+        origin_ui_session_id: str | None = None,
+        origin_profile: str | None = None,
         maximum_ttl_seconds: float = MAX_DURABLE_REQUEST_TTL_SECONDS,
         terminal_retention_seconds: float = (
             DEFAULT_DURABLE_TERMINAL_RETENTION_SECONDS
@@ -527,6 +572,38 @@ class DurableRequestStore:
             maximum=512,
             single_line=True,
         )
+        if not isinstance(wake_on_terminal, bool):
+            raise DurableRequestError("wake_on_terminal must be a boolean")
+        origin_session_value = _normalize_optional_text(
+            origin_session_id,
+            field="origin_session_id",
+            maximum=512,
+            single_line=True,
+        )
+        origin_ui_session_value = _normalize_optional_text(
+            origin_ui_session_id,
+            field="origin_ui_session_id",
+            maximum=512,
+            single_line=True,
+        )
+        origin_profile_value = _normalize_optional_text(
+            origin_profile,
+            field="origin_profile",
+            maximum=128,
+            single_line=True,
+        )
+        if (
+            wake_on_terminal
+            and origin_type_value == "session"
+            and origin_session_value is None
+        ):
+            raise DurableRequestError(
+                "session wake-up requires a durable origin session id"
+            )
+        if not wake_on_terminal:
+            origin_session_value = None
+            origin_ui_session_value = None
+            origin_profile_value = None
 
         if terminal_retention_seconds <= 0:
             raise DurableRequestError("terminal_retention_seconds must be positive")
@@ -573,8 +650,10 @@ class DurableRequestStore:
                            platform, chat_id, thread_id,
                            responder_mode, expected_actor_id,
                            origin_type, origin_id, reference,
-                           delivery_attempts
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+                           wake_requested, wake_status,
+                           origin_session_id, origin_ui_session_id, origin_profile,
+                           delivery_attempts, wake_attempts
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)""",
                     (
                         request_id,
                         validated.kind,
@@ -593,6 +672,11 @@ class DurableRequestStore:
                         origin_type_value,
                         origin_id_value,
                         validated.reference,
+                        1 if wake_on_terminal else 0,
+                        DurableWakeStatus.NOT_REQUESTED.value,
+                        origin_session_value,
+                        origin_ui_session_value,
+                        origin_profile_value,
                     ),
                 )
             except sqlite3.IntegrityError:
@@ -681,13 +765,21 @@ class DurableRequestStore:
                     """UPDATE durable_requests
                        SET status = ?, terminal_reason = ?, updated_at = ?,
                            resolved_at = ?, delivery_claim = NULL,
-                           delivery_claimed_at = NULL
+                           delivery_claimed_at = NULL,
+                           wake_status = CASE
+                               WHEN wake_requested = 1 AND wake_status = ? THEN ?
+                               ELSE wake_status
+                           END,
+                           wake_claim = NULL, wake_claimed_at = NULL,
+                           wake_reason = NULL
                        WHERE request_id = ?""",
                     (
                         DurableRequestStatus.CANCELLED.value,
                         reason_value,
                         now,
                         now,
+                        DurableWakeStatus.NOT_REQUESTED.value,
+                        DurableWakeStatus.PENDING.value,
                         row["request_id"],
                     ),
                 )
@@ -933,9 +1025,23 @@ class DurableRequestStore:
                 """UPDATE durable_requests
                    SET status = ?, terminal_reason = ?, resolved_at = ?,
                        updated_at = ?, delivery_claim = NULL,
-                       delivery_claimed_at = NULL
+                       delivery_claimed_at = NULL,
+                       wake_status = CASE
+                           WHEN wake_requested = 1 AND wake_status = ? THEN ?
+                           ELSE wake_status
+                       END,
+                       wake_claim = NULL, wake_claimed_at = NULL,
+                       wake_reason = NULL
                    WHERE request_id = ?""",
-                (status.value, reason_value, now, now, rid),
+                (
+                    status.value,
+                    reason_value,
+                    now,
+                    now,
+                    DurableWakeStatus.NOT_REQUESTED.value,
+                    DurableWakeStatus.PENDING.value,
+                    rid,
+                ),
             )
             terminal = conn.execute(
                 "SELECT * FROM durable_requests WHERE request_id = ?",
@@ -959,7 +1065,13 @@ class DurableRequestStore:
                 """UPDATE durable_requests
                    SET status = ?, terminal_reason = ?, resolved_at = ?,
                        updated_at = ?, delivery_claim = NULL,
-                       delivery_claimed_at = NULL
+                       delivery_claimed_at = NULL,
+                       wake_status = CASE
+                           WHEN wake_requested = 1 AND wake_status = ? THEN ?
+                           ELSE wake_status
+                       END,
+                       wake_claim = NULL, wake_claimed_at = NULL,
+                       wake_reason = NULL
                    WHERE status = ? AND delivery_claim IS NOT NULL
                      AND delivery_claimed_at IS NOT NULL
                      AND delivery_claimed_at <= ?""",
@@ -968,7 +1080,188 @@ class DurableRequestStore:
                     "provider_send_outcome_unknown",
                     now,
                     now,
+                    DurableWakeStatus.NOT_REQUESTED.value,
+                    DurableWakeStatus.PENDING.value,
                     DurableRequestStatus.PENDING_DELIVERY.value,
+                    cutoff,
+                ),
+            ).rowcount
+            return int(updated)
+
+    def claim_next_wake(self) -> DurableWakeClaim | None:
+        """Claim one terminal wake event for delivery.
+
+        The request row is the outbox record.  A claim changes only wake
+        delivery metadata; it never changes the authoritative request outcome.
+        """
+
+        now = float(self._wall_clock())
+        with self._lock, self._transaction(immediate=True) as conn:
+            self._expire_due_locked(conn, now)
+            row = conn.execute(
+                """SELECT * FROM durable_requests
+                   WHERE wake_status = ? AND status IN (?, ?, ?, ?, ?, ?)
+                   ORDER BY wake_attempts,
+                            COALESCE(resolved_at, updated_at), request_id
+                   LIMIT 1""",
+                (
+                    DurableWakeStatus.PENDING.value,
+                    DurableRequestStatus.SELECTED.value,
+                    DurableRequestStatus.EXPIRED.value,
+                    DurableRequestStatus.CANCELLED.value,
+                    DurableRequestStatus.UNSUPPORTED.value,
+                    DurableRequestStatus.DELIVERY_FAILED.value,
+                    DurableRequestStatus.DELIVERY_UNKNOWN.value,
+                ),
+            ).fetchone()
+            if row is None:
+                return None
+            claim_id = _new_claim_id()
+            updated = conn.execute(
+                """UPDATE durable_requests
+                   SET wake_status = ?, wake_claim = ?, wake_claimed_at = ?,
+                       wake_attempts = wake_attempts + 1, updated_at = ?
+                   WHERE request_id = ? AND wake_status = ?""",
+                (
+                    DurableWakeStatus.CLAIMED.value,
+                    claim_id,
+                    now,
+                    now,
+                    row["request_id"],
+                    DurableWakeStatus.PENDING.value,
+                ),
+            ).rowcount
+            if updated != 1:
+                return None
+            claimed = conn.execute(
+                "SELECT * FROM durable_requests WHERE request_id = ?",
+                (row["request_id"],),
+            ).fetchone()
+            assert claimed is not None
+            return DurableWakeClaim(
+                request=self._row_to_request(claimed),
+                claim_id=claim_id,
+            )
+
+    def release_wake_claim(self, *, request_id: str, claim_id: str) -> bool:
+        """Release a wake claim after a retryable routing failure."""
+
+        rid = _validate_request_id(request_id)
+        claim = _require_text(
+            claim_id,
+            field="claim_id",
+            maximum=256,
+            single_line=True,
+        )
+        now = float(self._wall_clock())
+        with self._lock, self._transaction(immediate=True) as conn:
+            updated = conn.execute(
+                """UPDATE durable_requests
+                   SET wake_status = ?, wake_claim = NULL,
+                       wake_claimed_at = NULL, updated_at = ?
+                   WHERE request_id = ? AND wake_status = ?
+                     AND wake_claim = ?""",
+                (
+                    DurableWakeStatus.PENDING.value,
+                    now,
+                    rid,
+                    DurableWakeStatus.CLAIMED.value,
+                    claim,
+                ),
+            ).rowcount
+            return updated == 1
+
+    def complete_wake(self, *, request_id: str, claim_id: str) -> bool:
+        """Acknowledge a wake only after a fresh turn was accepted."""
+
+        return self._finish_wake(
+            request_id=request_id,
+            claim_id=claim_id,
+            status=DurableWakeStatus.DELIVERED,
+            reason=None,
+        )
+
+    def drop_wake(
+        self,
+        *,
+        request_id: str,
+        claim_id: str,
+        reason: str,
+    ) -> bool:
+        """Terminally drop an undeliverable wake without altering the result."""
+
+        reason_value = _require_text(
+            reason,
+            field="reason",
+            maximum=256,
+            single_line=True,
+        )
+        return self._finish_wake(
+            request_id=request_id,
+            claim_id=claim_id,
+            status=DurableWakeStatus.DROPPED,
+            reason=reason_value,
+        )
+
+    def _finish_wake(
+        self,
+        *,
+        request_id: str,
+        claim_id: str,
+        status: DurableWakeStatus,
+        reason: str | None,
+    ) -> bool:
+        if status not in {DurableWakeStatus.DELIVERED, DurableWakeStatus.DROPPED}:
+            raise DurableRequestError("invalid terminal wake status")
+        rid = _validate_request_id(request_id)
+        claim = _require_text(
+            claim_id,
+            field="claim_id",
+            maximum=256,
+            single_line=True,
+        )
+        now = float(self._wall_clock())
+        with self._lock, self._transaction(immediate=True) as conn:
+            updated = conn.execute(
+                """UPDATE durable_requests
+                   SET wake_status = ?, wake_claim = NULL,
+                       wake_claimed_at = NULL, wake_delivered_at = ?,
+                       wake_reason = ?, updated_at = ?
+                   WHERE request_id = ? AND wake_status = ?
+                     AND wake_claim = ?""",
+                (
+                    status.value,
+                    now if status is DurableWakeStatus.DELIVERED else None,
+                    reason,
+                    now,
+                    rid,
+                    DurableWakeStatus.CLAIMED.value,
+                    claim,
+                ),
+            ).rowcount
+            return updated == 1
+
+    def recover_stale_wake_claims(
+        self,
+        *,
+        stale_after_seconds: float = WAKE_CLAIM_STALE_SECONDS,
+    ) -> int:
+        if stale_after_seconds <= 0:
+            raise DurableRequestError("stale_after_seconds must be positive")
+        now = float(self._wall_clock())
+        cutoff = now - float(stale_after_seconds)
+        with self._lock, self._transaction(immediate=True) as conn:
+            updated = conn.execute(
+                """UPDATE durable_requests
+                   SET wake_status = ?, wake_claim = NULL,
+                       wake_claimed_at = NULL, updated_at = ?
+                   WHERE wake_status = ? AND wake_claim IS NOT NULL
+                     AND wake_claimed_at IS NOT NULL
+                     AND wake_claimed_at <= ?""",
+                (
+                    DurableWakeStatus.PENDING.value,
+                    now,
+                    DurableWakeStatus.CLAIMED.value,
                     cutoff,
                 ),
             ).rowcount
@@ -1084,7 +1377,13 @@ class DurableRequestStore:
                 """UPDATE durable_requests
                    SET status = ?, selected_option_id = ?,
                        resolved_by_actor_id = ?, resolved_at = ?, updated_at = ?,
-                       terminal_reason = NULL
+                       terminal_reason = NULL,
+                       wake_status = CASE
+                           WHEN wake_requested = 1 AND wake_status = ? THEN ?
+                           ELSE wake_status
+                       END,
+                       wake_claim = NULL, wake_claimed_at = NULL,
+                       wake_reason = NULL
                    WHERE request_id = ? AND status = ?""",
                 (
                     DurableRequestStatus.SELECTED.value,
@@ -1092,6 +1391,8 @@ class DurableRequestStore:
                     actual_actor_id,
                     now,
                     now,
+                    DurableWakeStatus.NOT_REQUESTED.value,
+                    DurableWakeStatus.PENDING.value,
                     rid,
                     DurableRequestStatus.OPEN.value,
                 ),
@@ -1154,7 +1455,13 @@ class DurableRequestStore:
             conn.execute(
                 """UPDATE durable_requests
                    SET status = ?, terminal_reason = ?, resolved_at = ?,
-                       updated_at = ?
+                       updated_at = ?,
+                       wake_status = CASE
+                           WHEN wake_requested = 1 AND wake_status = ? THEN ?
+                           ELSE wake_status
+                       END,
+                       wake_claim = NULL, wake_claimed_at = NULL,
+                       wake_reason = NULL
                    WHERE request_id = ?""",
                 (
                     DurableRequestStatus.DELIVERY_FAILED.value,
@@ -1166,6 +1473,8 @@ class DurableRequestStore:
                     ),
                     now,
                     now,
+                    DurableWakeStatus.NOT_REQUESTED.value,
+                    DurableWakeStatus.PENDING.value,
                     rid,
                 ),
             )
@@ -1258,13 +1567,21 @@ class DurableRequestStore:
                 """UPDATE durable_requests
                    SET status = ?, terminal_reason = ?, resolved_at = ?,
                        updated_at = ?, delivery_claim = NULL,
-                       delivery_claimed_at = NULL
+                       delivery_claimed_at = NULL,
+                       wake_status = CASE
+                           WHEN wake_requested = 1 AND wake_status = ? THEN ?
+                           ELSE wake_status
+                       END,
+                       wake_claim = NULL, wake_claimed_at = NULL,
+                       wake_reason = NULL
                    WHERE request_id = ? AND status IN (?, ?)""",
                 (
                     DurableRequestStatus.EXPIRED.value,
                     "deadline_elapsed",
                     now,
                     now,
+                    DurableWakeStatus.NOT_REQUESTED.value,
+                    DurableWakeStatus.PENDING.value,
                     row["request_id"],
                     DurableRequestStatus.PENDING_DELIVERY.value,
                     DurableRequestStatus.OPEN.value,
@@ -1284,13 +1601,21 @@ class DurableRequestStore:
                 """UPDATE durable_requests
                    SET status = ?, terminal_reason = ?, resolved_at = ?,
                        updated_at = ?, delivery_claim = NULL,
-                       delivery_claimed_at = NULL
+                       delivery_claimed_at = NULL,
+                       wake_status = CASE
+                           WHEN wake_requested = 1 AND wake_status = ? THEN ?
+                           ELSE wake_status
+                       END,
+                       wake_claim = NULL, wake_claimed_at = NULL,
+                       wake_reason = NULL
                    WHERE status IN (?, ?) AND expires_at <= ?""",
                 (
                     DurableRequestStatus.EXPIRED.value,
                     "deadline_elapsed",
                     now,
                     now,
+                    DurableWakeStatus.NOT_REQUESTED.value,
+                    DurableWakeStatus.PENDING.value,
                     DurableRequestStatus.PENDING_DELIVERY.value,
                     DurableRequestStatus.OPEN.value,
                     now,
@@ -1311,12 +1636,24 @@ class DurableRequestStore:
         deleted = conn.execute(
             f"""DELETE FROM durable_requests
                 WHERE status IN ({placeholders})
+                  AND wake_status NOT IN (?, ?)
                   AND COALESCE(resolved_at, updated_at) <= ?""",
-            (*terminal_values, cutoff),
+            (
+                *terminal_values,
+                DurableWakeStatus.PENDING.value,
+                DurableWakeStatus.CLAIMED.value,
+                cutoff,
+            ),
         ).rowcount
         terminal_count = conn.execute(
-            f"SELECT COUNT(*) FROM durable_requests WHERE status IN ({placeholders})",
-            terminal_values,
+            f"""SELECT COUNT(*) FROM durable_requests
+                WHERE status IN ({placeholders})
+                  AND wake_status NOT IN (?, ?)""",
+            (
+                *terminal_values,
+                DurableWakeStatus.PENDING.value,
+                DurableWakeStatus.CLAIMED.value,
+            ),
         ).fetchone()[0]
         excess = int(terminal_count) - self._max_terminal
         if excess > 0:
@@ -1325,10 +1662,16 @@ class DurableRequestStore:
                     WHERE request_id IN (
                         SELECT request_id FROM durable_requests
                         WHERE status IN ({placeholders})
+                          AND wake_status NOT IN (?, ?)
                         ORDER BY COALESCE(resolved_at, updated_at), request_id
                         LIMIT ?
                     )""",
-                (*terminal_values, excess),
+                (
+                    *terminal_values,
+                    DurableWakeStatus.PENDING.value,
+                    DurableWakeStatus.CLAIMED.value,
+                    excess,
+                ),
             ).rowcount
         return int(deleted)
 
@@ -1354,6 +1697,11 @@ class DurableRequestStore:
             origin_type=row["origin_type"],
             origin_id=row["origin_id"],
             reference=row["reference"],
+            wake_requested=bool(row["wake_requested"]),
+            wake_status=DurableWakeStatus(row["wake_status"]),
+            origin_session_id=row["origin_session_id"],
+            origin_ui_session_id=row["origin_ui_session_id"],
+            origin_profile=row["origin_profile"],
             message_id=row["message_id"],
             selected_option_id=row["selected_option_id"],
             resolved_by_actor_id=row["resolved_by_actor_id"],
@@ -1371,6 +1719,19 @@ class DurableRequestStore:
             delivered_at=(
                 None if row["delivered_at"] is None else float(row["delivered_at"])
             ),
+            wake_attempts=int(row["wake_attempts"] or 0),
+            wake_claim=row["wake_claim"],
+            wake_claimed_at=(
+                None
+                if row["wake_claimed_at"] is None
+                else float(row["wake_claimed_at"])
+            ),
+            wake_delivered_at=(
+                None
+                if row["wake_delivered_at"] is None
+                else float(row["wake_delivered_at"])
+            ),
+            wake_reason=row["wake_reason"],
         )
 
 
@@ -1442,7 +1803,17 @@ CREATE TABLE IF NOT EXISTS durable_requests (
     delivery_attempts INTEGER NOT NULL DEFAULT 0,
     delivery_claim TEXT,
     delivery_claimed_at REAL,
-    delivered_at REAL
+    delivered_at REAL,
+    wake_requested INTEGER NOT NULL DEFAULT 0,
+    wake_status TEXT NOT NULL DEFAULT 'not_requested',
+    wake_attempts INTEGER NOT NULL DEFAULT 0,
+    wake_claim TEXT,
+    wake_claimed_at REAL,
+    wake_delivered_at REAL,
+    wake_reason TEXT,
+    origin_session_id TEXT,
+    origin_ui_session_id TEXT,
+    origin_profile TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_durable_requests_status_expiry
     ON durable_requests(status, expires_at);
@@ -1454,6 +1825,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_requests_origin_reference
     ON durable_requests(origin_type, origin_id, reference)
     WHERE reference IS NOT NULL;
 """
+
+
+_DURABLE_WAKE_COLUMN_DDL = {
+    "wake_requested": "INTEGER NOT NULL DEFAULT 0",
+    "wake_status": "TEXT NOT NULL DEFAULT 'not_requested'",
+    "wake_attempts": "INTEGER NOT NULL DEFAULT 0",
+    "wake_claim": "TEXT",
+    "wake_claimed_at": "REAL",
+    "wake_delivered_at": "REAL",
+    "wake_reason": "TEXT",
+    "origin_session_id": "TEXT",
+    "origin_ui_session_id": "TEXT",
+    "origin_profile": "TEXT",
+}
 
 
 _STORE_CACHE: dict[Path, DurableRequestStore] = {}
@@ -1603,6 +1988,10 @@ def create_durable_request(
     expected_actor_id: str | None,
     origin_type: str,
     origin_id: str,
+    wake_on_terminal: bool = False,
+    origin_session_id: str | None = None,
+    origin_ui_session_id: str | None = None,
+    origin_profile: str | None = None,
     maximum_ttl_seconds: float = MAX_DURABLE_REQUEST_TTL_SECONDS,
     terminal_retention_seconds: float = (
         DEFAULT_DURABLE_TERMINAL_RETENTION_SECONDS
@@ -1615,6 +2004,10 @@ def create_durable_request(
         expected_actor_id=expected_actor_id,
         origin_type=origin_type,
         origin_id=origin_id,
+        wake_on_terminal=wake_on_terminal,
+        origin_session_id=origin_session_id,
+        origin_ui_session_id=origin_ui_session_id,
+        origin_profile=origin_profile,
         maximum_ttl_seconds=maximum_ttl_seconds,
         terminal_retention_seconds=terminal_retention_seconds,
     )
@@ -1675,6 +2068,7 @@ __all__ = [
     "DELIVERY_CLAIM_STALE_SECONDS",
     "DurableCreateResult",
     "DurableDeliveryClaim",
+    "DurableWakeClaim",
     "DurableRequest",
     "DurableRequestError",
     "DurableRequestLimitError",
@@ -1685,13 +2079,16 @@ __all__ = [
     "DurableRequestTarget",
     "DurableRequestsConfig",
     "DurableResponderMode",
+    "DurableWakeStatus",
     "DurableResolveResult",
     "DurableResolveStatus",
     "MAX_ACTIVE_DURABLE_REQUESTS",
     "MAX_DELIVERY_BATCH",
+    "MAX_WAKE_BATCH",
     "MAX_DURABLE_REQUEST_TTL_SECONDS",
     "MAX_DURABLE_REFERENCE_LENGTH",
     "MIN_DURABLE_OPTIONS",
+    "WAKE_CLAIM_STALE_SECONDS",
     "cancel_durable_request",
     "create_durable_request",
     "get_durable_request",

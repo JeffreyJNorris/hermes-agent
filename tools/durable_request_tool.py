@@ -22,6 +22,7 @@ from gateway.durable_requests import (
     DurableRequestSpec,
     DurableRequestStatus,
     DurableResponderMode,
+    DurableWakeStatus,
     cancel_durable_request,
     create_durable_request,
     get_durable_request,
@@ -46,6 +47,9 @@ class _Origin:
     responder_mode: DurableResponderMode
     expected_actor_id: str | None
     requires_reference: bool
+    origin_session_id: str | None = None
+    origin_ui_session_id: str | None = None
+    origin_profile: str | None = None
 
 
 def check_durable_request_requirements() -> bool:
@@ -62,6 +66,7 @@ def durable_request_tool(
     options: Any = None,
     reference: Any = None,
     expires_in_seconds: Any = None,
+    wake_on_terminal: Any = False,
     request_id: Any = None,
 ) -> str:
     try:
@@ -76,6 +81,10 @@ def durable_request_tool(
         origin = _current_origin(config.scheduled_responder_mode)
 
         if action_value == "post":
+            wake_requested = _normalize_bool(
+                wake_on_terminal,
+                field="wake_on_terminal",
+            )
             normalized_reference = _normalize_optional_text(
                 reference,
                 field="reference",
@@ -120,6 +129,10 @@ def durable_request_tool(
                 expected_actor_id=origin.expected_actor_id,
                 origin_type=origin.origin_type,
                 origin_id=origin.origin_id,
+                wake_on_terminal=wake_requested,
+                origin_session_id=origin.origin_session_id,
+                origin_ui_session_id=origin.origin_ui_session_id,
+                origin_profile=origin.origin_profile,
                 maximum_ttl_seconds=config.max_ttl_seconds,
                 terminal_retention_seconds=config.terminal_retention_seconds,
             )
@@ -236,6 +249,12 @@ def _normalize_ttl(value: Any, *, default: float, maximum: float) -> float:
     return ttl
 
 
+def _normalize_bool(value: Any, *, field: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"{field} must be a boolean")
+
+
 def _normalize_lookup(
     *,
     request_id: Any,
@@ -271,11 +290,17 @@ def _current_origin(
             responder_mode=scheduled_responder_mode,
             expected_actor_id=None,
             requires_reference=True,
+            origin_profile=(
+                get_session_env("HERMES_SESSION_PROFILE", "").strip() or None
+            ),
         )
 
     session_key = get_session_env("HERMES_SESSION_KEY", "").strip()
     actor_id = get_session_env("HERMES_SESSION_USER_ID", "").strip()
     platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+    session_id = get_session_env("HERMES_SESSION_ID", "").strip()
+    ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "").strip()
+    profile = get_session_env("HERMES_SESSION_PROFILE", "").strip()
     if not session_key or not actor_id or platform != "discord":
         raise ValueError(
             "durable requests require an active Discord gateway session or cron job"
@@ -286,6 +311,9 @@ def _current_origin(
         responder_mode=DurableResponderMode.INITIATOR,
         expected_actor_id=actor_id,
         requires_reference=False,
+        origin_session_id=session_id or None,
+        origin_ui_session_id=ui_session_id or None,
+        origin_profile=profile or None,
     )
 
 
@@ -297,6 +325,23 @@ def _serialize_request(request: DurableRequest) -> dict[str, Any]:
     }
     if request.reference is not None:
         payload["reference"] = request.reference
+
+    if not request.wake_requested:
+        payload["wake"] = "not_requested"
+    elif request.status in {
+        DurableRequestStatus.PENDING_DELIVERY,
+        DurableRequestStatus.OPEN,
+    }:
+        payload["wake"] = "requested"
+    elif request.wake_status in {
+        DurableWakeStatus.PENDING,
+        DurableWakeStatus.CLAIMED,
+    }:
+        payload["wake"] = "pending"
+    else:
+        payload["wake"] = request.wake_status.value
+    if request.wake_status is DurableWakeStatus.DROPPED and request.wake_reason:
+        payload["wake_reason"] = request.wake_reason
 
     if request.status is DurableRequestStatus.PENDING_DELIVERY:
         payload["status"] = "pending"
@@ -340,8 +385,9 @@ DURABLE_REQUEST_SCHEMA = {
         "Post, inspect, or cancel a persisted finite-choice request in the "
         "operator-configured Approvals & Requests inbox. Posting returns "
         "immediately and the request can be answered after this turn or a "
-        "gateway restart. Scheduled jobs should use a stable reference and "
-        "poll status on later runs. This is user input, NOT a security "
+        "gateway restart. Scheduled jobs should use a stable reference, then "
+        "either poll status or opt into a fresh terminal wake turn. This is "
+        "user input, NOT a security "
         "authorization token: never use it to bypass terminal, execution, "
         "slash-command, or application approval controls."
     ),
@@ -391,6 +437,14 @@ DURABLE_REQUEST_SCHEMA = {
                     "Optional post lifetime, bounded by operator configuration."
                 ),
             },
+            "wake_on_terminal": {
+                "type": "boolean",
+                "description": (
+                    "Optional for post. When true, a terminal result starts a "
+                    "fresh turn for the originating conversation or schedule. "
+                    "The result remains user input, not an authorization token."
+                ),
+            },
             "request_id": {
                 "type": "string",
                 "description": "Request receipt used by status or cancel.",
@@ -412,6 +466,7 @@ registry.register(
         options=args.get("options"),
         reference=args.get("reference"),
         expires_in_seconds=args.get("expires_in_seconds"),
+        wake_on_terminal=args.get("wake_on_terminal", False),
         request_id=args.get("request_id"),
     ),
     check_fn=check_durable_request_requirements,

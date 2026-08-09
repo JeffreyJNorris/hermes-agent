@@ -95,6 +95,24 @@ def test_quick_backup_includes_execution_ledger():
     assert "cron/executions.db" in _QUICK_STATE_FILES
 
 
+def test_execution_ledger_follows_active_profile_home(tmp_path):
+    import cron.executions as executions
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    profile_home = tmp_path / "profiles" / "operations"
+    token = set_hermes_home_override(profile_home)
+    try:
+        record = executions.create_execution("profile-job", source="builtin")
+    finally:
+        reset_hermes_home_override(token)
+
+    assert record["job_id"] == "profile-job"
+    assert (profile_home / "cron" / "executions.db").is_file()
+
+
 def test_failed_execution_keeps_error(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
 
@@ -397,3 +415,101 @@ def test_job_listing_exposes_latest_execution(monkeypatch, tmp_path):
     listed = jobs.list_jobs(include_disabled=True)
     assert listed[0]["latest_execution"]["id"] == record["id"]
     assert listed[0]["latest_execution"]["status"] == "running"
+
+
+def test_triggered_execution_is_idempotent_by_source_and_trigger(
+    monkeypatch,
+    tmp_path,
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    first, first_created = executions.create_triggered_execution(
+        "job-1",
+        source="durable_request",
+        trigger_id="drq_1",
+    )
+    second, second_created = executions.create_triggered_execution(
+        "job-1",
+        source="durable_request",
+        trigger_id="drq_1",
+    )
+    independent, independent_created = executions.create_triggered_execution(
+        "job-1",
+        source="manual",
+        trigger_id="drq_1",
+    )
+
+    assert first_created is True
+    assert second_created is False
+    assert second["id"] == first["id"]
+    assert first["trigger_id"] == "drq_1"
+    assert independent_created is True
+    assert independent["id"] != first["id"]
+
+
+def test_abandon_triggered_reservation_only_removes_claimed_attempt(
+    monkeypatch,
+    tmp_path,
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    claimed, _ = executions.create_triggered_execution(
+        "job-1",
+        source="durable_request",
+        trigger_id="drq_claimed",
+    )
+    running, _ = executions.create_triggered_execution(
+        "job-1",
+        source="durable_request",
+        trigger_id="drq_running",
+    )
+    executions.mark_execution_running(running["id"])
+
+    assert executions.abandon_claimed_execution(claimed["id"]) is True
+    assert executions.abandon_claimed_execution(claimed["id"]) is False
+    assert executions.abandon_claimed_execution(running["id"]) is False
+    assert executions.latest_execution("job-1")["id"] == running["id"]
+
+
+def test_existing_execution_ledger_adds_trigger_column_and_unique_index(
+    monkeypatch,
+    tmp_path,
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
+    conn = sqlite3.connect(executions.EXECUTIONS_FILE)
+    try:
+        conn.execute(
+            """CREATE TABLE executions (
+                 id TEXT PRIMARY KEY,
+                 job_id TEXT NOT NULL,
+                 source TEXT NOT NULL,
+                 process_id TEXT NOT NULL,
+                 pid INTEGER NOT NULL,
+                 process_started_at INTEGER,
+                 status TEXT NOT NULL,
+                 claimed_at TEXT NOT NULL,
+                 started_at TEXT,
+                 finished_at TEXT,
+                 error TEXT
+               )"""
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    row, created = executions.create_triggered_execution(
+        "job-1",
+        source="durable_request",
+        trigger_id="drq_migrated",
+    )
+
+    assert created is True
+    assert row["trigger_id"] == "drq_migrated"
+    conn = sqlite3.connect(executions.EXECUTIONS_FILE)
+    try:
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(executions)")}
+        indexes = {r[1] for r in conn.execute("PRAGMA index_list(executions)")}
+    finally:
+        conn.close()
+    assert "trigger_id" in columns
+    assert "idx_executions_source_trigger" in indexes
