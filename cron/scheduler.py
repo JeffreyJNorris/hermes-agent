@@ -284,6 +284,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
 from cron.executions import (
+    ExecutionAlreadyRunning,
     abandon_claimed_execution,
     create_execution,
     create_triggered_execution,
@@ -4166,6 +4167,11 @@ def enqueue_durable_request_continuation(
             source="durable_request",
             trigger_id=str(request_id),
         )
+    except ExecutionAlreadyRunning:
+        with _running_lock:
+            _running_job_ids.discard(job["id"])
+            _schedule_neutral_job_ids.discard(job["id"])
+        return "retry", "origin_job_running"
     except Exception:
         with _running_lock:
             _running_job_ids.discard(job["id"])
@@ -4457,7 +4463,16 @@ def tick(
                 _running_job_ids.add(job_id)
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
-            execution = create_execution(job_id, source="builtin")
+            try:
+                execution = create_execution(job_id, source="builtin")
+            except ExecutionAlreadyRunning:
+                with _running_lock:
+                    _running_job_ids.discard(job_id)
+                logger.info(
+                    "Job '%s' already running in another process — skipping",
+                    job.get("name", job_id),
+                )
+                return None
             dispatched_job = dict(job, execution_id=execution["id"])
             _ctx = contextvars.copy_context()
 

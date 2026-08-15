@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _point_ledger(monkeypatch, tmp_path):
     import cron.executions as executions
@@ -183,6 +185,47 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
     assert [r["status"] for r in records] == ["unknown"]
 
 
+def test_live_execution_in_another_process_blocks_durable_reservation(
+    monkeypatch, tmp_path
+):
+    """A CLI-owned run must exclude a gateway-owned continuation."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    repo = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path)
+    env["PYTHONPATH"] = str(repo)
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; "
+            "from cron.executions import create_execution, mark_execution_running; "
+            "r=create_execution('shared-job', source='direct'); "
+            "mark_execution_running(r['id']); print('ready', flush=True); "
+            "time.sleep(30)",
+        ],
+        cwd=repo,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "ready"
+        busy_error = getattr(executions, "ExecutionAlreadyRunning", RuntimeError)
+        with pytest.raises(busy_error):
+            executions.create_triggered_execution(
+                "shared-job",
+                source="durable_request",
+                trigger_id="drq_cross_process",
+            )
+        assert len(executions.list_executions(job_id="shared-job")) == 1
+    finally:
+        holder.terminate()
+        holder.wait(timeout=10)
+
+
 def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch):
     import cron.scheduler as scheduler
 
@@ -211,6 +254,28 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         })
     ]
     assert "submit-fail" not in scheduler.get_running_job_ids()
+
+
+def test_builtin_tick_skips_job_owned_by_another_process(monkeypatch):
+    import cron.scheduler as scheduler
+
+    monkeypatch.setattr(
+        scheduler,
+        "create_execution",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            scheduler.ExecutionAlreadyRunning("external owner")
+        ),
+    )
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "busy-job"}])
+    monkeypatch.setattr(scheduler, "advance_next_runs", lambda _ids: 0)
+    monkeypatch.setattr(
+        scheduler,
+        "_get_parallel_pool",
+        lambda _workers: object(),
+    )
+
+    assert scheduler.tick(verbose=False, sync=False) == 0
+    assert "busy-job" not in scheduler.get_running_job_ids()
 
 
 def test_run_one_job_records_running_then_terminal(monkeypatch):
@@ -433,6 +498,7 @@ def test_triggered_execution_is_idempotent_by_source_and_trigger(
         source="durable_request",
         trigger_id="drq_1",
     )
+    executions.finish_execution(first["id"], success=True)
     independent, independent_created = executions.create_triggered_execution(
         "job-1",
         source="manual",
@@ -457,6 +523,7 @@ def test_abandon_triggered_reservation_only_removes_claimed_attempt(
         source="durable_request",
         trigger_id="drq_claimed",
     )
+    assert executions.abandon_claimed_execution(claimed["id"]) is True
     running, _ = executions.create_triggered_execution(
         "job-1",
         source="durable_request",
@@ -464,7 +531,6 @@ def test_abandon_triggered_reservation_only_removes_claimed_attempt(
     )
     executions.mark_execution_running(running["id"])
 
-    assert executions.abandon_claimed_execution(claimed["id"]) is True
     assert executions.abandon_claimed_execution(claimed["id"]) is False
     assert executions.abandon_claimed_execution(running["id"]) is False
     assert executions.latest_execution("job-1")["id"] == running["id"]
@@ -513,3 +579,4 @@ def test_existing_execution_ledger_adds_trigger_column_and_unique_index(
         conn.close()
     assert "trigger_id" in columns
     assert "idx_executions_source_trigger" in indexes
+    assert "idx_executions_one_active_per_job" in indexes

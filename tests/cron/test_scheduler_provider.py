@@ -253,6 +253,28 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
     assert ran == ["j1"]
 
 
+def test_fire_due_loses_to_execution_owned_by_another_process(monkeypatch):
+    from cron.executions import ExecutionAlreadyRunning
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    monkeypatch.setattr("cron.jobs.claim_job_for_fire", lambda _job_id: True)
+    monkeypatch.setattr("cron.jobs.get_job", lambda _job_id: {"id": "j1"})
+    monkeypatch.setattr(
+        "cron.executions.create_execution",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ExecutionAlreadyRunning("external owner")
+        ),
+    )
+    monkeypatch.setattr(
+        "cron.scheduler.run_one_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("busy job must not run")
+        ),
+    )
+
+    assert InProcessCronScheduler().fire_due("j1") is False
+
+
 # ── F2a: ticker liveness — survival, heartbeat, honest status (#32612, #32895) ──
 
 
@@ -412,5 +434,3 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
     # With 2 profiles and multiple iterations, we should have seen at least 2 calls.
     assert len(tick_count) >= len(profile_homes), \
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
-
-

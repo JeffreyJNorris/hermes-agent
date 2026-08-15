@@ -6,6 +6,7 @@ import pytest
 
 import cron.jobs as jobs
 import cron.scheduler as scheduler
+from cron.executions import ExecutionAlreadyRunning
 
 
 @pytest.fixture(autouse=True)
@@ -169,6 +170,20 @@ def test_running_origin_job_defers_continuation(monkeypatch) -> None:
         scheduler._running_job_ids.add("job-1")
 
     assert _enqueue() == ("retry", "origin_job_running")
+
+
+def test_cross_process_ledger_contention_defers_continuation(monkeypatch) -> None:
+    monkeypatch.setattr(jobs, "get_job", lambda _job_id: _job())
+    monkeypatch.setattr(
+        scheduler,
+        "create_triggered_execution",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ExecutionAlreadyRunning("owned by another process")
+        ),
+    )
+
+    assert _enqueue() == ("retry", "origin_job_running")
+    assert scheduler.get_running_job_ids() == frozenset()
 
 
 def test_existing_trigger_is_acknowledged_without_second_submission(

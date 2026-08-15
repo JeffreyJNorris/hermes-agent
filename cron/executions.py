@@ -27,6 +27,10 @@ _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
 
+class ExecutionAlreadyRunning(RuntimeError):
+    """Raised when another live process owns this job's execution slot."""
+
+
 def _connect() -> sqlite3.Connection:
     path = _current_executions_file()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -86,6 +90,18 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_source_trigger "
         "ON executions(source, trigger_id) WHERE trigger_id IS NOT NULL"
     )
+    # Older ledgers may contain abandoned active rows. Reconcile only owners
+    # proven dead before adding the cross-process exclusivity constraint.
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' "
+        "AND name='idx_executions_one_active_per_job'"
+    ).fetchone() is None:
+        _recover_dead_active_unlocked(conn)
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_executions_one_active_per_job "
+            "ON executions(job_id) "
+            "WHERE status IN ('claimed','running')"
+        )
 
 
 @contextmanager
@@ -146,6 +162,52 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     return current is not None and current == started_at
 
 
+def _recover_dead_active_unlocked(
+    conn: sqlite3.Connection, *, job_id: Optional[str] = None
+) -> int:
+    """Release active slots only when their exact owner is proven dead."""
+    params: tuple[Any, ...] = ()
+    clause = ""
+    if job_id is not None:
+        clause = " AND job_id=?"
+        params = (str(job_id),)
+    rows = conn.execute(
+        "SELECT id, process_id, pid, process_started_at FROM executions "
+        "WHERE status IN ('claimed','running')" + clause,
+        params,
+    ).fetchall()
+    now = _hermes_now().isoformat()
+    changed = 0
+    for row in rows:
+        if row["process_id"] == _PROCESS_ID:
+            continue
+        if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+            continue
+        changed += conn.execute(
+            "UPDATE executions SET status='unknown', finished_at=?, error=? "
+            "WHERE id=? AND status IN ('claimed','running')",
+            (
+                now,
+                "Execution owner exited before a durable terminal state; "
+                "whether side effects ran is unknown.",
+                row["id"],
+            ),
+        ).rowcount
+    return changed
+
+
+def _raise_if_job_active(conn: sqlite3.Connection, job_id: str) -> None:
+    row = conn.execute(
+        "SELECT id FROM executions WHERE job_id=? "
+        "AND status IN ('claimed','running') LIMIT 1",
+        (str(job_id),),
+    ).fetchone()
+    if row is not None:
+        raise ExecutionAlreadyRunning(
+            f"cron job {job_id!r} already has an active execution"
+        )
+
+
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
     limit = max(0, int(MAX_TERMINAL_EXECUTIONS))
     conn.execute(
@@ -164,14 +226,19 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
     with _transaction() as conn:
-        conn.execute(
-            """INSERT INTO executions
-               (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)""",
-            (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now),
-        )
+        _recover_dead_active_unlocked(conn, job_id=str(job_id))
+        try:
+            conn.execute(
+                """INSERT INTO executions
+                   (id, job_id, source, process_id, pid, process_started_at,
+                    status, claimed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)""",
+                (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
+                 _process_start_time(pid), now),
+            )
+        except sqlite3.IntegrityError:
+            _raise_if_job_active(conn, str(job_id))
+            raise
         row = conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
         ).fetchone()
@@ -201,6 +268,7 @@ def create_triggered_execution(
         ).fetchone()
         if existing is not None:
             return dict(existing), False
+        _recover_dead_active_unlocked(conn, job_id=str(job_id))
         try:
             conn.execute(
                 """INSERT INTO executions
@@ -224,6 +292,7 @@ def create_triggered_execution(
                 (str(source), normalized_trigger),
             ).fetchone()
             if existing is None:
+                _raise_if_job_active(conn, str(job_id))
                 raise
             return dict(existing), False
         row = conn.execute(
