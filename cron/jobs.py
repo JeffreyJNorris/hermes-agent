@@ -9,8 +9,10 @@ import contextlib
 import copy
 from contextvars import ContextVar
 from dataclasses import dataclass
+import hashlib
 import json
 import logging
+import math
 import shutil
 import tempfile
 import threading
@@ -1646,6 +1648,206 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     )
 
 
+_DURABLE_RESUME_DEFINITION_FIELDS = (
+    "script",
+    "no_agent",
+    "context_from",
+    "provider",
+    "model",
+    "base_url",
+    "provider_snapshot",
+    "model_snapshot",
+    "workdir",
+    "enabled_toolsets",
+    "deliver",
+    "origin",
+    "attach_to_session",
+)
+
+
+def _durable_resume_definition(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Select the cron definition that approval authorizes, excluding runtime state."""
+    normalized = _normalize_job_record(job)
+    repeat = job.get("repeat")
+    if not isinstance(repeat, dict):
+        raise ValueError("invalid repeat configuration")
+    definition = {
+        "id": normalized["id"],
+        "name": normalized["name"],
+        "schedule": job.get("schedule"),
+        "repeat": {"times": repeat.get("times")},
+        "prompt": normalized["prompt"],
+        "skills": normalized["skills"],
+    }
+    definition.update(
+        {field: job.get(field) for field in _DURABLE_RESUME_DEFINITION_FIELDS}
+    )
+    return definition
+
+
+def cron_job_definition_fingerprint(job: Dict[str, Any]) -> str:
+    """Return a digest of every execution-relevant cron definition field."""
+    encoded = json.dumps(
+        _durable_resume_definition(job),
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _valid_durable_resume_definition(job: Dict[str, Any]) -> bool:
+    job_id = job.get("id")
+    schedule = job.get("schedule")
+    repeat = job.get("repeat")
+    if not isinstance(job_id, str) or not job_id.strip():
+        return False
+    if not isinstance(schedule, dict) or not isinstance(repeat, dict):
+        return False
+    times = repeat.get("times")
+    if times is not None and (type(times) is not int or times <= 0):
+        return False
+    kind = schedule.get("kind")
+    if kind == "once":
+        run_at = schedule.get("run_at")
+        if not isinstance(run_at, str):
+            return False
+        try:
+            datetime.fromisoformat(run_at.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+    elif kind == "interval":
+        minutes = schedule.get("minutes")
+        if (
+            type(minutes) not in {int, float}
+            or not math.isfinite(minutes)
+            or minutes <= 0
+        ):
+            return False
+    elif kind == "cron":
+        if not isinstance(schedule.get("expr"), str) or not schedule["expr"].strip():
+            return False
+    else:
+        return False
+    return not bool(job.get("no_agent")) or bool(job.get("script"))
+
+
+def resume_job_if_unchanged(
+    job_id: str,
+    expected_fingerprint: str,
+) -> Tuple[str, Optional[str]]:
+    """Conditionally resume one canonical job under a single jobs lock."""
+    with _jobs_lock():
+        records = load_jobs()
+        match = next((job for job in records if job.get("id") == job_id), None)
+        if match is None:
+            return "invalidated", "job_missing"
+        if not _valid_durable_resume_definition(match):
+            return "invalidated", "job_invalid"
+        try:
+            current_fingerprint = cron_job_definition_fingerprint(match)
+        except (TypeError, ValueError, OverflowError):
+            return "invalidated", "job_invalid"
+        if current_fingerprint != expected_fingerprint:
+            return "invalidated", "job_changed"
+        if match.get("enabled") is True and match.get("state") == "scheduled":
+            return "already_applied", None
+        if match.get("enabled") is not False or match.get("state") != "paused":
+            return "invalidated", "job_state_invalid"
+        try:
+            next_run_at = compute_next_run(match["schedule"])
+        except Exception:
+            return "failed", "schedule_error"
+        if next_run_at is None:
+            return "failed", "schedule_unavailable"
+        match.update(
+            enabled=True,
+            state="scheduled",
+            paused_at=None,
+            paused_reason=None,
+            next_run_at=next_run_at,
+        )
+        _save_jobs_unlocked(records)
+        return "succeeded", None
+
+
+def prepare_durable_cron_resume(job_ref: str):
+    """Prepare the fixed version-1 durable approval for a paused cron job."""
+    from gateway.durable_actions import PreparedDurableAction, encode_durable_action_payload
+
+    if not isinstance(job_ref, str) or not job_ref.strip():
+        raise ValueError("job reference is required")
+    try:
+        job = resolve_job_ref(job_ref)
+    except AmbiguousJobReference:
+        raise ValueError("job reference is ambiguous") from None
+    if job is None:
+        raise ValueError("cron job was not found")
+    if job.get("enabled") is not False or job.get("state") != "paused":
+        raise ValueError("cron job is not paused")
+    if not _valid_durable_resume_definition(job):
+        raise ValueError("cron job configuration is invalid")
+    fingerprint = cron_job_definition_fingerprint(job)
+    job_id = job["id"]
+    return PreparedDurableAction(
+        action_type="cron.resume",
+        action_version=1,
+        payload_json=encode_durable_action_payload({"job_id": job_id}),
+        fingerprint=fingerprint,
+        idempotency_key=f"cron.resume:{job_id}:{fingerprint}",
+    )
+
+
+def execute_durable_cron_resume(context):
+    """Revalidate policy and execute the fixed version-1 durable resume action."""
+    from gateway.durable_actions import (
+        DurableActionOutcome,
+        DurableActionStatus,
+        decode_durable_action_payload,
+    )
+    from hermes_cli.config import load_config
+
+    if context.action_type != "cron.resume" or context.action_version != 1:
+        return DurableActionOutcome(DurableActionStatus.FAILED, reason="invalid_payload")
+    try:
+        payload = decode_durable_action_payload(context.payload_json)
+    except (TypeError, ValueError):
+        return DurableActionOutcome(DurableActionStatus.FAILED, reason="invalid_payload")
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"job_id"}
+        or not isinstance(payload["job_id"], str)
+        or not payload["job_id"].strip()
+    ):
+        return DurableActionOutcome(DurableActionStatus.FAILED, reason="invalid_payload")
+    try:
+        policy = (load_config() or {}).get("durable_approvals") or {}
+    except Exception:
+        policy = {}
+    allowed = policy.get("allowed_actions")
+    if (
+        policy.get("enabled") is not True
+        or not isinstance(allowed, list)
+        or "cron.resume" not in allowed
+    ):
+        return DurableActionOutcome(
+            DurableActionStatus.INVALIDATED,
+            reason="permission_revoked",
+        )
+
+    status, reason = resume_job_if_unchanged(payload["job_id"], context.fingerprint)
+    outcome = DurableActionOutcome(DurableActionStatus(status), reason=reason)
+    if outcome.status is DurableActionStatus.SUCCEEDED:
+        from cron.scheduler import _notify_provider_jobs_changed
+
+        try:
+            _notify_provider_jobs_changed()
+        except Exception:
+            pass
+    return outcome
+
+
 def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Schedule a job to run on the next scheduler tick. Accepts a job ID or name."""
     job = resolve_job_ref(job_id)
@@ -2744,3 +2946,14 @@ def rewrite_skill_refs(
             "jobs_updated": len(rewrites),
             "jobs_scanned": len(jobs),
         }
+
+
+# Fixed built-in registration: persisted data can select only this exact name/version.
+from gateway.durable_actions import register_durable_action_handler
+
+register_durable_action_handler(
+    "cron.resume",
+    1,
+    prepare=prepare_durable_cron_resume,
+    execute=execute_durable_cron_resume,
+)

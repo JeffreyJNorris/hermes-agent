@@ -268,6 +268,14 @@ _DURABLE_ACTION_HANDLERS: dict[
 ] = {}
 
 
+def _load_builtin_handler(action_type: str) -> None:
+    if (
+        action_type == "cron.resume"
+        and ("cron.resume", 1) not in _DURABLE_ACTION_HANDLERS
+    ):
+        from cron import jobs as _cron_jobs  # noqa: F401
+
+
 def register_durable_action_handler(
     action_type: str,
     action_version: int,
@@ -294,6 +302,7 @@ def lookup_durable_action_preparer(
         _validate_action_identity(action_type, action_version)
     except (TypeError, ValueError):
         return None
+    _load_builtin_handler(action_type)
     registered = _DURABLE_ACTION_HANDLERS.get((action_type, action_version))
     return registered[0] if registered is not None else None
 
@@ -306,6 +315,7 @@ def lookup_durable_action_handler(
         _validate_action_identity(action_type, action_version)
     except (TypeError, ValueError):
         return None
+    _load_builtin_handler(action_type)
     registered = _DURABLE_ACTION_HANDLERS.get((action_type, action_version))
     return registered[1] if registered is not None else None
 

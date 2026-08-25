@@ -1,0 +1,311 @@
+from __future__ import annotations
+
+import logging
+import threading
+from datetime import timedelta
+
+import pytest
+
+from cron import jobs
+from gateway.durable_actions import (
+    DurableActionExecutionContext,
+    DurableActionStatus,
+    decode_durable_action_payload,
+    lookup_durable_action_handler,
+    lookup_durable_action_preparer,
+)
+from hermes_time import now as hermes_now
+
+
+@pytest.fixture()
+def cron_store(tmp_path, monkeypatch):
+    cron_dir = tmp_path / "cron"
+    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
+    monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
+    return tmp_path
+
+
+def _job(**updates):
+    job = {
+        "id": "job-123",
+        "name": "private report",
+        "prompt": "prompt SECRET_VALUE",
+        "skills": ["reporter"],
+        "skill": "reporter",
+        "model": "private-model",
+        "provider": "private-provider",
+        "provider_snapshot": "private-provider-snapshot",
+        "model_snapshot": "private-model-snapshot",
+        "base_url": "https://secret.example/token",
+        "script": "secret-script.py",
+        "no_agent": False,
+        "context_from": ["upstream"],
+        "schedule": {"kind": "interval", "minutes": 30, "display": "every 30m"},
+        "schedule_display": "every 30m",
+        "repeat": {"times": 4, "completed": 1},
+        "enabled": False,
+        "state": "paused",
+        "paused_at": "2026-08-25T00:00:00+00:00",
+        "paused_reason": "manual",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "next_run_at": None,
+        "last_run_at": "2026-08-24T00:00:00+00:00",
+        "last_status": "ok",
+        "last_error": "SECRET_ERROR",
+        "last_delivery_error": "SECRET_DELIVERY_ERROR",
+        "deliver": "origin",
+        "origin": {"platform": "discord", "chat_id": "private-chat"},
+        "enabled_toolsets": ["web"],
+        "workdir": "/private/workdir",
+        "attach_to_session": True,
+    }
+    job.update(updates)
+    return job
+
+
+def _save(job):
+    jobs.save_jobs([job])
+
+
+def _context(prepared):
+    return DurableActionExecutionContext(
+        request_id="request-1",
+        action_type=prepared.action_type,
+        action_version=prepared.action_version,
+        payload_json=prepared.payload_json,
+        fingerprint=prepared.fingerprint,
+        idempotency_key=prepared.idempotency_key,
+    )
+
+
+def _allow(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"durable_approvals": {"enabled": True, "allowed_actions": ["cron.resume"]}},
+    )
+
+
+def test_registry_has_exact_cron_resume_v1():
+    assert lookup_durable_action_preparer("cron.resume", 1) is not None
+    assert lookup_durable_action_handler("cron.resume", 1) is not None
+    assert lookup_durable_action_handler("cron.resume", 2) is None
+
+
+def test_prepare_resolves_id_and_name_to_same_minimal_payload(cron_store):
+    _save(_job())
+    prepare = lookup_durable_action_preparer("cron.resume", 1)
+    assert prepare is not None
+
+    by_id = prepare("job-123")
+    by_name = prepare("private report")
+
+    assert by_id == by_name
+    assert decode_durable_action_payload(by_id.payload_json) == {"job_id": "job-123"}
+    assert by_id.idempotency_key == f"cron.resume:job-123:{by_id.fingerprint}"
+    assert "SECRET_VALUE" not in repr(by_id)
+    assert "secret.example" not in repr(by_id)
+
+
+@pytest.mark.parametrize(
+    "job",
+    [
+        _job(enabled=True, state="scheduled"),
+        _job(enabled=True, state="paused"),
+        _job(enabled=False, state="scheduled"),
+    ],
+)
+def test_prepare_requires_consistently_paused_job(cron_store, job):
+    _save(job)
+    prepare = lookup_durable_action_preparer("cron.resume", 1)
+    with pytest.raises(ValueError, match="not paused"):
+        prepare("job-123")
+
+
+def test_fingerprint_tracks_definition_but_not_runtime_state():
+    original = _job()
+    fingerprint = jobs.cron_job_definition_fingerprint(original)
+    relevant_changes = [
+        {"id": "job-456"},
+        {"name": "renamed"},
+        {"schedule": {"kind": "interval", "minutes": 31}},
+        {"repeat": {"times": 5, "completed": 1}},
+        {"prompt": "changed prompt"},
+        {"skills": ["other"], "skill": "other"},
+        {"script": "other.py"},
+        {"no_agent": True},
+        {"context_from": ["other"]},
+        {"provider": "other"},
+        {"model": "other"},
+        {"base_url": "https://other.example"},
+        {"provider_snapshot": "other"},
+        {"model_snapshot": "other"},
+        {"workdir": "/other"},
+        {"enabled_toolsets": ["terminal"]},
+        {"deliver": "local"},
+        {"origin": {"platform": "telegram", "chat_id": "other"}},
+        {"attach_to_session": False},
+    ]
+    for changes in relevant_changes:
+        assert jobs.cron_job_definition_fingerprint({**original, **changes}) != fingerprint
+
+    volatile = {
+        "enabled": True,
+        "state": "scheduled",
+        "paused_at": None,
+        "paused_reason": None,
+        "next_run_at": "2099-01-01T00:00:00+00:00",
+        "last_run_at": "2098-01-01T00:00:00+00:00",
+        "last_status": "failed",
+        "last_error": "different",
+        "last_delivery_error": "different",
+        "repeat": {"times": 4, "completed": 999},
+        "run_claim": {"token": "volatile"},
+        "created_at": "2099-01-01T00:00:00+00:00",
+    }
+    assert jobs.cron_job_definition_fingerprint({**original, **volatile}) == fingerprint
+
+
+def test_execute_resumes_once_and_then_reports_already_applied(cron_store, monkeypatch):
+    _allow(monkeypatch)
+    _save(_job())
+    prepare = lookup_durable_action_preparer("cron.resume", 1)
+    execute = lookup_durable_action_handler("cron.resume", 1)
+    prepared = prepare("job-123")
+    notifications = []
+    monkeypatch.setattr("cron.scheduler._notify_provider_jobs_changed", lambda: notifications.append(True))
+
+    first = execute(_context(prepared))
+    second = execute(_context(prepared))
+
+    resumed = jobs.get_job("job-123")
+    assert first.status is DurableActionStatus.SUCCEEDED
+    assert second.status is DurableActionStatus.ALREADY_APPLIED
+    assert resumed["enabled"] is True
+    assert resumed["state"] == "scheduled"
+    assert resumed["repeat"] == {"times": 4, "completed": 1}
+    assert resumed["next_run_at"] is not None
+    assert notifications == [True]
+
+
+@pytest.mark.parametrize("case", ["changed", "missing", "invalid"])
+def test_execute_invalidates_changed_missing_or_invalid_job(cron_store, monkeypatch, case):
+    _allow(monkeypatch)
+    _save(_job())
+    prepare = lookup_durable_action_preparer("cron.resume", 1)
+    execute = lookup_durable_action_handler("cron.resume", 1)
+    context = _context(prepare("job-123"))
+    if case == "changed":
+        _save(_job(prompt="new secret"))
+    elif case == "missing":
+        jobs.save_jobs([])
+    else:
+        _save(_job(schedule={"kind": "interval"}))
+    before = jobs.JOBS_FILE.read_bytes()
+    notifications = []
+    monkeypatch.setattr(
+        "cron.scheduler._notify_provider_jobs_changed",
+        lambda: notifications.append(True),
+    )
+
+    outcome = execute(context)
+
+    assert outcome.status is DurableActionStatus.INVALIDATED
+    assert jobs.JOBS_FILE.read_bytes() == before
+    assert notifications == []
+    assert "secret" not in (outcome.reason or "").lower()
+
+
+def test_execute_revalidates_policy_before_mutation(cron_store, monkeypatch):
+    _save(_job())
+    prepare = lookup_durable_action_preparer("cron.resume", 1)
+    execute = lookup_durable_action_handler("cron.resume", 1)
+    context = _context(prepare("job-123"))
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"durable_approvals": {"enabled": False, "allowed_actions": ["cron.resume"]}},
+    )
+    before = jobs.JOBS_FILE.read_bytes()
+
+    outcome = execute(context)
+
+    assert outcome.status is DurableActionStatus.INVALIDATED
+    assert outcome.reason == "permission_revoked"
+    assert jobs.JOBS_FILE.read_bytes() == before
+
+
+def test_past_one_shot_fails_bounded_without_mutation(cron_store, monkeypatch):
+    _allow(monkeypatch)
+    run_at = (hermes_now() + timedelta(seconds=30)).isoformat()
+    _save(_job(schedule={"kind": "once", "run_at": run_at}, repeat={"times": 1, "completed": 0}))
+    prepare = lookup_durable_action_preparer("cron.resume", 1)
+    execute = lookup_durable_action_handler("cron.resume", 1)
+    context = _context(prepare("job-123"))
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: hermes_now() + timedelta(hours=1))
+    before = jobs.JOBS_FILE.read_bytes()
+
+    outcome = execute(context)
+
+    assert outcome.status is DurableActionStatus.FAILED
+    assert outcome.reason == "schedule_unavailable"
+    assert jobs.JOBS_FILE.read_bytes() == before
+
+
+def test_provider_notification_is_after_save_and_best_effort(cron_store, monkeypatch):
+    _allow(monkeypatch)
+    _save(_job())
+    prepare = lookup_durable_action_preparer("cron.resume", 1)
+    execute = lookup_durable_action_handler("cron.resume", 1)
+    context = _context(prepare("job-123"))
+    observed = []
+
+    def notify():
+        observed.append(jobs.get_job("job-123")["enabled"])
+        raise RuntimeError("provider secret")
+
+    monkeypatch.setattr("cron.scheduler._notify_provider_jobs_changed", notify)
+    outcome = execute(context)
+    assert outcome.status is DurableActionStatus.SUCCEEDED
+    assert observed == [True]
+
+
+def test_fingerprint_and_save_share_one_lock(cron_store, monkeypatch):
+    _save(_job())
+    expected = jobs.cron_job_definition_fingerprint(_job())
+    entered_save = threading.Event()
+    competitor_done = threading.Event()
+    original_save = jobs._save_jobs_unlocked
+
+    def blocked_save(records):
+        entered_save.set()
+        assert not competitor_done.wait(0.05)
+        original_save(records)
+
+    monkeypatch.setattr(jobs, "_save_jobs_unlocked", blocked_save)
+    result = []
+    worker = threading.Thread(target=lambda: result.append(jobs.resume_job_if_unchanged("job-123", expected)))
+    worker.start()
+    assert entered_save.wait(2)
+
+    competitor = threading.Thread(
+        target=lambda: (jobs.update_job("job-123", {"prompt": "competing update"}), competitor_done.set())
+    )
+    competitor.start()
+    worker.join(2)
+    competitor.join(2)
+
+    assert result[0] == ("succeeded", None)
+    assert competitor_done.is_set()
+    assert jobs.get_job("job-123")["prompt"] == "competing update"
+
+
+def test_no_sensitive_values_are_logged(cron_store, monkeypatch, caplog):
+    _allow(monkeypatch)
+    _save(_job())
+    prepare = lookup_durable_action_preparer("cron.resume", 1)
+    execute = lookup_durable_action_handler("cron.resume", 1)
+    with caplog.at_level(logging.DEBUG):
+        execute(_context(prepare("job-123")))
+    text = caplog.text
+    for secret in ("SECRET_VALUE", "secret-script.py", "secret.example", "private-model"):
+        assert secret not in text
