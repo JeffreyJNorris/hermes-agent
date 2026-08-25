@@ -1,13 +1,25 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
 
 from gateway import durable_actions
-from gateway.durable_requests import DurableRequestStore
+from gateway.durable_requests import (
+    DurableRequestError,
+    DurableRequestLimitError,
+    DurableRequestOption,
+    DurableRequestSpec,
+    DurableRequestStatus,
+    DurableRequestStore,
+    DurableRequestTarget,
+    DurableResponderMode,
+    DurableWakeStatus,
+    PromptStyle,
+)
 from hermes_state_common import SCHEMA_SQL
 
 
@@ -611,3 +623,439 @@ def test_decoding_persisted_payload_cannot_select_or_invoke_a_handler() -> None:
         is None
     )
     assert called is False
+
+
+def _approval_spec(
+    *,
+    reference: str | None = "resume-job-1",
+    approve_label: str = "Resume now",
+    reject_label: str = "Keep paused",
+) -> DurableRequestSpec:
+    return DurableRequestSpec(
+        kind="cron.resume_approval",
+        title="Resume scheduled job?",
+        body="The job is paused and requires approval before it can resume.",
+        options=(
+            DurableRequestOption("approve", approve_label, PromptStyle.SUCCESS),
+            DurableRequestOption("reject", reject_label, PromptStyle.DANGER),
+        ),
+        ttl_seconds=60,
+        reference=reference,
+    )
+
+
+def _action(
+    *,
+    action_type: str = "cron.resume",
+    idempotency_key: str = "cron.resume:job-1:fingerprint",
+) -> durable_actions.PreparedDurableAction:
+    return durable_actions.PreparedDurableAction(
+        action_type=action_type,
+        action_version=1,
+        payload_json=durable_actions.encode_durable_action_payload(
+            {"job_id": "job-1"}
+        ),
+        fingerprint="sha256:fingerprint",
+        idempotency_key=idempotency_key,
+    )
+
+
+def _create_approval(
+    store: DurableRequestStore,
+    *,
+    spec: DurableRequestSpec | None = None,
+    action: durable_actions.PreparedDurableAction | None = None,
+):
+    return store.create_with_action(
+        spec or _approval_spec(),
+        action=action or _action(),
+        target=DurableRequestTarget("discord", "chat-1", "thread-1"),
+        responder_mode=DurableResponderMode.ANY_AUTHORIZED,
+        expected_actor_id=None,
+        origin_type="session",
+        origin_id="discord:guild:user",
+        origin_session_id="session-1",
+        origin_ui_session_id="ui-session-1",
+        origin_profile="work",
+    )
+
+
+def test_create_with_action_persists_one_joined_approval_and_retains_lineage(
+    tmp_path: Path,
+) -> None:
+    store = DurableRequestStore(tmp_path / "state.db", wall_clock=lambda: 1_000.0)
+
+    result = _create_approval(store)
+
+    assert result.created is True
+    assert result.request.options == (
+        DurableRequestOption("approve", "Resume now", PromptStyle.SUCCESS),
+        DurableRequestOption("reject", "Keep paused", PromptStyle.DANGER),
+    )
+    assert result.request.status is DurableRequestStatus.PENDING_DELIVERY
+    assert result.request.wake_requested is False
+    assert result.request.wake_status is DurableWakeStatus.NOT_REQUESTED
+    assert result.request.origin_session_id == "session-1"
+    assert result.request.origin_ui_session_id == "ui-session-1"
+    assert result.request.origin_profile == "work"
+    assert result.ticket == durable_actions.DurableActionTicket(
+        request_id=result.request.request_id,
+        action_type="cron.resume",
+        action_version=1,
+        payload_json='{"job_id":"job-1"}',
+        fingerprint="sha256:fingerprint",
+        idempotency_key="cron.resume:job-1:fingerprint",
+        status=durable_actions.DurableActionStatus.WAITING_FOR_DECISION,
+        execution_claim=None,
+        execution_claimed_at=None,
+        execution_started_at=None,
+        outcome_reason=None,
+        outcome_json=None,
+        completed_at=None,
+        notification_status=(
+            durable_actions.DurableActionNotificationStatus.NOT_READY
+        ),
+        notification_claim=None,
+        notification_claimed_at=None,
+        notification_completed_at=None,
+        created_at=1_000.0,
+        updated_at=1_000.0,
+    )
+    with pytest.raises(FrozenInstanceError):
+        result.created = False  # type: ignore[misc]
+
+    with sqlite3.connect(tmp_path / "state.db") as conn:
+        assert conn.execute("SELECT COUNT(*) FROM durable_requests").fetchone()[0] == 1
+        assert (
+            conn.execute("SELECT COUNT(*) FROM durable_action_tickets").fetchone()[0]
+            == 1
+        )
+        assert conn.execute(
+            """SELECT COUNT(*)
+               FROM durable_requests AS request
+               JOIN durable_action_tickets AS ticket
+                 ON ticket.request_id = request.request_id"""
+        ).fetchone()[0] == 1
+
+
+def test_create_with_action_returns_terminal_ticket_idempotently(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = DurableRequestStore(db_path, wall_clock=lambda: 1_000.0)
+    first = _create_approval(store)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """UPDATE durable_action_tickets
+               SET status = 'failed', outcome_reason = 'bounded_failure',
+                   outcome_json = '{"changed":false}', completed_at = 1001.0,
+                   notification_status = 'pending', updated_at = 1001.0
+               WHERE request_id = ?""",
+            (first.request.request_id,),
+        )
+
+    repeated = _create_approval(
+        store,
+        spec=_approval_spec(reference="another-reference"),
+    )
+
+    assert repeated.created is False
+    assert repeated.request.request_id == first.request.request_id
+    assert repeated.ticket.status is durable_actions.DurableActionStatus.FAILED
+    assert repeated.ticket.outcome_reason == "bounded_failure"
+    assert repeated.ticket.outcome_json == '{"changed":false}'
+    assert repeated.ticket.notification_status is (
+        durable_actions.DurableActionNotificationStatus.PENDING
+    )
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM durable_requests").fetchone()[0] == 1
+        assert (
+            conn.execute("SELECT COUNT(*) FROM durable_action_tickets").fetchone()[0]
+            == 1
+        )
+
+
+def test_create_with_action_reference_cannot_attach_to_generic_request(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = DurableRequestStore(db_path, wall_clock=lambda: 1_000.0)
+    generic = store.create(
+        _approval_spec(),
+        target=DurableRequestTarget("discord", "chat-1"),
+        responder_mode=DurableResponderMode.ANY_AUTHORIZED,
+        expected_actor_id=None,
+        origin_type="session",
+        origin_id="discord:guild:user",
+    )
+
+    with pytest.raises(DurableRequestError, match="reference"):
+        _create_approval(store)
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM durable_requests").fetchone()[0] == 1
+        assert (
+            conn.execute("SELECT COUNT(*) FROM durable_action_tickets").fetchone()[0]
+            == 0
+        )
+    assert store.get(request_id=generic.request.request_id) == generic.request
+
+
+def test_create_with_action_reference_cannot_return_a_different_action(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = DurableRequestStore(db_path, wall_clock=lambda: 1_000.0)
+    first = _create_approval(store)
+
+    with pytest.raises(DurableRequestError, match="reference"):
+        _create_approval(
+            store,
+            action=_action(
+                action_type="cron.pause",
+                idempotency_key="cron.pause:job-1:fingerprint",
+            ),
+        )
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM durable_requests").fetchone()[0] == 1
+        assert (
+            conn.execute("SELECT COUNT(*) FROM durable_action_tickets").fetchone()[0]
+            == 1
+        )
+    assert store.get(request_id=first.request.request_id) == first.request
+
+
+def test_create_with_action_rolls_back_request_when_ticket_insert_fails(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = DurableRequestStore(db_path, wall_clock=lambda: 1_000.0)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """CREATE TRIGGER fail_ticket_insert
+               BEFORE INSERT ON durable_action_tickets
+               BEGIN
+                   SELECT RAISE(ABORT, 'injected ticket failure');
+               END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected ticket failure"):
+        _create_approval(store)
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM durable_requests").fetchone()[0] == 0
+        assert (
+            conn.execute("SELECT COUNT(*) FROM durable_action_tickets").fetchone()[0]
+            == 0
+        )
+
+
+def test_create_with_action_rolls_back_trigger_ticket_when_request_insert_fails(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = DurableRequestStore(db_path, wall_clock=lambda: 1_000.0)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """CREATE TRIGGER fail_request_insert
+               BEFORE INSERT ON durable_requests
+               BEGIN
+                   INSERT INTO durable_action_tickets (
+                       request_id, action_type, action_version, payload_json,
+                       fingerprint, idempotency_key, status,
+                       notification_status, created_at, updated_at
+                   ) VALUES (
+                       NEW.request_id, 'test.injected', 1, '{}', 'fingerprint',
+                       NEW.request_id, 'waiting_for_decision', 'not_ready', 1, 1
+                   );
+                   SELECT RAISE(ABORT, 'injected request failure');
+               END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected request failure"):
+        _create_approval(store)
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM durable_requests").fetchone()[0] == 0
+        assert (
+            conn.execute("SELECT COUNT(*) FROM durable_action_tickets").fetchone()[0]
+            == 0
+        )
+
+
+def test_concurrent_create_with_action_uses_one_request_and_ticket(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    stores = [
+        DurableRequestStore(db_path, wall_clock=lambda: 1_000.0),
+        DurableRequestStore(db_path, wall_clock=lambda: 1_000.0),
+    ]
+    barrier = threading.Barrier(2)
+    results = []
+    errors = []
+
+    def create(store: DurableRequestStore) -> None:
+        try:
+            barrier.wait()
+            results.append(_create_approval(store))
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=create, args=(store,)) for store in stores]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert sorted(result.created for result in results) == [False, True]
+    assert len({result.request.request_id for result in results}) == 1
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM durable_requests").fetchone()[0] == 1
+        assert (
+            conn.execute("SELECT COUNT(*) FROM durable_action_tickets").fetchone()[0]
+            == 1
+        )
+
+
+def test_generic_creation_remains_ticket_free(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = DurableRequestStore(db_path, wall_clock=lambda: 1_000.0)
+
+    result = store.create(
+        _approval_spec(),
+        target=DurableRequestTarget("discord", "chat-1"),
+        responder_mode=DurableResponderMode.ANY_AUTHORIZED,
+        expected_actor_id=None,
+        origin_type="session",
+        origin_id="generic-session",
+        wake_on_terminal=False,
+        origin_session_id="must-not-be-retained",
+        origin_ui_session_id="must-not-be-retained",
+        origin_profile="must-not-be-retained",
+    )
+
+    assert result.request.origin_session_id is None
+    with sqlite3.connect(db_path) as conn:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM durable_action_tickets").fetchone()[0]
+            == 0
+        )
+
+
+def test_create_with_action_requires_canonical_binary_options_and_session_lineage(
+    tmp_path: Path,
+) -> None:
+    store = DurableRequestStore(tmp_path / "state.db", wall_clock=lambda: 1_000.0)
+    noncanonical = DurableRequestSpec(
+        kind="approval",
+        title="Approve?",
+        body="Choose.",
+        options=(
+            DurableRequestOption("yes", "Approve"),
+            DurableRequestOption("no", "Reject"),
+        ),
+        ttl_seconds=60,
+    )
+
+    with pytest.raises(DurableRequestError, match="approve.*reject"):
+        _create_approval(store, spec=noncanonical)
+    with pytest.raises(DurableRequestError, match="session id"):
+        store.create_with_action(
+            _approval_spec(),
+            action=_action(),
+            target=DurableRequestTarget("discord", "chat-1"),
+            responder_mode=DurableResponderMode.ANY_AUTHORIZED,
+            expected_actor_id=None,
+            origin_type="session",
+            origin_id="discord:guild:user",
+        )
+
+
+def test_create_with_action_accepts_only_prepared_trusted_actions(
+    tmp_path: Path,
+) -> None:
+    store = DurableRequestStore(tmp_path / "state.db", wall_clock=lambda: 1_000.0)
+
+    with pytest.raises(DurableRequestError, match="PreparedDurableAction"):
+        _create_approval(
+            store,
+            action={  # type: ignore[arg-type]
+                "action_type": "cron.resume",
+                "payload_json": '{"command":"run anything"}',
+            },
+        )
+
+
+def test_create_with_action_shares_validation_capacity_and_pruning(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    now = [1_000.0]
+    store = DurableRequestStore(
+        db_path,
+        wall_clock=lambda: now[0],
+        max_active=1,
+    )
+    generic = store.create(
+        _approval_spec(reference="old"),
+        target=DurableRequestTarget("discord", "chat-1"),
+        responder_mode=DurableResponderMode.ANY_AUTHORIZED,
+        expected_actor_id=None,
+        origin_type="session",
+        origin_id="generic-session",
+    )
+
+    with pytest.raises(DurableRequestLimitError):
+        _create_approval(store)
+    assert store.cancel(
+        origin_type="session",
+        origin_id="generic-session",
+        request_id=generic.request.request_id,
+    ) is not None
+    now[0] += 11
+
+    created = store.create_with_action(
+        _approval_spec(approve_label=" A ", reject_label=" R "),
+        action=_action(),
+        target=DurableRequestTarget("DISCORD", " chat-1 "),
+        responder_mode=DurableResponderMode.ANY_AUTHORIZED,
+        expected_actor_id=None,
+        origin_type=" session ",
+        origin_id=" trusted-session ",
+        origin_session_id=" durable-session ",
+        maximum_ttl_seconds=60,
+        terminal_retention_seconds=10,
+    )
+
+    assert created.request.options[0].label == "A"
+    assert created.request.target.platform == "discord"
+    assert created.request.origin_type == "session"
+    assert store.get(request_id=generic.request.request_id) is None
+
+
+def test_create_with_action_logs_no_action_secrets(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = DurableRequestStore(tmp_path / "state.db", wall_clock=lambda: 1_000.0)
+    action = durable_actions.PreparedDurableAction(
+        action_type="cron.resume",
+        action_version=1,
+        payload_json=durable_actions.encode_durable_action_payload(
+            {"job_id": "secret-job-marker"}
+        ),
+        fingerprint="secret-fingerprint-marker",
+        idempotency_key="secret-idempotency-marker",
+    )
+
+    with caplog.at_level("INFO", logger="gateway.durable_requests"):
+        _create_approval(store, action=action)
+
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    assert "secret-job-marker" not in rendered
+    assert "secret-fingerprint-marker" not in rendered
+    assert "secret-idempotency-marker" not in rendered

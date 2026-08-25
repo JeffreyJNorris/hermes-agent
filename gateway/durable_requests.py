@@ -26,6 +26,13 @@ from enum import Enum
 from pathlib import Path
 from typing import Iterable, Iterator, Mapping
 
+from gateway.durable_actions import (
+    DurableActionCreateResult,
+    DurableActionNotificationStatus,
+    DurableActionStatus,
+    DurableActionTicket,
+    PreparedDurableAction,
+)
 from gateway.interactive import (
     MAX_PROMPT_BODY_LENGTH,
     MAX_PROMPT_KIND_LENGTH,
@@ -201,6 +208,21 @@ class DurableRequest:
 class DurableCreateResult:
     request: DurableRequest
     created: bool
+
+
+@dataclass(frozen=True)
+class _ValidatedCreate:
+    spec: DurableRequestSpec
+    target: DurableRequestTarget
+    responder_mode: DurableResponderMode
+    actor: str | None
+    origin_type: str
+    origin_id: str
+    wake_on_terminal: bool
+    origin_session_id: str | None
+    origin_ui_session_id: str | None
+    origin_profile: str | None
+    terminal_retention_seconds: float
 
 
 @dataclass(frozen=True)
@@ -546,11 +568,188 @@ class DurableRequestStore:
             DEFAULT_DURABLE_TERMINAL_RETENTION_SECONDS
         ),
     ) -> DurableCreateResult:
+        values = self._validate_create_inputs(
+            spec,
+            target=target,
+            responder_mode=responder_mode,
+            expected_actor_id=expected_actor_id,
+            origin_type=origin_type,
+            origin_id=origin_id,
+            wake_on_terminal=wake_on_terminal,
+            origin_session_id=origin_session_id,
+            origin_ui_session_id=origin_ui_session_id,
+            origin_profile=origin_profile,
+            maximum_ttl_seconds=maximum_ttl_seconds,
+            terminal_retention_seconds=terminal_retention_seconds,
+            retain_origin=False,
+        )
+        now = float(self._wall_clock())
+        with self._lock, self._transaction(immediate=True) as conn:
+            self._prepare_create_locked(conn, values=values, now=now)
+            if values.spec.reference is not None:
+                existing = self._find_reference_locked(conn, values)
+                if existing is not None:
+                    return DurableCreateResult(
+                        request=self._row_to_request(existing),
+                        created=False,
+                    )
+            self._require_create_capacity_locked(conn)
+            try:
+                row = self._insert_request_locked(conn, values=values, now=now)
+            except sqlite3.IntegrityError:
+                if values.spec.reference is None:
+                    raise
+                existing = self._find_reference_locked(conn, values)
+                if existing is None:
+                    raise
+                return DurableCreateResult(
+                    request=self._row_to_request(existing),
+                    created=False,
+                )
+            return DurableCreateResult(request=self._row_to_request(row), created=True)
+
+    def create_with_action(
+        self,
+        spec: DurableRequestSpec,
+        *,
+        action: PreparedDurableAction,
+        target: DurableRequestTarget,
+        responder_mode: DurableResponderMode,
+        expected_actor_id: str | None,
+        origin_type: str,
+        origin_id: str,
+        origin_session_id: str | None = None,
+        origin_ui_session_id: str | None = None,
+        origin_profile: str | None = None,
+        maximum_ttl_seconds: float = MAX_DURABLE_REQUEST_TTL_SECONDS,
+        terminal_retention_seconds: float = (
+            DEFAULT_DURABLE_TERMINAL_RETENTION_SECONDS
+        ),
+    ) -> DurableActionCreateResult:
+        if not isinstance(action, PreparedDurableAction):
+            raise DurableRequestError("action must be a PreparedDurableAction")
+        values = self._validate_create_inputs(
+            spec,
+            target=target,
+            responder_mode=responder_mode,
+            expected_actor_id=expected_actor_id,
+            origin_type=origin_type,
+            origin_id=origin_id,
+            wake_on_terminal=False,
+            origin_session_id=origin_session_id,
+            origin_ui_session_id=origin_ui_session_id,
+            origin_profile=origin_profile,
+            maximum_ttl_seconds=maximum_ttl_seconds,
+            terminal_retention_seconds=terminal_retention_seconds,
+            retain_origin=True,
+        )
+        if tuple(option.id for option in values.spec.options) != (
+            "approve",
+            "reject",
+        ):
+            raise DurableRequestError(
+                "action approvals require exactly approve and reject options"
+            )
+
+        now = float(self._wall_clock())
+        with self._lock, self._transaction(immediate=True) as conn:
+            self._prepare_create_locked(conn, values=values, now=now)
+            if values.spec.reference is not None:
+                existing_request = self._find_reference_locked(conn, values)
+                if existing_request is not None:
+                    existing_ticket = conn.execute(
+                        "SELECT * FROM durable_action_tickets WHERE request_id = ?",
+                        (existing_request["request_id"],),
+                    ).fetchone()
+                    if (
+                        existing_ticket is None
+                        or existing_ticket["action_type"] != action.action_type
+                        or existing_ticket["idempotency_key"]
+                        != action.idempotency_key
+                    ):
+                        raise DurableRequestError(
+                            "reference belongs to a different durable request or action"
+                        )
+                    return DurableActionCreateResult(
+                        request=self._row_to_request(existing_request),
+                        ticket=self._row_to_action_ticket(existing_ticket),
+                        created=False,
+                    )
+
+            existing_ticket = conn.execute(
+                """SELECT * FROM durable_action_tickets
+                   WHERE action_type = ? AND idempotency_key = ?""",
+                (action.action_type, action.idempotency_key),
+            ).fetchone()
+            if existing_ticket is not None:
+                existing_request = conn.execute(
+                    "SELECT * FROM durable_requests WHERE request_id = ?",
+                    (existing_ticket["request_id"],),
+                ).fetchone()
+                if existing_request is None:
+                    raise DurableRequestError(
+                        "durable action ticket has no matching request"
+                    )
+                return DurableActionCreateResult(
+                    request=self._row_to_request(existing_request),
+                    ticket=self._row_to_action_ticket(existing_ticket),
+                    created=False,
+                )
+
+            self._require_create_capacity_locked(conn)
+            request_row = self._insert_request_locked(conn, values=values, now=now)
+            conn.execute(
+                """INSERT INTO durable_action_tickets (
+                       request_id, action_type, action_version, payload_json,
+                       fingerprint, idempotency_key, status,
+                       notification_status, created_at, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    request_row["request_id"],
+                    action.action_type,
+                    action.action_version,
+                    action.payload_json,
+                    action.fingerprint,
+                    action.idempotency_key,
+                    DurableActionStatus.WAITING_FOR_DECISION.value,
+                    DurableActionNotificationStatus.NOT_READY.value,
+                    now,
+                    now,
+                ),
+            )
+            ticket_row = conn.execute(
+                "SELECT * FROM durable_action_tickets WHERE request_id = ?",
+                (request_row["request_id"],),
+            ).fetchone()
+            assert ticket_row is not None
+            return DurableActionCreateResult(
+                request=self._row_to_request(request_row),
+                ticket=self._row_to_action_ticket(ticket_row),
+                created=True,
+            )
+
+    def _validate_create_inputs(
+        self,
+        spec: DurableRequestSpec,
+        *,
+        target: DurableRequestTarget,
+        responder_mode: DurableResponderMode,
+        expected_actor_id: str | None,
+        origin_type: str,
+        origin_id: str,
+        wake_on_terminal: bool,
+        origin_session_id: str | None,
+        origin_ui_session_id: str | None,
+        origin_profile: str | None,
+        maximum_ttl_seconds: float,
+        terminal_retention_seconds: float,
+        retain_origin: bool,
+    ) -> _ValidatedCreate:
         validated = validate_durable_request_spec(
             spec,
             maximum_ttl_seconds=maximum_ttl_seconds,
         )
-        target = _validate_target(target)
+        validated_target = _validate_target(target)
         if not isinstance(responder_mode, DurableResponderMode):
             raise DurableRequestError("responder_mode is not supported")
         actor = _normalize_optional_text(
@@ -594,121 +793,172 @@ class DurableRequestStore:
             single_line=True,
         )
         if (
-            wake_on_terminal
+            (wake_on_terminal or retain_origin)
             and origin_type_value == "session"
             and origin_session_value is None
         ):
             raise DurableRequestError(
                 "session wake-up requires a durable origin session id"
             )
-        if not wake_on_terminal:
+        if not wake_on_terminal and not retain_origin:
             origin_session_value = None
             origin_ui_session_value = None
             origin_profile_value = None
-
         if terminal_retention_seconds <= 0:
             raise DurableRequestError("terminal_retention_seconds must be positive")
+        return _ValidatedCreate(
+            spec=validated,
+            target=validated_target,
+            responder_mode=responder_mode,
+            actor=actor,
+            origin_type=origin_type_value,
+            origin_id=origin_id_value,
+            wake_on_terminal=wake_on_terminal,
+            origin_session_id=origin_session_value,
+            origin_ui_session_id=origin_ui_session_value,
+            origin_profile=origin_profile_value,
+            terminal_retention_seconds=float(terminal_retention_seconds),
+        )
 
-        now = float(self._wall_clock())
+    def _prepare_create_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        values: _ValidatedCreate,
+        now: float,
+    ) -> None:
+        self._expire_due_locked(conn, now)
+        self._prune_locked(
+            conn,
+            now=now,
+            retention_seconds=values.terminal_retention_seconds,
+        )
+
+    @staticmethod
+    def _find_reference_locked(
+        conn: sqlite3.Connection,
+        values: _ValidatedCreate,
+    ) -> sqlite3.Row | None:
+        return conn.execute(
+            """SELECT * FROM durable_requests
+               WHERE origin_type = ? AND origin_id = ? AND reference = ?""",
+            (values.origin_type, values.origin_id, values.spec.reference),
+        ).fetchone()
+
+    def _require_create_capacity_locked(self, conn: sqlite3.Connection) -> None:
+        active_count = conn.execute(
+            """SELECT COUNT(*) FROM durable_requests
+               WHERE status IN (?, ?)""",
+            (
+                DurableRequestStatus.PENDING_DELIVERY.value,
+                DurableRequestStatus.OPEN.value,
+            ),
+        ).fetchone()[0]
+        if int(active_count) >= self._max_active:
+            raise DurableRequestLimitError("too many active durable requests")
+
+    @staticmethod
+    def _insert_request_locked(
+        conn: sqlite3.Connection,
+        *,
+        values: _ValidatedCreate,
+        now: float,
+    ) -> sqlite3.Row:
         request_id = _new_request_id()
-        with self._lock, self._transaction(immediate=True) as conn:
-            self._expire_due_locked(conn, now)
-            self._prune_locked(
-                conn,
-                now=now,
-                retention_seconds=float(terminal_retention_seconds),
-            )
+        conn.execute(
+            """INSERT INTO durable_requests (
+                   request_id, kind, title, body, options_json, status,
+                   created_at, updated_at, expires_at,
+                   platform, chat_id, thread_id,
+                   responder_mode, expected_actor_id,
+                   origin_type, origin_id, reference,
+                   wake_requested, wake_status,
+                   origin_session_id, origin_ui_session_id, origin_profile,
+                   delivery_attempts, wake_attempts
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)""",
+            (
+                request_id,
+                values.spec.kind,
+                values.spec.title,
+                values.spec.body,
+                _serialize_options(values.spec.options),
+                DurableRequestStatus.PENDING_DELIVERY.value,
+                now,
+                now,
+                now + values.spec.ttl_seconds,
+                values.target.platform,
+                values.target.chat_id,
+                values.target.thread_id,
+                values.responder_mode.value,
+                values.actor,
+                values.origin_type,
+                values.origin_id,
+                values.spec.reference,
+                1 if values.wake_on_terminal else 0,
+                DurableWakeStatus.NOT_REQUESTED.value,
+                values.origin_session_id,
+                values.origin_ui_session_id,
+                values.origin_profile,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM durable_requests WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        assert row is not None
+        logger.info(
+            "Durable request registered",
+            extra={
+                "request_id": request_id,
+                "platform": values.target.platform,
+                "state": DurableRequestStatus.PENDING_DELIVERY.value,
+            },
+        )
+        return row
 
-            if validated.reference is not None:
-                existing = conn.execute(
-                    """SELECT * FROM durable_requests
-                       WHERE origin_type = ? AND origin_id = ? AND reference = ?""",
-                    (origin_type_value, origin_id_value, validated.reference),
-                ).fetchone()
-                if existing is not None:
-                    return DurableCreateResult(
-                        request=self._row_to_request(existing),
-                        created=False,
-                    )
-
-            active_count = conn.execute(
-                """SELECT COUNT(*) FROM durable_requests
-                   WHERE status IN (?, ?)""",
-                (
-                    DurableRequestStatus.PENDING_DELIVERY.value,
-                    DurableRequestStatus.OPEN.value,
-                ),
-            ).fetchone()[0]
-            if int(active_count) >= self._max_active:
-                raise DurableRequestLimitError("too many active durable requests")
-
-            expires_at = now + validated.ttl_seconds
-            try:
-                conn.execute(
-                    """INSERT INTO durable_requests (
-                           request_id, kind, title, body, options_json, status,
-                           created_at, updated_at, expires_at,
-                           platform, chat_id, thread_id,
-                           responder_mode, expected_actor_id,
-                           origin_type, origin_id, reference,
-                           wake_requested, wake_status,
-                           origin_session_id, origin_ui_session_id, origin_profile,
-                           delivery_attempts, wake_attempts
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)""",
-                    (
-                        request_id,
-                        validated.kind,
-                        validated.title,
-                        validated.body,
-                        _serialize_options(validated.options),
-                        DurableRequestStatus.PENDING_DELIVERY.value,
-                        now,
-                        now,
-                        expires_at,
-                        target.platform,
-                        target.chat_id,
-                        target.thread_id,
-                        responder_mode.value,
-                        actor,
-                        origin_type_value,
-                        origin_id_value,
-                        validated.reference,
-                        1 if wake_on_terminal else 0,
-                        DurableWakeStatus.NOT_REQUESTED.value,
-                        origin_session_value,
-                        origin_ui_session_value,
-                        origin_profile_value,
-                    ),
-                )
-            except sqlite3.IntegrityError:
-                if validated.reference is None:
-                    raise
-                existing = conn.execute(
-                    """SELECT * FROM durable_requests
-                       WHERE origin_type = ? AND origin_id = ? AND reference = ?""",
-                    (origin_type_value, origin_id_value, validated.reference),
-                ).fetchone()
-                if existing is None:
-                    raise
-                return DurableCreateResult(
-                    request=self._row_to_request(existing),
-                    created=False,
-                )
-
-            row = conn.execute(
-                "SELECT * FROM durable_requests WHERE request_id = ?",
-                (request_id,),
-            ).fetchone()
-            assert row is not None
-            logger.info(
-                "Durable request registered",
-                extra={
-                    "request_id": request_id,
-                    "platform": target.platform,
-                    "state": DurableRequestStatus.PENDING_DELIVERY.value,
-                },
-            )
-            return DurableCreateResult(request=self._row_to_request(row), created=True)
+    @staticmethod
+    def _row_to_action_ticket(row: sqlite3.Row) -> DurableActionTicket:
+        return DurableActionTicket(
+            request_id=row["request_id"],
+            action_type=row["action_type"],
+            action_version=int(row["action_version"]),
+            payload_json=row["payload_json"],
+            fingerprint=row["fingerprint"],
+            idempotency_key=row["idempotency_key"],
+            status=DurableActionStatus(row["status"]),
+            execution_claim=row["execution_claim"],
+            execution_claimed_at=(
+                None
+                if row["execution_claimed_at"] is None
+                else float(row["execution_claimed_at"])
+            ),
+            execution_started_at=(
+                None
+                if row["execution_started_at"] is None
+                else float(row["execution_started_at"])
+            ),
+            outcome_reason=row["outcome_reason"],
+            outcome_json=row["outcome_json"],
+            completed_at=(
+                None if row["completed_at"] is None else float(row["completed_at"])
+            ),
+            notification_status=DurableActionNotificationStatus(
+                row["notification_status"]
+            ),
+            notification_claim=row["notification_claim"],
+            notification_claimed_at=(
+                None
+                if row["notification_claimed_at"] is None
+                else float(row["notification_claimed_at"])
+            ),
+            notification_completed_at=(
+                None
+                if row["notification_completed_at"] is None
+                else float(row["notification_completed_at"])
+            ),
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+        )
 
     def get(
         self,

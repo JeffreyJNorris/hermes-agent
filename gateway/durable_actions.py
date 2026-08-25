@@ -7,13 +7,16 @@ import math
 import re
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from hermes_state_common import (
     MAX_DURABLE_ACTION_OUTCOME_JSON_BYTES,
     MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH,
     MAX_DURABLE_ACTION_PAYLOAD_BYTES,
 )
+
+if TYPE_CHECKING:
+    from gateway.durable_requests import DurableRequest
 
 
 class DurableActionStatus(str, Enum):
@@ -212,6 +215,13 @@ class DurableActionTicket:
 
 
 @dataclass(frozen=True)
+class DurableActionCreateResult:
+    request: DurableRequest
+    ticket: DurableActionTicket
+    created: bool
+
+
+@dataclass(frozen=True)
 class DurableActionOutcome:
     status: DurableActionStatus
     reason: str | None = None
@@ -286,6 +296,7 @@ def lookup_durable_action_handler(
 
 
 __all__ = [
+    "DurableActionCreateResult",
     "DurableActionNotificationStatus",
     "DurableActionOutcome",
     "DurableActionExecutionContext",
