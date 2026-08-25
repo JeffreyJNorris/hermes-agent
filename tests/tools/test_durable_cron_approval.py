@@ -7,7 +7,11 @@ from pathlib import Path
 import pytest
 
 from cron import jobs
-from gateway.durable_requests import reset_durable_request_store_cache
+from gateway.durable_requests import (
+    DurableRequestStatus,
+    get_durable_request_store,
+    reset_durable_request_store_cache,
+)
 from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
 from hermes_cli.config_defaults import DEFAULT_CONFIG
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -51,8 +55,12 @@ def durable_cron_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         reset_hermes_home_override(token)
 
 
-def _paused_job() -> dict:
-    job = jobs.create_job(prompt="Harmless check", schedule="every 1h")
+def _paused_job(*, name: str | None = None) -> dict:
+    job = jobs.create_job(
+        prompt="Harmless check",
+        schedule="every 1h",
+        name=name,
+    )
     paused = jobs.pause_job(job["id"])
     assert paused is not None
     return paused
@@ -194,6 +202,147 @@ def test_duplicate_unchanged_model_resume_returns_existing_ticket(
     assert first["request_id"] == second["request_id"]
     assert first["created"] is True
     assert second["created"] is False
+
+
+@pytest.mark.parametrize(
+    ("transition", "expected_status"),
+    [
+        ("reject", "declined"),
+        ("expire", "expired"),
+        ("cancel", "cancelled"),
+        ("delivery_failure", "abandoned"),
+    ],
+)
+def test_terminal_ticket_reuse_reports_persisted_action_status(
+    durable_cron_home: Path,
+    transition: str,
+    expected_status: str,
+) -> None:
+    (durable_cron_home / "config.yaml").write_text(
+        _config(enabled=True, allowlisted=True), encoding="utf-8"
+    )
+    job = _paused_job()
+    tokens = _bind_discord_session()
+    try:
+        first = _model_handler(job["id"])
+        store = get_durable_request_store()
+        if transition == "cancel":
+            store.cancel(
+                request_id=first["request_id"],
+                origin_type="session",
+                origin_id="discord:guild:channel:user",
+            )
+        elif transition == "expire":
+            with sqlite3.connect(durable_cron_home / "state.db") as conn:
+                conn.execute(
+                    "UPDATE durable_requests SET expires_at = 0 WHERE request_id = ?",
+                    (first["request_id"],),
+                )
+            store.get(request_id=first["request_id"])
+        else:
+            claim = store.claim_next_pending(["discord"])
+            assert claim is not None
+            if transition == "delivery_failure":
+                store.fail_delivery(
+                    request_id=first["request_id"],
+                    claim_id=claim.claim_id,
+                    status=DurableRequestStatus.DELIVERY_FAILED,
+                    reason="provider_message_missing",
+                )
+            else:
+                store.bind_delivery(
+                    request_id=first["request_id"],
+                    claim_id=claim.claim_id,
+                    platform="discord",
+                    message_id="message-1",
+                )
+                store.resolve(
+                    request_id=first["request_id"],
+                    option_token="2",
+                    platform="discord",
+                    channel_id="123456789012345678",
+                    message_id="message-1",
+                    actor_id="42",
+                )
+        reused = _model_handler(job["id"])
+    finally:
+        clear_session_vars(tokens)
+
+    assert set(reused) == {
+        "status",
+        "request_id",
+        "action",
+        "expires_at",
+        "created",
+    }
+    assert reused["status"] == expected_status
+    assert reused["request_id"] == first["request_id"]
+    assert reused["action"] == "cron.resume"
+    assert reused["created"] is False
+
+
+def test_allowlisted_model_resume_resolves_job_name_to_canonical_id(
+    durable_cron_home: Path,
+) -> None:
+    (durable_cron_home / "config.yaml").write_text(
+        _config(enabled=True, allowlisted=True), encoding="utf-8"
+    )
+    job = _paused_job(name="Nightly report")
+    tokens = _bind_discord_session()
+    try:
+        result = _model_handler("nightly report")
+    finally:
+        clear_session_vars(tokens)
+
+    assert result["status"] == "approval_pending"
+    with sqlite3.connect(durable_cron_home / "state.db") as conn:
+        payload_json = conn.execute(
+            "SELECT payload_json FROM durable_action_tickets"
+        ).fetchone()[0]
+    assert json.loads(payload_json) == {"job_id": job["id"]}
+
+
+def test_allowlisted_model_resume_preserves_ambiguous_name_error(
+    durable_cron_home: Path,
+) -> None:
+    (durable_cron_home / "config.yaml").write_text(
+        _config(enabled=True, allowlisted=True), encoding="utf-8"
+    )
+    first = _paused_job(name="Duplicate")
+    second = _paused_job(name="Duplicate")
+    tokens = _bind_discord_session()
+    try:
+        result = _model_handler("duplicate")
+    finally:
+        clear_session_vars(tokens)
+
+    assert result["success"] is False
+    assert "ambiguous" in result["error"]
+    assert {match["id"] for match in result["matches"]} == {
+        first["id"],
+        second["id"],
+    }
+
+
+def test_allowlisted_model_resume_preserves_not_found_error(
+    durable_cron_home: Path,
+) -> None:
+    (durable_cron_home / "config.yaml").write_text(
+        _config(enabled=True, allowlisted=True), encoding="utf-8"
+    )
+    tokens = _bind_discord_session()
+    try:
+        result = _model_handler("missing job")
+    finally:
+        clear_session_vars(tokens)
+
+    assert result == {
+        "success": False,
+        "error": (
+            "Job with ID or name 'missing job' not found. "
+            "Use cronjob(action='list') to inspect jobs."
+        ),
+    }
 
 
 def test_enabled_but_not_allowlisted_fails_closed_without_resuming(

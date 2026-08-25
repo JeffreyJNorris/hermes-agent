@@ -737,6 +737,42 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
         return {"claimed": True, "success": False, "error": str(e)}
 
 
+def _resolve_job_for_tool(
+    job_ref: str,
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    try:
+        job = resolve_job_ref(job_ref)
+    except AmbiguousJobReference as exc:
+        return None, json.dumps(
+            {
+                "success": False,
+                "error": str(exc),
+                "matches": [
+                    {
+                        "id": match["id"],
+                        "name": match.get("name"),
+                        "schedule": match.get("schedule_display"),
+                        "next_run_at": match.get("next_run_at"),
+                    }
+                    for match in exc.matches
+                ],
+            },
+            indent=2,
+        )
+    if job is None:
+        return None, json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"Job with ID or name '{job_ref}' not found. "
+                    "Use cronjob(action='list') to inspect jobs."
+                ),
+            },
+            indent=2,
+        )
+    return job, None
+
+
 def cronjob(
     action: str,
     job_id: Optional[str] = None,
@@ -861,30 +897,10 @@ def cronjob(
         if not job_id:
             return tool_error(f"job_id is required for action '{normalized}'", success=False)
 
-        try:
-            job = resolve_job_ref(job_id)
-        except AmbiguousJobReference as exc:
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": str(exc),
-                    "matches": [
-                        {
-                            "id": m["id"],
-                            "name": m.get("name"),
-                            "schedule": m.get("schedule_display"),
-                            "next_run_at": m.get("next_run_at"),
-                        }
-                        for m in exc.matches
-                    ],
-                },
-                indent=2,
-            )
-        if not job:
-            return json.dumps(
-                {"success": False, "error": f"Job with ID or name '{job_id}' not found. Use cronjob(action='list') to inspect jobs."},
-                indent=2,
-            )
+        job, resolution_error = _resolve_job_for_tool(job_id)
+        if resolution_error is not None:
+            return resolution_error
+        assert job is not None
         # Resolve to canonical ID (supports name-based lookup)
         job_id = job["id"]
 
@@ -1194,7 +1210,10 @@ def _model_cronjob(args: Dict[str, Any], *, task_id: Optional[str] = None) -> st
     normalized = str(args.get("action", "")).strip().lower()
     if normalized == "resume":
         try:
-            from gateway.durable_actions import lookup_durable_action_preparer
+            from gateway.durable_actions import (
+                DurableActionStatus,
+                lookup_durable_action_preparer,
+            )
             from gateway.durable_requests import (
                 DurableRequestError,
                 DurableRequestLimitError,
@@ -1230,6 +1249,11 @@ def _model_cronjob(args: Dict[str, Any], *, task_id: Optional[str] = None) -> st
             job_id = args.get("job_id")
             if not isinstance(job_id, str) or not job_id.strip():
                 return tool_error("job_id is required for action 'resume'", success=False)
+            job, resolution_error = _resolve_job_for_tool(job_id)
+            if resolution_error is not None:
+                return resolution_error
+            assert job is not None
+            job_id = job["id"]
             prepare = lookup_durable_action_preparer("cron.resume", 1)
             if prepare is None:
                 return tool_error("cron.resume durable approval handler is unavailable")
@@ -1259,7 +1283,11 @@ def _model_cronjob(args: Dict[str, Any], *, task_id: Optional[str] = None) -> st
                 terminal_retention_seconds=request_config.terminal_retention_seconds,
             )
             return tool_result(
-                status="approval_pending",
+                status=(
+                    "approval_pending"
+                    if result.ticket.status is DurableActionStatus.WAITING_FOR_DECISION
+                    else result.ticket.status.value
+                ),
                 request_id=result.request.request_id,
                 action="cron.resume",
                 expires_at=(
