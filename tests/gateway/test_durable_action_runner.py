@@ -271,6 +271,12 @@ def test_stale_claim_recovery_and_stale_execution_terminalization(tmp_path: Path
     assert claim is not None
     assert executing_store.mark_executing(executing_id, claim.token)
     now[0] = 2_301.0
+    assert executing_store.recover_stale(300) == (0, 0)
+    observed = _ticket(executing_db, executing_id)
+    assert observed["status"] == "executing"
+    assert observed["execution_claimed_at"] == 2_000.0
+    assert observed["updated_at"] == 2_301.0
+    now[0] = 2_602.0
     assert executing_store.recover_stale(300) == (0, 1)
     row = _ticket(executing_db, executing_id)
     assert (row["status"], row["outcome_reason"]) == (
@@ -278,8 +284,36 @@ def test_stale_claim_recovery_and_stale_execution_terminalization(tmp_path: Path
         "execution_interrupted",
     )
     assert row["notification_status"] == "pending"
-    assert row["completed_at"] == 2_301.0
+    assert row["completed_at"] == 2_602.0
     assert executing_store.claim_next() is None
+
+
+def test_forward_clock_jump_gets_grace_and_heartbeat_clears_marker(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    request_id = _ready_ticket(db_path)
+    now = [1_000.0]
+    store = DurableActionStore(db_path, wall_clock=lambda: now[0])
+    claim = store.claim_next()
+    assert claim is not None and store.mark_executing(request_id, claim.token)
+    now[0] = 10_000.0
+
+    assert store.recover_stale(300) == (0, 0)
+    observed = _ticket(db_path, request_id)
+    assert observed["status"] == "executing"
+    assert observed["execution_claimed_at"] == 1_000.0
+    assert observed["updated_at"] == 10_000.0
+    assert store.renew_execution_claim(request_id, claim.token) is True
+    renewed = _ticket(db_path, request_id)
+    assert renewed["execution_claimed_at"] == 10_000.0
+    assert renewed["updated_at"] == 10_000.0
+    assert store.complete(
+        request_id,
+        claim.token,
+        DurableActionOutcome(DurableActionStatus.SUCCEEDED),
+    )
+    assert _ticket(db_path, request_id)["status"] == "succeeded"
 
 
 @pytest.mark.parametrize("sample", [float("nan"), float("inf"), float("-inf")])
@@ -516,6 +550,53 @@ async def test_cancellation_drains_handler_and_persists_outcome(tmp_path: Path) 
 
     assert was_pending is True
     assert isinstance(result[0], asyncio.CancelledError)
+    assert _ticket(db_path, request_id)["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_start_still_owns_and_completes_handler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "state.db"
+    request_id = _ready_ticket(db_path)
+    store = DurableActionStore(db_path)
+    start_entered = threading.Event()
+    release_start = threading.Event()
+    handler_called = threading.Event()
+    calls = 0
+    original_start = store.mark_executing
+
+    def blocked_start(request_id: str, token: str) -> bool:
+        start_entered.set()
+        assert release_start.wait(5)
+        return original_start(request_id, token)
+
+    def execute(_context):
+        nonlocal calls
+        calls += 1
+        handler_called.set()
+        return DurableActionOutcome(DurableActionStatus.SUCCEEDED)
+
+    monkeypatch.setattr(store, "mark_executing", blocked_start)
+    _register(execute)
+    runner = DurableActionRunner(
+        store,
+        enabled=True,
+        allowed_actions=["test.execute"],
+    )
+    task = asyncio.create_task(runner.process_once())
+    assert await asyncio.to_thread(start_entered.wait, 5)
+    task.cancel()
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release_start.set()
+    assert await asyncio.to_thread(handler_called.wait, 5)
+    result = await asyncio.gather(task, return_exceptions=True)
+
+    assert isinstance(result[0], asyncio.CancelledError)
+    assert calls == 1
     assert _ticket(db_path, request_id)["status"] == "succeeded"
 
 

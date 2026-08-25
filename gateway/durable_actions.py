@@ -331,12 +331,16 @@ class DurableActionStore:
     def _connect(self) -> sqlite3.Connection:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self._db_path, timeout=10.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA busy_timeout = 10000")
-        from hermes_state import apply_wal_with_fallback
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 10000")
+            from hermes_state import apply_wal_with_fallback
 
-        apply_wal_with_fallback(conn, db_label="state.db (durable_actions)")
-        return conn
+            apply_wal_with_fallback(conn, db_label="state.db (durable_actions)")
+            return conn
+        except Exception:
+            conn.close()
+            raise
 
     @contextmanager
     def _transaction(self):
@@ -496,6 +500,11 @@ class DurableActionStore:
             ).rowcount == 1
 
     def recover_stale(self, stale_after_seconds: float) -> tuple[int, int]:
+        """Recover stale work with two observations for executing tickets.
+
+        The first stale observation only moves ``updated_at``; UNKNOWN requires
+        that marker to remain stale for another interval without a heartbeat.
+        """
         stale_after_seconds = float(stale_after_seconds)
         if not math.isfinite(stale_after_seconds) or stale_after_seconds <= 0:
             raise ValueError("stale_after_seconds must be finite and positive")
@@ -523,7 +532,9 @@ class DurableActionStore:
                        outcome_json = NULL, completed_at = ?,
                        notification_status = ?, updated_at = ?
                    WHERE status = ?
-                     AND COALESCE(execution_claimed_at, execution_started_at) <= ?""",
+                     AND execution_claimed_at <= ?
+                     AND updated_at != execution_claimed_at
+                     AND updated_at <= ?""",
                 (
                     DurableActionStatus.UNKNOWN.value,
                     now,
@@ -531,8 +542,20 @@ class DurableActionStore:
                     now,
                     DurableActionStatus.EXECUTING.value,
                     cutoff,
+                    cutoff,
                 ),
             ).rowcount
+            conn.execute(
+                """UPDATE durable_action_tickets
+                   SET updated_at = ?
+                   WHERE status = ? AND execution_claimed_at <= ?
+                     AND updated_at = execution_claimed_at""",
+                (
+                    now,
+                    DurableActionStatus.EXECUTING.value,
+                    cutoff,
+                ),
+            )
         return claimed, executing
 
 

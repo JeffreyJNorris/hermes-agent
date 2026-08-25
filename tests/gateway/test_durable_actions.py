@@ -128,6 +128,33 @@ def test_action_store_explicitly_closes_schema_connection(
     assert connection.closed is True
 
 
+def test_action_store_connect_closes_connection_when_setup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Connection:
+        closed = False
+        row_factory = None
+
+        def execute(self, _sql: str) -> None:
+            raise sqlite3.OperationalError("setup failed")
+
+        def close(self) -> None:
+            self.closed = True
+
+    connection = Connection()
+    monkeypatch.setattr(
+        durable_actions.sqlite3,
+        "connect",
+        lambda *_args, **_kwargs: connection,
+    )
+
+    with pytest.raises(sqlite3.OperationalError, match="setup failed"):
+        durable_actions.DurableActionStore(tmp_path / "state.db")
+
+    assert connection.closed is True
+
+
 @pytest.mark.parametrize("initializer", ["central", "store"])
 def test_fresh_database_contains_action_ticket_ledger(
     tmp_path: Path,

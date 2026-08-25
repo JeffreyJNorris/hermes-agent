@@ -59,12 +59,8 @@ class DurableActionRunner:
                 claim.token,
                 reason="handler_unavailable",
             )
-        if not await asyncio.to_thread(
-            self._store.mark_executing, context.request_id, claim.token
-        ):
-            return False
         execution = asyncio.create_task(
-            self._execute_and_complete(handler, context, claim.token)
+            self._start_execute_and_complete(handler, context, claim.token)
         )
         try:
             return await asyncio.shield(execution)
@@ -79,6 +75,15 @@ class DurableActionRunner:
             if execution.done() and not execution.cancelled():
                 execution.exception()
             raise asyncio.CancelledError
+
+    async def _start_execute_and_complete(self, handler, context, token: str) -> bool:
+        if not await asyncio.to_thread(
+            self._store.mark_executing,
+            context.request_id,
+            token,
+        ):
+            return False
+        return await self._execute_and_complete(handler, context, token)
 
     async def _execute_and_complete(self, handler, context, token: str) -> bool:
         handler_task = asyncio.create_task(asyncio.to_thread(handler, context))
