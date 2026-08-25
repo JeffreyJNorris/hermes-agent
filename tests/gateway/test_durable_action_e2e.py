@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from cron import jobs
+from gateway import durable_actions
+from gateway.config import Platform
 from gateway.durable_action_runner import (
     DurableActionNotificationDisposition,
     DurableActionNotificationResult,
@@ -26,6 +31,7 @@ from gateway.durable_requests import (
     get_durable_request_store,
     reset_durable_request_store_cache,
 )
+from gateway.run import GatewayRunner
 from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 import tools.cronjob_tools  # noqa: F401 - registers the real model-facing tool
@@ -74,14 +80,14 @@ def _paused_job() -> dict:
     return paused
 
 
-def _post_resume(job_id: str) -> dict:
+def _post_resume(job_id: str, *, actor_id: str = "42") -> dict:
     entry = registry.get_entry("cronjob")
     assert entry is not None
     tokens = set_session_vars(
         platform="discord",
         session_key="discord:guild:source:user",
         session_id="physical-session",
-        user_id="42",
+        user_id=actor_id,
         profile="test-profile",
         cron_session="",
         cron_job_id="",
@@ -92,7 +98,12 @@ def _post_resume(job_id: str) -> dict:
         clear_session_vars(tokens)
 
 
-def _approve(request_id: str) -> None:
+def _approve(
+    request_id: str,
+    *,
+    actor_id: str = "42",
+    message_id: str = "provider-message",
+) -> str:
     store = get_durable_request_store()
     claim = store.claim_next_pending(["discord"])
     assert claim is not None and claim.request.request_id == request_id
@@ -100,17 +111,18 @@ def _approve(request_id: str) -> None:
         request_id=request_id,
         claim_id=claim.claim_id,
         platform="discord",
-        message_id="provider-message",
+        message_id=message_id,
     ) is not None
     result = store.resolve(
         request_id=request_id,
         option_token="1",
         platform="discord",
         channel_id="123456789012345678",
-        message_id="provider-message",
-        actor_id="42",
+        message_id=message_id,
+        actor_id=actor_id,
     )
     assert result.status.value == "resolved"
+    return claim.claim_id
 
 
 def _ticket(profile: Path, request_id: str) -> sqlite3.Row:
@@ -328,31 +340,148 @@ async def test_changed_state_invalidates_without_mutation(
 
 
 @pytest.mark.asyncio
+async def test_composed_failure_notification_and_logs_are_structural_only(
+    profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    payload_canary = "payload-credential-canary"
+    actor_canary = "actor-canary"
+    provider_canary = "provider-message-canary"
+    exception_canary = "raw-handler-exception-canary"
+    _paused_job()
+    records = jobs.load_jobs()
+    records[0]["id"] = payload_canary
+    jobs.save_jobs(records)
+
+    with caplog.at_level("INFO"):
+        response = _post_resume(payload_canary, actor_id=actor_canary)
+        ticket = _ticket(profile, response["request_id"])
+        fingerprint_canary = ticket["fingerprint"]
+        idempotency_canary = ticket["idempotency_key"]
+        delivery_claim_canary = _approve(
+            response["request_id"],
+            actor_id=actor_canary,
+            message_id=provider_canary,
+        )
+        registered = durable_actions._DURABLE_ACTION_HANDLERS[("cron.resume", 1)]
+
+        def fail_with_private_detail(_context):
+            raise RuntimeError(exception_canary)
+
+        monkeypatch.setitem(
+            durable_actions._DURABLE_ACTION_HANDLERS,
+            ("cron.resume", 1),
+            (registered[0], fail_with_private_detail),
+        )
+        gateway = object.__new__(GatewayRunner)
+        gateway._classify_completion_target = AsyncMock(return_value="active")
+        gateway._build_process_event_source = MagicMock(return_value=object())
+        gateway._adapter_for_source = MagicMock(return_value=object())
+        gateway._inject_watch_notification = AsyncMock(return_value=True)
+        notification_claims = []
+
+        async def notify(claim):
+            notification_claims.append(claim.token)
+            return await gateway._dispatch_durable_action_notification(
+                claim,
+                profile_name="primary",
+                adapters={Platform.DISCORD: object()},
+            )
+
+        runner = DurableActionRunner(
+            DurableActionStore(profile / "state.db"),
+            enabled=True,
+            allowed_actions={"cron.resume"},
+            notification_handler=notify,
+        )
+        assert await runner.process_once() is True
+
+    terminal = _ticket(profile, response["request_id"])
+    assert (terminal["status"], terminal["outcome_reason"]) == (
+        "failed",
+        "handler_exception",
+    )
+    text, event = gateway._inject_watch_notification.await_args.args
+    assert "Action status: failed" in text
+    assert "Reason: handler_exception" in text
+    rendered_logs = repr(
+        [(record.msg, record.args, record.__dict__) for record in caplog.records]
+    )
+    public_surfaces = (repr(response), text, repr(event), rendered_logs)
+    private_values = (
+        payload_canary,
+        fingerprint_canary,
+        idempotency_canary,
+        actor_canary,
+        provider_canary,
+        delivery_claim_canary,
+        notification_claims[0],
+        exception_canary,
+    )
+    for surface in public_surfaces:
+        for private in private_values:
+            assert private not in surface
+
+
+@pytest.mark.asyncio
 async def test_disable_pauses_ready_ticket_and_reenable_executes_once(
     profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     job = _paused_job()
     response = _post_resume(job["id"])
     _approve(response["request_id"])
+    passes: list[bool] = []
+    pass_finished = asyncio.Event()
+    original_process_once = DurableActionRunner.process_once
+
+    async def observed_process_once(runner: DurableActionRunner) -> bool:
+        result = await original_process_once(runner)
+        passes.append(runner._enabled)
+        pass_finished.set()
+        return result
+
+    monkeypatch.setattr(DurableActionRunner, "process_once", observed_process_once)
+    provider_notifications = []
+    monkeypatch.setattr(
+        "cron.scheduler._notify_provider_jobs_changed",
+        lambda: provider_notifications.append(True),
+    )
+
+    async def run_gateway_pass() -> None:
+        gateway = object.__new__(GatewayRunner)
+        gateway._running = True
+        gateway._shutdown_event = asyncio.Event()
+        gateway._durable_request_home = profile
+        gateway._durable_action_task = None
+        gateway.adapters = {}
+        gateway.config = SimpleNamespace(multiplex_profiles=False)
+        gateway._dispatch_durable_action_notification = AsyncMock(
+            return_value=DurableActionNotificationResult(
+                DurableActionNotificationDisposition.DELIVERED
+            )
+        )
+        task = asyncio.create_task(gateway._run_durable_action_worker())
+        await asyncio.wait_for(pass_finished.wait(), timeout=2)
+        gateway._running = False
+        gateway._shutdown_event.set()
+        await task
+        pass_finished.clear()
+
     (profile / "config.yaml").write_text(
         _config(approvals_enabled=False), encoding="utf-8"
     )
 
-    assert await DurableActionRunner(
-        DurableActionStore(profile / "state.db"),
-        enabled=False,
-        allowed_actions={"cron.resume"},
-    ).process_once() is False
+    await run_gateway_pass()
+    assert passes == [False]
     assert _ticket(profile, response["request_id"])["status"] == "ready"
     assert jobs.get_job(job["id"])["enabled"] is False
 
     (profile / "config.yaml").write_text(_config(), encoding="utf-8")
-    runner = DurableActionRunner(
-        DurableActionStore(profile / "state.db"),
-        enabled=True,
-        allowed_actions={"cron.resume"},
-    )
-    assert await runner.process_once() is True
-    assert await runner.process_once() is False
+    await run_gateway_pass()
+    await run_gateway_pass()
+    assert passes == [False, True, True]
     assert _ticket(profile, response["request_id"])["status"] == "succeeded"
     assert jobs.get_job(job["id"])["enabled"] is True
+    assert provider_notifications == [True]
