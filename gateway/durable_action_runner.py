@@ -63,9 +63,14 @@ class DurableActionRunner:
         await asyncio.to_thread(
             self._store.recover_stale_notifications, self._stale_claim_seconds
         )
+        action_processed = await self._process_action()
+        notification_processed = await self._dispatch_notification()
+        return action_processed or notification_processed
+
+    async def _process_action(self) -> bool:
         claim = await asyncio.to_thread(self._store.claim_next)
         if claim is None:
-            return await self._dispatch_notification()
+            return False
         context = claim.context
         if context.action_type not in self._allowed_actions:
             return await asyncio.to_thread(

@@ -206,6 +206,11 @@ CREATE TABLE IF NOT EXISTS durable_action_tickets (
     notification_claim TEXT,
     notification_claimed_at REAL,
     notification_completed_at REAL,
+    notification_reason TEXT
+        CHECK (
+            notification_reason IS NULL
+            OR length(notification_reason) <= {MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH}
+        ),
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -216,6 +221,18 @@ CREATE INDEX IF NOT EXISTS idx_durable_action_tickets_runnable
 CREATE INDEX IF NOT EXISTS idx_durable_action_tickets_notification
     ON durable_action_tickets(notification_status, notification_claimed_at, updated_at);
 """
+
+
+def reconcile_durable_action_schema(conn) -> None:
+    """Create the action ledger and upgrade pre-notification-reason ledgers."""
+    conn.executescript(DURABLE_ACTION_SCHEMA_SQL)
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(durable_action_tickets)")
+    }
+    if "notification_reason" not in columns:
+        conn.execute(
+            "ALTER TABLE durable_action_tickets ADD COLUMN notification_reason TEXT"
+        )
 
 
 _FTS_TRIGGERS = (

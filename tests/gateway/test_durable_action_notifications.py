@@ -27,12 +27,18 @@ from unittest.mock import AsyncMock, MagicMock
 from types import SimpleNamespace
 
 
+@pytest.fixture(autouse=True)
+def _isolate_handlers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(durable_actions, "_DURABLE_ACTION_HANDLERS", {})
+
+
 def _terminal_ticket(
     db_path: Path,
     *,
     status: DurableActionStatus = DurableActionStatus.SUCCEEDED,
     reason: str | None = "applied",
     origin_type: str = "session",
+    suffix: str = "default",
 ) -> str:
     created = DurableRequestStore(db_path, wall_clock=lambda: 1_000.0).create_with_action(
         DurableRequestSpec(
@@ -52,7 +58,7 @@ def _terminal_ticket(
                 {"job_id": "private-job"}
             ),
             fingerprint="private-fingerprint",
-            idempotency_key="private-idempotency",
+            idempotency_key=f"private-idempotency-{suffix}",
         ),
         target=DurableRequestTarget("discord", "private-inbox"),
         responder_mode=DurableResponderMode.ANY_AUTHORIZED,
@@ -136,6 +142,27 @@ def test_notification_release_and_drop_never_change_action_outcome(
     assert row["status"] == "invalidated"
     assert row["outcome_reason"] == "applied"
     assert row["notification_status"] == "dropped"
+    assert row["notification_reason"] == "origin_session_ended"
+
+
+def test_notification_claim_retry_and_delivery_clear_drop_reason(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    request_id = _terminal_ticket(db_path)
+    store = DurableActionStore(db_path, wall_clock=lambda: 2_000.0)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE durable_action_tickets SET notification_reason = 'old_reason'"
+        )
+
+    first = store.claim_next_notification()
+    assert first is not None
+    assert _row(db_path, request_id)["notification_reason"] is None
+    assert store.release_notification(request_id, first.token)
+    assert _row(db_path, request_id)["notification_reason"] is None
+    second = store.claim_next_notification()
+    assert second is not None
+    assert store.complete_notification(request_id, second.token)
+    assert _row(db_path, request_id)["notification_reason"] is None
 
 
 @pytest.mark.asyncio
@@ -162,6 +189,53 @@ async def test_runner_dispatches_each_terminal_notification_once(tmp_path: Path)
     assert await runner.process_once() is False
     assert len(delivered) == 1
     assert _row(db_path, request_id)["notification_status"] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_ready_actions_do_not_starve_pending_notifications(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    notified_id = _terminal_ticket(db_path)
+    ready_id = _terminal_ticket(
+        db_path,
+        status=DurableActionStatus.READY,
+        reason=None,
+        suffix="ready",
+    )
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """UPDATE durable_action_tickets
+               SET status = 'ready', completed_at = NULL,
+                   notification_status = 'not_ready'
+               WHERE request_id = ?""",
+            (ready_id,),
+        )
+    durable_actions.register_durable_action_handler(
+        "cron.resume",
+        1,
+        prepare=lambda: None,
+        execute=lambda _context: durable_actions.DurableActionOutcome(
+            DurableActionStatus.SUCCEEDED, reason="applied"
+        ),
+    )
+    delivered = []
+
+    async def notify(claim):
+        delivered.append(claim.request_id)
+        return DurableActionNotificationResult(
+            DurableActionNotificationDisposition.DELIVERED
+        )
+
+    runner = DurableActionRunner(
+        DurableActionStore(db_path),
+        enabled=True,
+        allowed_actions={"cron.resume"},
+        notification_handler=notify,
+    )
+
+    assert await runner.process_once() is True
+    assert delivered == [notified_id]
+    assert _row(db_path, notified_id)["notification_status"] == "delivered"
+    assert _row(db_path, ready_id)["status"] == "succeeded"
 
 
 @pytest.mark.asyncio
@@ -288,6 +362,60 @@ async def test_gateway_action_completion_obeys_session_lineage(
 
     assert (result.disposition, result.reason) == (disposition, reason)
     runner._inject_watch_notification.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_session_reset_drop_reason_is_persisted(tmp_path: Path) -> None:
+    db_path = tmp_path / "session-reset.db"
+    request_id = _terminal_ticket(db_path)
+    gateway = object.__new__(GatewayRunner)
+    gateway._classify_completion_target = AsyncMock(return_value="terminal")
+
+    async def notify(claim):
+        return await gateway._dispatch_durable_action_notification(
+            claim, profile_name="operations", adapters={}
+        )
+
+    runner = DurableActionRunner(
+        DurableActionStore(db_path), enabled=True, notification_handler=notify
+    )
+    assert await runner.process_once() is True
+    row = _row(db_path, request_id)
+    assert (row["notification_status"], row["notification_reason"]) == (
+        "dropped",
+        "origin_session_ended",
+    )
+
+
+@pytest.mark.asyncio
+async def test_cron_drop_reason_is_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import cron.scheduler as scheduler
+
+    db_path = tmp_path / "cron-drop.db"
+    request_id = _terminal_ticket(db_path, origin_type="cron")
+    monkeypatch.setattr(
+        scheduler,
+        "enqueue_durable_action_continuation",
+        lambda **_kwargs: ("dropped", "origin_job_missing"),
+    )
+    gateway = object.__new__(GatewayRunner)
+
+    async def notify(claim):
+        return await gateway._dispatch_durable_action_notification(
+            claim, profile_name="operations", adapters={}
+        )
+
+    runner = DurableActionRunner(
+        DurableActionStore(db_path), enabled=True, notification_handler=notify
+    )
+    assert await runner.process_once() is True
+    row = _row(db_path, request_id)
+    assert (row["notification_status"], row["notification_reason"]) == (
+        "dropped",
+        "origin_job_missing",
+    )
 
 
 @pytest.mark.parametrize(

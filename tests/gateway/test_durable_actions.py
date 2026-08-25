@@ -20,7 +20,7 @@ from gateway.durable_requests import (
     DurableWakeStatus,
     PromptStyle,
 )
-from hermes_state_common import SCHEMA_SQL
+from hermes_state_common import DURABLE_ACTION_SCHEMA_SQL, SCHEMA_SQL
 
 
 _PHASE4B_DURABLE_REQUEST_SCHEMA_SQL = """
@@ -64,6 +64,7 @@ EXPECTED_COLUMNS = {
     "notification_claim",
     "notification_claimed_at",
     "notification_completed_at",
+    "notification_reason",
     "created_at",
     "updated_at",
 }
@@ -106,6 +107,9 @@ def test_action_store_explicitly_closes_schema_connection(
 
         def executescript(self, _sql: str) -> None:
             pass
+
+        def execute(self, _sql: str):
+            return []
 
         def close(self) -> None:
             self.closed = True
@@ -198,6 +202,28 @@ def test_fresh_database_contains_action_ticket_ledger(
     finally:
         conn.close()
     assert unique["idx_durable_action_tickets_idempotency"] == 1
+
+
+def test_existing_action_ledger_adds_notification_reason(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy-action.db"
+    block = """    notification_reason TEXT
+        CHECK (
+            notification_reason IS NULL
+            OR length(notification_reason) <= 1024
+        ),
+"""
+    legacy_schema = DURABLE_ACTION_SCHEMA_SQL.replace(block, "")
+    assert legacy_schema != DURABLE_ACTION_SCHEMA_SQL
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(legacy_schema)
+    finally:
+        conn.close()
+
+    durable_actions.DurableActionStore(db_path)
+
+    columns, _ = _schema_details(db_path)
+    assert "notification_reason" in columns
 
 
 def test_action_ticket_payload_and_outcome_are_database_bounded_by_bytes(
@@ -629,6 +655,12 @@ def test_outcome_is_structural_canonical_and_bounded() -> None:
             reason="x"
             * (durable_actions.MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH + 1),
         )
+    for reason in ("two words", "line\nbreak", "MixedCase", "bad/slash"):
+        with pytest.raises(ValueError, match="structural token"):
+            durable_actions.DurableActionOutcome(
+                status=durable_actions.DurableActionStatus.FAILED,
+                reason=reason,
+            )
     with pytest.raises(ValueError, match="UTF-8"):
         durable_actions.DurableActionOutcome(
             status=durable_actions.DurableActionStatus.FAILED,

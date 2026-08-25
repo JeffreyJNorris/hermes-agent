@@ -17,10 +17,10 @@ from typing import TYPE_CHECKING, Callable
 
 from hermes_constants import get_hermes_home
 from hermes_state_common import (
-    DURABLE_ACTION_SCHEMA_SQL,
     MAX_DURABLE_ACTION_OUTCOME_JSON_BYTES,
     MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH,
     MAX_DURABLE_ACTION_PAYLOAD_BYTES,
+    reconcile_durable_action_schema,
 )
 
 if TYPE_CHECKING:
@@ -53,6 +53,7 @@ class DurableActionNotificationStatus(str, Enum):
 
 
 _ACTION_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$")
+_STRUCTURAL_REASON_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
 _EXECUTION_OUTCOME_STATUSES = frozenset(
     {
         DurableActionStatus.SUCCEEDED,
@@ -89,6 +90,15 @@ def _validate_utf8(value: str, field: str) -> None:
         value.encode("utf-8")
     except UnicodeEncodeError as exc:
         raise ValueError(f"{field} must be valid UTF-8") from exc
+
+
+def _validate_structural_reason(value: str, field: str = "reason") -> None:
+    _validate_nonblank(value, field)
+    if (
+        len(value) > MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH
+        or _STRUCTURAL_REASON_RE.fullmatch(value) is None
+    ):
+        raise ValueError(f"{field} must be a bounded structural token")
 
 
 def _validate_json_value(value: object) -> None:
@@ -220,6 +230,7 @@ class DurableActionTicket:
     notification_completed_at: float | None
     created_at: float
     updated_at: float
+    notification_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -264,9 +275,7 @@ class DurableActionOutcome:
         if self.reason is not None:
             if not isinstance(self.reason, str):
                 raise TypeError("reason must be a string or None")
-            _validate_utf8(self.reason, "reason")
-            if len(self.reason) > MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH:
-                raise ValueError("reason is too long")
+            _validate_structural_reason(self.reason)
         if self.result_json is not None:
             if not isinstance(self.result_json, str):
                 raise TypeError("result_json must be a string or None")
@@ -366,7 +375,7 @@ class DurableActionStore:
         self._lock = threading.RLock()
         conn = self._connect()
         try:
-            conn.executescript(DURABLE_ACTION_SCHEMA_SQL)
+            reconcile_durable_action_schema(conn)
         finally:
             conn.close()
 
@@ -622,7 +631,8 @@ class DurableActionStore:
             changed = conn.execute(
                 """UPDATE durable_action_tickets
                    SET notification_status = ?, notification_claim = ?,
-                       notification_claimed_at = ?, updated_at = ?
+                       notification_claimed_at = ?, notification_reason = NULL,
+                       updated_at = ?
                    WHERE request_id = ? AND notification_status = ?""",
                 (
                     DurableActionNotificationStatus.CLAIMED.value,
@@ -657,7 +667,8 @@ class DurableActionStore:
             return conn.execute(
                 """UPDATE durable_action_tickets
                    SET notification_status = ?, notification_claim = NULL,
-                       notification_claimed_at = NULL, updated_at = ?
+                       notification_claimed_at = NULL,
+                       notification_reason = NULL, updated_at = ?
                    WHERE notification_status = ? AND notification_claimed_at <= ?""",
                 (
                     DurableActionNotificationStatus.PENDING.value,
@@ -675,13 +686,12 @@ class DurableActionStore:
         )
 
     def drop_notification(self, request_id: str, token: str, *, reason: str) -> bool:
-        _validate_nonblank(reason, "reason")
-        if len(reason) > MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH:
-            raise ValueError("reason is too long")
+        _validate_structural_reason(reason)
         return self._finish_notification(
             request_id,
             token,
             status=DurableActionNotificationStatus.DROPPED,
+            reason=reason,
         )
 
     def _finish_notification(
@@ -690,6 +700,7 @@ class DurableActionStore:
         token: str,
         *,
         status: DurableActionNotificationStatus,
+        reason: str | None = None,
     ) -> bool:
         with self._lock, self._transaction() as conn:
             now = self._now()
@@ -697,12 +708,14 @@ class DurableActionStore:
                 """UPDATE durable_action_tickets
                    SET notification_status = ?, notification_claim = NULL,
                        notification_claimed_at = NULL,
-                       notification_completed_at = ?, updated_at = ?
+                       notification_completed_at = ?, notification_reason = ?,
+                       updated_at = ?
                    WHERE request_id = ? AND notification_status = ?
                      AND notification_claim = ?""",
                 (
                     status.value,
                     now,
+                    reason,
                     now,
                     request_id,
                     DurableActionNotificationStatus.CLAIMED.value,
@@ -716,7 +729,8 @@ class DurableActionStore:
             return conn.execute(
                 """UPDATE durable_action_tickets
                    SET notification_status = ?, notification_claim = NULL,
-                       notification_claimed_at = NULL, updated_at = ?
+                       notification_claimed_at = NULL,
+                       notification_reason = NULL, updated_at = ?
                    WHERE request_id = ? AND notification_status = ?
                      AND notification_claim = ?""",
                 (
