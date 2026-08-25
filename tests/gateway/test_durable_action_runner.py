@@ -149,6 +149,8 @@ def test_claim_token_timestamp_and_token_guards(tmp_path: Path) -> None:
         DurableActionOutcome(DurableActionStatus.SUCCEEDED),
     ) is False
     assert store.mark_executing(request_id, claim.token) is True
+    assert store.renew_execution_claim(request_id, "wrong") is False
+    assert store.renew_execution_claim(request_id, claim.token) is True
     assert store.complete(
         request_id,
         claim.token,
@@ -162,6 +164,7 @@ def test_claim_token_timestamp_and_token_guards(tmp_path: Path) -> None:
         claim.token,
         DurableActionOutcome(DurableActionStatus.FAILED, reason="replay"),
     ) is False
+    assert store.renew_execution_claim(request_id, claim.token) is False
     row = _ticket(db_path, request_id)
     assert row["execution_started_at"] == 2_000.0
     assert row["status"] == "succeeded"
@@ -279,6 +282,34 @@ def test_stale_claim_recovery_and_stale_execution_terminalization(tmp_path: Path
     assert executing_store.claim_next() is None
 
 
+@pytest.mark.parametrize("sample", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_wall_clock_is_rejected_without_mutation(
+    tmp_path: Path,
+    sample: float,
+) -> None:
+    db_path = tmp_path / "state.db"
+    request_id = _ready_ticket(db_path)
+    store = DurableActionStore(db_path, wall_clock=lambda: sample)
+
+    with pytest.raises(ValueError, match="wall clock"):
+        store.claim_next()
+
+    assert _ticket(db_path, request_id)["status"] == "ready"
+
+
+@pytest.mark.parametrize("interval", [0, -1, float("nan"), float("inf")])
+def test_stale_interval_must_be_finite_and_positive(
+    tmp_path: Path,
+    interval: float,
+) -> None:
+    store = DurableActionStore(tmp_path / "state.db")
+
+    with pytest.raises(ValueError, match="stale"):
+        store.recover_stale(interval)
+    with pytest.raises(ValueError, match="stale"):
+        DurableActionRunner(store, enabled=True, stale_claim_seconds=interval)
+
+
 @pytest.mark.parametrize(
     "status",
     [
@@ -366,6 +397,151 @@ def test_runner_persists_start_before_handler_and_holds_no_sqlite_lock(
     assert _ticket(db_path, request_id)["status"] == "succeeded"
     with sqlite3.connect(db_path) as conn:
         assert conn.execute("SELECT value FROM handler_probe").fetchone() == ("written",)
+
+
+@pytest.mark.asyncio
+async def test_live_handler_heartbeat_prevents_stale_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "state.db"
+    request_id = _ready_ticket(db_path)
+    now = [1_000.0]
+    store = DurableActionStore(db_path, wall_clock=lambda: now[0])
+    started = threading.Event()
+    release = threading.Event()
+    renewed = threading.Event()
+
+    def execute(_context):
+        started.set()
+        assert release.wait(5)
+        return DurableActionOutcome(DurableActionStatus.SUCCEEDED)
+
+    original_renew = store.renew_execution_claim
+
+    def renew(request_id: str, token: str) -> bool:
+        result = original_renew(request_id, token)
+        renewed.set()
+        return result
+
+    monkeypatch.setattr(store, "renew_execution_claim", renew)
+    _register(execute)
+    runner = DurableActionRunner(
+        store,
+        enabled=True,
+        allowed_actions=["test.execute"],
+        stale_claim_seconds=0.03,
+    )
+    task = asyncio.create_task(runner.process_once())
+    assert await asyncio.to_thread(started.wait, 5)
+    now[0] = 1_400.0
+    assert await asyncio.to_thread(renewed.wait, 5)
+
+    recovery = DurableActionStore(db_path, wall_clock=lambda: now[0])
+    assert await asyncio.to_thread(recovery.recover_stale, 0.03) == (0, 0)
+    assert _ticket(db_path, request_id)["status"] == "executing"
+    release.set()
+    assert await task is True
+    assert _ticket(db_path, request_id)["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_error_does_not_orphan_live_handler(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "state.db"
+    request_id = _ready_ticket(db_path)
+    started = threading.Event()
+    release = threading.Event()
+    renewal_attempted = threading.Event()
+
+    def execute(_context):
+        started.set()
+        assert release.wait(5)
+        return DurableActionOutcome(DurableActionStatus.SUCCEEDED)
+
+    store = DurableActionStore(db_path)
+
+    def fail_renewal(_request_id: str, _token: str) -> bool:
+        renewal_attempted.set()
+        raise sqlite3.OperationalError("private database detail")
+
+    monkeypatch.setattr(store, "renew_execution_claim", fail_renewal)
+    _register(execute)
+    runner = DurableActionRunner(
+        store,
+        enabled=True,
+        allowed_actions=["test.execute"],
+        stale_claim_seconds=0.03,
+    )
+    task = asyncio.create_task(runner.process_once())
+    assert await asyncio.to_thread(started.wait, 5)
+    assert await asyncio.to_thread(renewal_attempted.wait, 5)
+    assert not task.done()
+    release.set()
+
+    assert await task is True
+    assert _ticket(db_path, request_id)["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_cancellation_drains_handler_and_persists_outcome(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    request_id = _ready_ticket(db_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    def execute(_context):
+        started.set()
+        assert release.wait(5)
+        return DurableActionOutcome(DurableActionStatus.SUCCEEDED)
+
+    _register(execute)
+    runner = DurableActionRunner(
+        DurableActionStore(db_path),
+        enabled=True,
+        allowed_actions=["test.execute"],
+        stale_claim_seconds=0.03,
+    )
+    task = asyncio.create_task(runner.process_once())
+    assert await asyncio.to_thread(started.wait, 5)
+    task.cancel()
+    await asyncio.sleep(0.02)
+    task.cancel()
+    await asyncio.sleep(0.03)
+    was_pending = not task.done()
+    release.set()
+    result = await asyncio.gather(task, return_exceptions=True)
+
+    assert was_pending is True
+    assert isinstance(result[0], asyncio.CancelledError)
+    assert _ticket(db_path, request_id)["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_store_contention_does_not_block_event_loop(tmp_path: Path) -> None:
+    store = DurableActionStore(tmp_path / "state.db")
+    release = threading.Event()
+
+    def blocked_recovery(_interval: float):
+        assert release.wait(5)
+        return (0, 0)
+
+    store.recover_stale = blocked_recovery  # type: ignore[method-assign]
+    runner = DurableActionRunner(store, enabled=True)
+    timer = threading.Timer(0.3, release.set)
+    timer.start()
+    loop = asyncio.get_running_loop()
+    started_at = loop.time()
+    task = asyncio.create_task(runner.process_once())
+    await asyncio.sleep(0)
+    elapsed = loop.time() - started_at
+    release.set()
+    await task
+    timer.cancel()
+
+    assert elapsed < 0.1
 
 
 @pytest.mark.parametrize(

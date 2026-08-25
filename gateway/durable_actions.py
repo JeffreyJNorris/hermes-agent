@@ -322,8 +322,11 @@ class DurableActionStore:
         self._db_path = Path(db_path or Path(get_hermes_home()) / "state.db")
         self._wall_clock = wall_clock
         self._lock = threading.RLock()
-        with self._connect() as conn:
+        conn = self._connect()
+        try:
             conn.executescript(DURABLE_ACTION_SCHEMA_SQL)
+        finally:
+            conn.close()
 
     def _connect(self) -> sqlite3.Connection:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -348,6 +351,12 @@ class DurableActionStore:
         finally:
             conn.close()
 
+    def _now(self) -> float:
+        now = float(self._wall_clock())
+        if not math.isfinite(now):
+            raise ValueError("wall clock must be finite")
+        return now
+
     def claim_next(self) -> DurableActionClaim | None:
         token = secrets.token_urlsafe(24)
         with self._lock, self._transaction() as conn:
@@ -370,7 +379,7 @@ class DurableActionStore:
                 fingerprint=row["fingerprint"],
                 idempotency_key=row["idempotency_key"],
             )
-            now = float(self._wall_clock())
+            now = self._now()
             changed = conn.execute(
                 """UPDATE durable_action_tickets
                    SET status = ?, execution_claim = ?, execution_claimed_at = ?,
@@ -391,17 +400,35 @@ class DurableActionStore:
 
     def mark_executing(self, request_id: str, token: str) -> bool:
         with self._lock, self._transaction() as conn:
-            now = float(self._wall_clock())
+            now = self._now()
             return conn.execute(
                 """UPDATE durable_action_tickets
-                   SET status = ?, execution_started_at = ?, updated_at = ?
+                   SET status = ?, execution_claimed_at = ?,
+                       execution_started_at = ?, updated_at = ?
                    WHERE request_id = ? AND status = ? AND execution_claim = ?""",
                 (
                     DurableActionStatus.EXECUTING.value,
                     now,
                     now,
+                    now,
                     request_id,
                     DurableActionStatus.CLAIMED.value,
+                    token,
+                ),
+            ).rowcount == 1
+
+    def renew_execution_claim(self, request_id: str, token: str) -> bool:
+        with self._lock, self._transaction() as conn:
+            now = self._now()
+            return conn.execute(
+                """UPDATE durable_action_tickets
+                   SET execution_claimed_at = ?, updated_at = ?
+                   WHERE request_id = ? AND status = ? AND execution_claim = ?""",
+                (
+                    now,
+                    now,
+                    request_id,
+                    DurableActionStatus.EXECUTING.value,
                     token,
                 ),
             ).rowcount == 1
@@ -415,7 +442,7 @@ class DurableActionStore:
         if not isinstance(outcome, DurableActionOutcome):
             raise TypeError("outcome must be a DurableActionOutcome")
         with self._lock, self._transaction() as conn:
-            now = float(self._wall_clock())
+            now = self._now()
             return conn.execute(
                 """UPDATE durable_action_tickets
                    SET status = ?, execution_claim = NULL,
@@ -448,7 +475,7 @@ class DurableActionStore:
             reason=reason,
         )
         with self._lock, self._transaction() as conn:
-            now = float(self._wall_clock())
+            now = self._now()
             return conn.execute(
                 """UPDATE durable_action_tickets
                    SET status = ?, execution_claim = NULL,
@@ -469,10 +496,11 @@ class DurableActionStore:
             ).rowcount == 1
 
     def recover_stale(self, stale_after_seconds: float) -> tuple[int, int]:
-        if stale_after_seconds < 0:
-            raise ValueError("stale_after_seconds must not be negative")
+        stale_after_seconds = float(stale_after_seconds)
+        if not math.isfinite(stale_after_seconds) or stale_after_seconds <= 0:
+            raise ValueError("stale_after_seconds must be finite and positive")
         with self._lock, self._transaction() as conn:
-            now = float(self._wall_clock())
+            now = self._now()
             cutoff = now - stale_after_seconds
             claimed = conn.execute(
                 """UPDATE durable_action_tickets
@@ -494,7 +522,8 @@ class DurableActionStore:
                        outcome_reason = 'execution_interrupted',
                        outcome_json = NULL, completed_at = ?,
                        notification_status = ?, updated_at = ?
-                   WHERE status = ? AND execution_started_at <= ?""",
+                   WHERE status = ?
+                     AND COALESCE(execution_claimed_at, execution_started_at) <= ?""",
                 (
                     DurableActionStatus.UNKNOWN.value,
                     now,

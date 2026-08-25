@@ -97,6 +97,37 @@ def _schema_details(
         conn.close()
 
 
+def test_action_store_explicitly_closes_schema_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Connection:
+        closed = False
+
+        def executescript(self, _sql: str) -> None:
+            pass
+
+        def close(self) -> None:
+            self.closed = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    connection = Connection()
+    monkeypatch.setattr(
+        durable_actions.DurableActionStore,
+        "_connect",
+        lambda _self: connection,
+    )
+
+    durable_actions.DurableActionStore(tmp_path / "state.db")
+
+    assert connection.closed is True
+
+
 @pytest.mark.parametrize("initializer", ["central", "store"])
 def test_fresh_database_contains_action_ticket_ledger(
     tmp_path: Path,
