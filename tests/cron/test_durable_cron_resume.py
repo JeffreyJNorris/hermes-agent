@@ -195,6 +195,43 @@ def test_legacy_pause_generation_backfill_is_stable(cron_store):
     assert second_job["pause_generation"] == first_job["pause_generation"]
 
 
+def test_stateless_legacy_paused_job_backfills_once_and_executes(
+    cron_store,
+    monkeypatch,
+):
+    _allow(monkeypatch)
+    legacy = _job()
+    legacy.pop("state")
+    legacy.pop("pause_generation")
+    _save(legacy)
+    prepare = lookup_durable_action_preparer("cron.resume", 1)
+    execute = lookup_durable_action_handler("cron.resume", 1)
+
+    first = prepare("job-123")
+    persisted = jobs.load_jobs()[0]
+    second = prepare("job-123")
+    outcome = execute(_context(first))
+
+    assert first == second
+    assert persisted["state"] == "paused"
+    assert len(persisted["pause_generation"]) == 32
+    assert outcome.status is DurableActionStatus.SUCCEEDED
+
+
+def test_stateless_enabled_legacy_job_is_ineligible_without_mutation(cron_store):
+    legacy = _job(enabled=True)
+    legacy.pop("state")
+    legacy.pop("pause_generation")
+    _save(legacy)
+    before = jobs.JOBS_FILE.read_bytes()
+    prepare = lookup_durable_action_preparer("cron.resume", 1)
+
+    with pytest.raises(ValueError, match="not paused"):
+        prepare("job-123")
+
+    assert jobs.JOBS_FILE.read_bytes() == before
+
+
 @pytest.mark.parametrize(
     "job",
     [
@@ -481,9 +518,14 @@ def test_execute_invalidates_corrupted_definition_field(
     assert jobs.JOBS_FILE.read_bytes() == before
 
 
-def test_execute_invalidates_unsafe_canonical_id(cron_store, monkeypatch):
+@pytest.mark.parametrize("unsafe_id", ["../escape", "bad\x00id", "bad\x1fid", "bad\x7fid"])
+def test_execute_invalidates_unsafe_canonical_id(
+    cron_store,
+    monkeypatch,
+    unsafe_id,
+):
     _allow(monkeypatch)
-    unsafe = _job(id="../escape", pause_generation="a" * 32)
+    unsafe = _job(id=unsafe_id, pause_generation="a" * 32)
     _save(unsafe)
     fingerprint = jobs.cron_job_definition_fingerprint(unsafe)
     from gateway.durable_actions import PreparedDurableAction, encode_durable_action_payload
@@ -492,7 +534,7 @@ def test_execute_invalidates_unsafe_canonical_id(cron_store, monkeypatch):
         PreparedDurableAction(
             action_type="cron.resume",
             action_version=1,
-            payload_json=encode_durable_action_payload({"job_id": "../escape"}),
+            payload_json=encode_durable_action_payload({"job_id": unsafe_id}),
             fingerprint=fingerprint,
             idempotency_key="unsafe",
         )
@@ -504,6 +546,12 @@ def test_execute_invalidates_unsafe_canonical_id(cron_store, monkeypatch):
     assert outcome.status is DurableActionStatus.INVALIDATED
     assert outcome.reason == "job_invalid"
     assert jobs.JOBS_FILE.read_bytes() == before
+
+
+@pytest.mark.parametrize("unsafe_id", ["bad\x00id", "bad\x1fid", "bad\x7fid"])
+def test_job_output_dir_rejects_ascii_control_characters(cron_store, unsafe_id):
+    with pytest.raises(ValueError, match="Invalid cron job id"):
+        jobs._job_output_dir(unsafe_id)
 
 
 def test_past_one_shot_fails_bounded_without_mutation(cron_store, monkeypatch):

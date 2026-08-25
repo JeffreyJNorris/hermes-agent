@@ -381,8 +381,15 @@ def _job_output_dir(job_id: str) -> Path:
     allow output writes/deletes to escape the cron output sandbox. Reject
     anything that isn't a single safe path component.
     """
-    text = str(job_id or "").strip()
-    if not text or text in {".", ".."} or "/" in text or "\\" in text:
+    raw = str(job_id or "")
+    text = raw.strip()
+    if (
+        not text
+        or text in {".", ".."}
+        or "/" in text
+        or "\\" in text
+        or any(ord(char) < 32 or ord(char) == 127 for char in raw)
+    ):
         raise ValueError(f"Invalid cron job id for output path: {job_id!r}")
     if Path(text).is_absolute() or Path(text).drive:
         raise ValueError(f"Invalid cron job id for output path: {job_id!r}")
@@ -1844,14 +1851,17 @@ def prepare_durable_cron_resume(job_ref: str):
             state = raw_job.get("state") or (
                 "scheduled" if raw_job.get("enabled", True) else "paused"
             )
-            if (
-                raw_job.get("enabled") is False
-                and state == "paused"
-                and not raw_job.get("pause_generation")
-            ):
-                raw_job["pause_generation"] = uuid.uuid4().hex
-                _save_jobs_unlocked(records)
-            if not raw_job.get("state"):
+            if raw_job.get("enabled") is False and state == "paused":
+                changed = False
+                if not raw_job.get("state"):
+                    raw_job["state"] = "paused"
+                    changed = True
+                if not raw_job.get("pause_generation"):
+                    raw_job["pause_generation"] = uuid.uuid4().hex
+                    changed = True
+                if changed:
+                    _save_jobs_unlocked(records)
+            elif not raw_job.get("state"):
                 job = {**raw_job, "state": state}
     if job is None:
         raise ValueError("cron job was not found")
