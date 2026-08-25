@@ -606,7 +606,12 @@ class DurableRequestStore:
                     request=self._row_to_request(existing),
                     created=False,
                 )
-            return DurableCreateResult(request=self._row_to_request(row), created=True)
+            result = DurableCreateResult(
+                request=self._row_to_request(row),
+                created=True,
+            )
+        self._log_registered(result.request)
+        return result
 
     def create_with_action(
         self,
@@ -724,11 +729,13 @@ class DurableRequestStore:
                 (request_row["request_id"],),
             ).fetchone()
             assert ticket_row is not None
-            return DurableActionCreateResult(
+            result = DurableActionCreateResult(
                 request=self._row_to_request(request_row),
                 ticket=self._row_to_action_ticket(ticket_row),
                 created=True,
             )
+        self._log_registered(result.request)
+        return result
 
     @staticmethod
     def _ticket_matches_action(
@@ -921,15 +928,18 @@ class DurableRequestStore:
             (request_id,),
         ).fetchone()
         assert row is not None
+        return row
+
+    @staticmethod
+    def _log_registered(request: DurableRequest) -> None:
         logger.info(
             "Durable request registered",
             extra={
-                "request_id": request_id,
-                "platform": values.target.platform,
+                "request_id": request.request_id,
+                "platform": request.target.platform,
                 "state": DurableRequestStatus.PENDING_DELIVERY.value,
             },
         )
-        return row
 
     @staticmethod
     def _row_to_action_ticket(row: sqlite3.Row) -> DurableActionTicket:

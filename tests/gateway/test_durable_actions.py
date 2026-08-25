@@ -874,6 +874,7 @@ def test_create_with_action_reference_cannot_return_a_different_action(
 
 def test_create_with_action_rolls_back_request_when_ticket_insert_fails(
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     db_path = tmp_path / "state.db"
     store = DurableRequestStore(db_path, wall_clock=lambda: 1_000.0)
@@ -886,8 +887,9 @@ def test_create_with_action_rolls_back_request_when_ticket_insert_fails(
                END"""
         )
 
-    with pytest.raises(sqlite3.IntegrityError, match="injected ticket failure"):
-        _create_approval(store)
+    with caplog.at_level("INFO", logger="gateway.durable_requests"):
+        with pytest.raises(sqlite3.IntegrityError, match="injected ticket failure"):
+            _create_approval(store)
 
     with sqlite3.connect(db_path) as conn:
         assert conn.execute("SELECT COUNT(*) FROM durable_requests").fetchone()[0] == 0
@@ -895,6 +897,10 @@ def test_create_with_action_rolls_back_request_when_ticket_insert_fails(
             conn.execute("SELECT COUNT(*) FROM durable_action_tickets").fetchone()[0]
             == 0
         )
+    assert not any(
+        record.getMessage() == "Durable request registered"
+        for record in caplog.records
+    )
 
 
 def test_create_with_action_rolls_back_ticket_when_request_insert_helper_fails(
@@ -935,6 +941,85 @@ def test_create_with_action_rolls_back_ticket_when_request_insert_helper_fails(
             conn.execute("SELECT COUNT(*) FROM durable_action_tickets").fetchone()[0]
             == 0
         )
+
+
+@pytest.mark.parametrize("trusted", [False, True], ids=["generic", "trusted"])
+def test_create_logs_nothing_when_commit_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    trusted: bool,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = DurableRequestStore(db_path, wall_clock=lambda: 1_000.0)
+
+    class FailingCommitConnection(sqlite3.Connection):
+        def commit(self) -> None:
+            self.rollback()
+            raise sqlite3.OperationalError("injected commit failure")
+
+    def failing_connect() -> sqlite3.Connection:
+        conn = sqlite3.connect(
+            db_path,
+            timeout=10.0,
+            factory=FailingCommitConnection,
+        )
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    monkeypatch.setattr(store, "_connect", failing_connect)
+    with caplog.at_level("INFO", logger="gateway.durable_requests"):
+        with pytest.raises(sqlite3.OperationalError, match="commit failure"):
+            if trusted:
+                _create_approval(store)
+            else:
+                store.create(
+                    _approval_spec(),
+                    target=DurableRequestTarget("discord", "chat-1"),
+                    responder_mode=DurableResponderMode.ANY_AUTHORIZED,
+                    expected_actor_id=None,
+                    origin_type="session",
+                    origin_id="generic-session",
+                )
+
+    assert not any(
+        record.getMessage() == "Durable request registered"
+        for record in caplog.records
+    )
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM durable_requests").fetchone()[0] == 0
+        assert (
+            conn.execute("SELECT COUNT(*) FROM durable_action_tickets").fetchone()[0]
+            == 0
+        )
+
+
+@pytest.mark.parametrize("trusted", [False, True], ids=["generic", "trusted"])
+def test_create_logs_one_registration_after_successful_commit(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    trusted: bool,
+) -> None:
+    store = DurableRequestStore(tmp_path / "state.db", wall_clock=lambda: 1_000.0)
+
+    with caplog.at_level("INFO", logger="gateway.durable_requests"):
+        if trusted:
+            _create_approval(store)
+        else:
+            store.create(
+                _approval_spec(),
+                target=DurableRequestTarget("discord", "chat-1"),
+                responder_mode=DurableResponderMode.ANY_AUTHORIZED,
+                expected_actor_id=None,
+                origin_type="session",
+                origin_id="generic-session",
+            )
+
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "gateway.durable_requests"
+    ] == ["Durable request registered"]
 
 
 def test_concurrent_create_with_action_uses_one_request_and_ticket(
@@ -1106,9 +1191,43 @@ def test_create_with_action_logs_no_action_secrets(
     )
 
     with caplog.at_level("INFO", logger="gateway.durable_requests"):
-        _create_approval(store, action=action)
+        store.create_with_action(
+            _approval_spec(),
+            action=action,
+            target=DurableRequestTarget(
+                "discord",
+                "secret-chat-marker",
+                "secret-thread-marker",
+            ),
+            responder_mode=DurableResponderMode.INITIATOR,
+            expected_actor_id="secret-actor-marker",
+            origin_type="session",
+            origin_id="secret-origin-marker",
+            origin_session_id="secret-session-marker",
+            origin_ui_session_id="secret-ui-session-marker",
+            origin_profile="secret-profile-marker",
+        )
 
-    rendered = "\n".join(record.getMessage() for record in caplog.records)
-    assert "secret-job-marker" not in rendered
-    assert "secret-fingerprint-marker" not in rendered
-    assert "secret-idempotency-marker" not in rendered
+    rendered = repr(
+        [
+            {
+                "message": record.msg,
+                "args": record.args,
+                "fields": record.__dict__,
+            }
+            for record in caplog.records
+        ]
+    )
+    for secret in (
+        "secret-job-marker",
+        "secret-fingerprint-marker",
+        "secret-idempotency-marker",
+        "secret-chat-marker",
+        "secret-thread-marker",
+        "secret-actor-marker",
+        "secret-origin-marker",
+        "secret-session-marker",
+        "secret-ui-session-marker",
+        "secret-profile-marker",
+    ):
+        assert secret not in rendered
