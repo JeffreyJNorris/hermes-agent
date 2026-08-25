@@ -11,6 +11,7 @@ import re
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -1185,13 +1186,89 @@ def check_cronjob_requirements() -> bool:
 
 
 # --- Registry ---
-from tools.registry import registry, tool_error
+from tools.registry import registry, tool_error, tool_result
 
-registry.register(
-    name="cronjob",
-    toolset="cronjob",
-    schema=CRONJOB_SCHEMA,
-    handler=lambda args, **kw: cronjob(
+
+def _model_cronjob(args: Dict[str, Any], *, task_id: Optional[str] = None) -> str:
+    """Apply trusted policy only at the model-facing cron tool boundary."""
+    normalized = str(args.get("action", "")).strip().lower()
+    if normalized == "resume":
+        try:
+            from gateway.durable_actions import lookup_durable_action_preparer
+            from gateway.durable_requests import (
+                DurableRequestError,
+                DurableRequestLimitError,
+                DurableRequestOption,
+                DurableRequestSpec,
+                get_durable_request_store,
+                load_durable_requests_config,
+            )
+            from hermes_cli.config import load_config_readonly
+            from tools.durable_request_tool import _current_origin
+
+            raw_config = load_config_readonly()
+            policy = raw_config.get("durable_approvals", {})
+            if not isinstance(policy, dict) or policy.get("enabled") is not True:
+                return cronjob(
+                    action=args.get("action", ""),
+                    job_id=args.get("job_id"),
+                    task_id=task_id,
+                )
+            allowed = policy.get("allowed_actions")
+            if not isinstance(allowed, list) or "cron.resume" not in allowed:
+                return tool_error("cron.resume durable approval is not allowlisted")
+
+            request_config = load_durable_requests_config()
+            if not request_config.available or request_config.target is None:
+                return tool_error("durable request inbox is not configured")
+            origin = _current_origin(request_config.scheduled_responder_mode)
+            job_id = args.get("job_id")
+            if not isinstance(job_id, str) or not job_id.strip():
+                return tool_error("job_id is required for action 'resume'", success=False)
+            prepare = lookup_durable_action_preparer("cron.resume", 1)
+            if prepare is None:
+                return tool_error("cron.resume durable approval handler is unavailable")
+            prepared = prepare(job_id)
+            result = get_durable_request_store().create_with_action(
+                DurableRequestSpec(
+                    kind="tool.durable_approval.cron.resume",
+                    title="Resume scheduled job?",
+                    body=f"Resume paused cron job {job_id}?",
+                    options=(
+                        DurableRequestOption(id="approve", label="Resume"),
+                        DurableRequestOption(id="reject", label="Keep paused"),
+                    ),
+                    ttl_seconds=request_config.default_ttl_seconds,
+                    reference=f"durable-action:{prepared.idempotency_key}",
+                ),
+                action=prepared,
+                target=request_config.target,
+                responder_mode=origin.responder_mode,
+                expected_actor_id=origin.expected_actor_id,
+                origin_type=origin.origin_type,
+                origin_id=origin.origin_id,
+                origin_session_id=origin.origin_session_id,
+                origin_ui_session_id=origin.origin_ui_session_id,
+                origin_profile=origin.origin_profile,
+                maximum_ttl_seconds=request_config.max_ttl_seconds,
+                terminal_retention_seconds=request_config.terminal_retention_seconds,
+            )
+            return tool_result(
+                status="approval_pending",
+                request_id=result.request.request_id,
+                action="cron.resume",
+                expires_at=(
+                    datetime.fromtimestamp(
+                        result.request.expires_at,
+                        tz=timezone.utc,
+                    ).isoformat().replace("+00:00", "Z")
+                ),
+                created=result.created,
+            )
+        except (DurableRequestError, DurableRequestLimitError, ValueError) as exc:
+            return tool_error(str(exc))
+
+    return cronjob(
         action=args.get("action", ""),
         job_id=args.get("job_id"),
         prompt=args.get("prompt"),
@@ -1202,19 +1279,21 @@ registry.register(
         include_disabled=args.get("include_disabled", True),
         skill=args.get("skill"),
         skills=args.get("skills"),
-        # model / provider / base_url are intentionally NOT read from the
-        # agent's arguments: per-job inference pins are user-owned (dashboard,
-        # `hermes cron create/edit --model`, or hand-edited jobs). The agent
-        # must not be able to point unattended spend at a different model.
-        # Programmatic callers of cronjob() itself retain the parameters.
+        # model / provider / base_url are intentionally not accepted here.
         reason=args.get("reason"),
         script=args.get("script"),
         context_from=args.get("context_from"),
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
-        task_id=kw.get("task_id"),
-    ),
+        task_id=task_id,
+    )
+
+registry.register(
+    name="cronjob",
+    toolset="cronjob",
+    schema=CRONJOB_SCHEMA,
+    handler=lambda args, **kw: _model_cronjob(args, task_id=kw.get("task_id")),
     check_fn=check_cronjob_requirements,
     emoji="⏰",
 )

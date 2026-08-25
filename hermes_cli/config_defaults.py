@@ -2042,6 +2042,14 @@ DEFAULT_CONFIG = {
         "scheduled_responder_policy": "any_authorized",
     },
 
+    # Trusted application-owned durable actions. Generic durable requests
+    # remain persisted input only; each executable action must be explicitly
+    # enabled and allowlisted by the operator.
+    "durable_approvals": {
+        "enabled": False,
+        "allowed_actions": [],
+    },
+
     # Approval mode for dangerous commands:
     #   manual — always prompt the user
     #   smart  — use auxiliary LLM to auto-approve low-risk commands (default)
