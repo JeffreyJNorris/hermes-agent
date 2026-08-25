@@ -286,6 +286,34 @@ def register_durable_action_handler(
     _DURABLE_ACTION_HANDLERS[key] = (prepare, execute)
 
 
+def _register_cron_resume_builtin(
+    *,
+    prepare: DurableActionPreparer,
+    execute: DurableActionHandler,
+) -> None:
+    """Register or refresh only Hermes' fixed cron.resume implementation."""
+    expected = (
+        ("cron.jobs", "prepare_durable_cron_resume"),
+        ("cron.jobs", "execute_durable_cron_resume"),
+    )
+    supplied = tuple(
+        (getattr(fn, "__module__", None), getattr(fn, "__qualname__", None))
+        for fn in (prepare, execute)
+    )
+    key = ("cron.resume", 1)
+    current = _DURABLE_ACTION_HANDLERS.get(key)
+    if supplied != expected or (
+        current is not None
+        and tuple(
+            (getattr(fn, "__module__", None), getattr(fn, "__qualname__", None))
+            for fn in current
+        )
+        != expected
+    ):
+        raise ValueError(f"durable action handler {key!r} is already registered")
+    _DURABLE_ACTION_HANDLERS[key] = (prepare, execute)
+
+
 def lookup_durable_action_preparer(
     action_type: str,
     action_version: int,
@@ -587,3 +615,8 @@ __all__ = [
 # Eager fixed-handler bootstrap. This is deliberately after every registry type
 # and function so importing either module first is circular-safe.
 from cron import jobs as _cron_jobs  # noqa: E402,F401
+
+_register_cron_resume_builtin(
+    prepare=_cron_jobs.prepare_durable_cron_resume,
+    execute=_cron_jobs.execute_durable_cron_resume,
+)

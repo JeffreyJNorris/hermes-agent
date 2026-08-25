@@ -1619,6 +1619,7 @@ def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, A
             "state": "paused",
             "paused_at": _hermes_now().isoformat(),
             "paused_reason": reason,
+            "pause_generation": uuid.uuid4().hex,
         },
     )
 
@@ -1649,6 +1650,7 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 
 _DURABLE_RESUME_DEFINITION_FIELDS = (
+    "pause_generation",
     "script",
     "no_agent",
     "context_from",
@@ -1703,7 +1705,50 @@ def _valid_durable_resume_definition(job: Dict[str, Any]) -> bool:
     repeat = job.get("repeat")
     if not isinstance(job_id, str) or not job_id.strip():
         return False
-    if not isinstance(schedule, dict) or not isinstance(repeat, dict):
+    try:
+        _job_output_dir(job_id)
+    except ValueError:
+        return False
+    if type(job.get("name")) is not str or type(job.get("prompt")) is not str:
+        return False
+    skills = job.get("skills")
+    if type(skills) is not list or any(type(item) is not str for item in skills):
+        return False
+    for field in (
+        "script",
+        "skill",
+        "workdir",
+        "provider",
+        "model",
+        "base_url",
+        "provider_snapshot",
+        "model_snapshot",
+    ):
+        if job.get(field) is not None and type(job.get(field)) is not str:
+            return False
+    if type(job.get("no_agent")) is not bool:
+        return False
+    for field in ("context_from", "enabled_toolsets"):
+        value = job.get(field)
+        if value is not None and (
+            type(value) is not list
+            or any(type(item) is not str for item in value)
+        ):
+            return False
+    if type(job.get("deliver")) is not str:
+        return False
+    if job.get("origin") is not None and type(job.get("origin")) is not dict:
+        return False
+    attach = job.get("attach_to_session")
+    if attach is not None and type(attach) is not bool:
+        return False
+    generation = job.get("pause_generation")
+    if (
+        type(generation) is not str
+        or re.fullmatch(r"[0-9a-f]{32}", generation) is None
+    ):
+        return False
+    if type(schedule) is not dict or type(repeat) is not dict:
         return False
     times = repeat.get("times")
     if times is not None and (type(times) is not int or times <= 0):
@@ -1789,7 +1834,25 @@ def prepare_durable_cron_resume(job_ref: str):
 
     if not isinstance(job_ref, str) or not job_ref.strip():
         raise ValueError("job reference is required")
-    job = get_job(job_ref)
+    with _jobs_lock():
+        records = load_jobs()
+        raw_job = next((row for row in records if row.get("id") == job_ref), None)
+        if raw_job is None:
+            job = None
+        else:
+            job = raw_job
+            state = raw_job.get("state") or (
+                "scheduled" if raw_job.get("enabled", True) else "paused"
+            )
+            if (
+                raw_job.get("enabled") is False
+                and state == "paused"
+                and not raw_job.get("pause_generation")
+            ):
+                raw_job["pause_generation"] = uuid.uuid4().hex
+                _save_jobs_unlocked(records)
+            if not raw_job.get("state"):
+                job = {**raw_job, "state": state}
     if job is None:
         raise ValueError("cron job was not found")
     if job.get("enabled") is not False or job.get("state") != "paused":
@@ -1832,6 +1895,8 @@ def execute_durable_cron_resume(context):
     try:
         policy = (load_config() or {}).get("durable_approvals") or {}
     except Exception:
+        policy = {}
+    if not isinstance(policy, dict):
         policy = {}
     allowed = policy.get("allowed_actions")
     if (
@@ -2957,11 +3022,9 @@ def rewrite_skill_refs(
 
 
 # Fixed built-in registration: persisted data can select only this exact name/version.
-from gateway.durable_actions import register_durable_action_handler
+from gateway.durable_actions import _register_cron_resume_builtin
 
-register_durable_action_handler(
-    "cron.resume",
-    1,
+_register_cron_resume_builtin(
     prepare=prepare_durable_cron_resume,
     execute=execute_durable_cron_resume,
 )
