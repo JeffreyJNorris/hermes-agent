@@ -38,6 +38,7 @@ from gateway.interactive import (
     PromptStyle,
 )
 from hermes_constants import get_hermes_home
+from hermes_state_common import DURABLE_ACTION_SCHEMA_SQL
 
 logger = logging.getLogger(__name__)
 
@@ -507,7 +508,7 @@ class DurableRequestStore:
         with self._lock:
             conn = self._connect()
             try:
-                conn.executescript(_DURABLE_SCHEMA_SQL)
+                conn.executescript(_DURABLE_SCHEMA_SQL + DURABLE_ACTION_SCHEMA_SQL)
                 existing_columns = {
                     row["name"]
                     for row in conn.execute(

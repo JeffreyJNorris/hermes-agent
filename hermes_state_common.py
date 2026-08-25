@@ -172,6 +172,52 @@ FTS_STORAGE_VERSION = 1
 MAX_FTS5_QUERY_CHARS = 2_048
 
 
+MAX_DURABLE_ACTION_PAYLOAD_BYTES = 16_384
+MAX_DURABLE_ACTION_OUTCOME_JSON_BYTES = 16_384
+MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH = 1_024
+
+
+DURABLE_ACTION_SCHEMA_SQL = f"""
+CREATE TABLE IF NOT EXISTS durable_action_tickets (
+    request_id TEXT PRIMARY KEY,
+    action_type TEXT NOT NULL,
+    action_version INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+        CHECK (length(CAST(payload_json AS BLOB)) <= {MAX_DURABLE_ACTION_PAYLOAD_BYTES}),
+    fingerprint TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    execution_claim TEXT,
+    execution_claimed_at REAL,
+    execution_started_at REAL,
+    outcome_reason TEXT
+        CHECK (
+            outcome_reason IS NULL
+            OR length(outcome_reason) <= {MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH}
+        ),
+    outcome_json TEXT
+        CHECK (
+            outcome_json IS NULL
+            OR length(CAST(outcome_json AS BLOB))
+                <= {MAX_DURABLE_ACTION_OUTCOME_JSON_BYTES}
+        ),
+    completed_at REAL,
+    notification_status TEXT NOT NULL,
+    notification_claim TEXT,
+    notification_claimed_at REAL,
+    notification_completed_at REAL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_action_tickets_idempotency
+    ON durable_action_tickets(action_type, idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_durable_action_tickets_runnable
+    ON durable_action_tickets(status, execution_claimed_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_durable_action_tickets_notification
+    ON durable_action_tickets(notification_status, notification_claimed_at, updated_at);
+"""
+
+
 _FTS_TRIGGERS = (
     "messages_fts_insert",
     "messages_fts_delete",
@@ -405,7 +451,7 @@ CREATE INDEX IF NOT EXISTS idx_durable_requests_platform
 CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_requests_origin_reference
     ON durable_requests(origin_type, origin_id, reference)
     WHERE reference IS NOT NULL;
-"""
+""" + DURABLE_ACTION_SCHEMA_SQL
 
 
 # Indexes that reference columns added in later schema versions must be
