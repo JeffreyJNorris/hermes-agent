@@ -70,6 +70,14 @@ def _validate_nonblank(value: str, field: str) -> None:
         raise TypeError(f"{field} must be a string")
     if not value.strip():
         raise ValueError(f"{field} must not be blank")
+    _validate_utf8(value, field)
+
+
+def _validate_utf8(value: str, field: str) -> None:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{field} must be valid UTF-8") from exc
 
 
 def _validate_json_value(value: object) -> None:
@@ -93,8 +101,8 @@ def _validate_json_value(value: object) -> None:
 
 
 def _encode_bounded_json(value: object, max_bytes: int) -> str:
-    _validate_json_value(value)
     try:
+        _validate_json_value(value)
         encoded = json.dumps(
             value,
             allow_nan=False,
@@ -217,6 +225,7 @@ class DurableActionOutcome:
         if self.reason is not None:
             if not isinstance(self.reason, str):
                 raise TypeError("reason must be a string or None")
+            _validate_utf8(self.reason, "reason")
             if len(self.reason) > MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH:
                 raise ValueError("reason is too long")
         if self.result_json is not None:

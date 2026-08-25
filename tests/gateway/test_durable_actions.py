@@ -428,6 +428,14 @@ def test_payload_json_rejects_noncanonical_persisted_text() -> None:
         durable_actions.decode_durable_action_payload('{"b": 2, "a": 1}')
 
 
+def test_payload_json_normalizes_cyclic_container_errors() -> None:
+    cyclic: list[object] = []
+    cyclic.append(cyclic)
+
+    with pytest.raises(ValueError, match="canonical JSON"):
+        durable_actions.encode_durable_action_payload(cyclic)
+
+
 def test_payload_and_result_helpers_bound_utf8_encoded_bytes() -> None:
     payload_at_limit = "é" * (
         (durable_actions.MAX_DURABLE_ACTION_PAYLOAD_BYTES - 2) // 2
@@ -472,6 +480,21 @@ def test_prepared_action_rejects_blank_security_fields(field: str) -> None:
     values[field] = " \t"
 
     with pytest.raises(ValueError, match=field):
+        durable_actions.PreparedDurableAction(**values)
+
+
+@pytest.mark.parametrize("field", ["fingerprint", "idempotency_key"])
+def test_prepared_action_rejects_lone_unicode_surrogates(field: str) -> None:
+    values = {
+        "action_type": "test.resume",
+        "action_version": 1,
+        "payload_json": durable_actions.encode_durable_action_payload({}),
+        "fingerprint": "sha256:fingerprint",
+        "idempotency_key": "test.resume:key",
+    }
+    values[field] = "\ud800"
+
+    with pytest.raises(ValueError, match="UTF-8"):
         durable_actions.PreparedDurableAction(**values)
 
 
@@ -535,6 +558,11 @@ def test_outcome_is_structural_canonical_and_bounded() -> None:
             status=durable_actions.DurableActionStatus.FAILED,
             reason="x"
             * (durable_actions.MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH + 1),
+        )
+    with pytest.raises(ValueError, match="UTF-8"):
+        durable_actions.DurableActionOutcome(
+            status=durable_actions.DurableActionStatus.FAILED,
+            reason="\ud800",
         )
     with pytest.raises(ValueError, match="canonical"):
         durable_actions.DurableActionOutcome(
