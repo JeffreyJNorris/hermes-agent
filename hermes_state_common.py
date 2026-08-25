@@ -231,7 +231,9 @@ def reconcile_durable_action_schema(conn) -> None:
     }
     if "notification_reason" not in columns:
         conn.execute(
-            "ALTER TABLE durable_action_tickets ADD COLUMN notification_reason TEXT"
+            "ALTER TABLE durable_action_tickets ADD COLUMN notification_reason TEXT "
+            f"CHECK (notification_reason IS NULL OR length(notification_reason) "
+            f"<= {MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH})"
         )
 
 

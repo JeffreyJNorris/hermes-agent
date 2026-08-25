@@ -224,6 +224,29 @@ def test_existing_action_ledger_adds_notification_reason(tmp_path: Path) -> None
 
     columns, _ = _schema_details(db_path)
     assert "notification_reason" in columns
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """INSERT INTO durable_action_tickets (
+                   request_id, action_type, action_version, payload_json,
+                   fingerprint, idempotency_key, status, notification_status,
+                   created_at, updated_at
+               ) VALUES ('drq_legacy', 'test.action', 1, '{}', 'fingerprint',
+                         'idempotency', 'failed', 'pending', 1, 1)"""
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "UPDATE durable_action_tickets SET notification_reason = ?",
+                (
+                    "x"
+                    * (
+                        durable_actions.MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH
+                        + 1
+                    ),
+                ),
+            )
+    finally:
+        conn.close()
 
 
 def test_action_ticket_payload_and_outcome_are_database_bounded_by_bytes(
