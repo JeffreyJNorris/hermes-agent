@@ -138,12 +138,12 @@ class DurableActionRunner:
             outcome = await handler_task
         except Exception:
             outcome = DurableActionOutcome(
-                DurableActionStatus.FAILED,
+                DurableActionStatus.UNKNOWN,
                 reason="handler_exception",
             )
         if not isinstance(outcome, DurableActionOutcome):
             outcome = DurableActionOutcome(
-                DurableActionStatus.FAILED,
+                DurableActionStatus.UNKNOWN,
                 reason="invalid_handler_outcome",
             )
         return await asyncio.to_thread(

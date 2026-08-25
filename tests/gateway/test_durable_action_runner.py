@@ -641,7 +641,7 @@ async def test_store_contention_does_not_block_event_loop(tmp_path: Path) -> Non
         ),
     ],
 )
-def test_runner_converts_bad_handler_results_to_bounded_structural_failure(
+def test_runner_converts_ambiguous_handler_results_to_bounded_unknown(
     tmp_path: Path, execute, reason: str
 ) -> None:
     db_path = tmp_path / "state.db"
@@ -654,7 +654,7 @@ def test_runner_converts_bad_handler_results_to_bounded_structural_failure(
     assert asyncio.run(runner.process_once()) is True
     row = _ticket(db_path, request_id)
     assert (row["status"], row["outcome_reason"], row["outcome_json"]) == (
-        "failed",
+        "unknown",
         reason,
         None,
     )

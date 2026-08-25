@@ -293,14 +293,19 @@ Only the canonical internal `approve` option makes a ticket ready. Display
 labels are not authority. Before mutation, the registered in-process handler
 reloads current state, rechecks the allowlist and policy, and compares the
 stored fingerprint. A removed or changed job becomes `invalidated` without a
-mutation. Payload rows never contain callbacks, Python import paths, shell
-commands, or credentials.
+mutation. The trusted `cron.resume` preparer emits exactly one inert data field,
+`job_id`; it never emits an executable selector, callback, command, Python
+import path, or credential. Bounded JSON used by future trusted handlers is
+data only and cannot select a handler; the separate, fixed action type and
+version select a statically registered implementation.
 
 Execution is at most once by default. A stale `claimed` ticket whose handler
 never started may return to `ready`. Hermes records `executing` before entering
-application code; if that execution becomes stale, the ticket becomes
-`unknown` and is never replayed automatically. Handler code runs outside the
-SQLite transaction, and a terminal outcome is persisted before notification.
+application code. A stale execution, an unexpected handler exception, or an
+invalid handler return becomes `unknown` and is never replayed automatically.
+`failed` is reserved for a handler's bounded, definite failure result. Handler
+code runs outside the SQLite transaction, and a terminal outcome is persisted
+before notification.
 
 For `unknown`, an operator must inspect the current domain state and structural
 ticket outcome before acting. Do not edit the SQLite row or reset it to
@@ -312,17 +317,22 @@ approval only after the target has a new, unambiguous state/fingerprint.
 An attached action suppresses the ordinary request-terminal wake. Hermes sends
 one fresh completion event only after the action is terminal. Rejection,
 expiry, cancellation, abandonment, invalidation, failure, unavailable handlers,
-and unknown outcomes all report that no new action was applied (or that the
-result is ambiguous). Notification failure never changes the action outcome.
+and unknown outcomes are described structurally. `unknown` always says the
+outcome is ambiguous and must be inspected before retry; it never promises that
+no action was applied. Notification failure never changes the action outcome.
 Session notifications follow the Phase 4B lineage checks, so `/new` drops them
 rather than injecting into a replacement session. Cron notifications use a
 schedule-neutral execution with source `durable_action` and the request ID as
 its trigger ID.
 
-Tool responses and completion events expose only bounded structural fields such
-as request ID, action type, terminal status, and reason. They omit payloads,
-fingerprints, idempotency keys, actor/profile/provider identifiers, routing,
-claims, credentials, and raw exceptions. Ordinary logs follow the same rule.
+Model-facing tool responses and formatted completion text expose only bounded
+structural fields such as request ID, action type, terminal status, and reason.
+They omit payloads, fingerprints, idempotency keys, actor/profile/provider
+identifiers, routing, claims, credentials, and raw exceptions. The internal
+routing envelope necessarily carries the verified session/profile address, but
+still omits action payloads, fingerprints, actor/provider identifiers, claims,
+credentials, and raw exceptions. Ordinary structural logs omit all of those
+private values.
 
 ## Security and privacy
 

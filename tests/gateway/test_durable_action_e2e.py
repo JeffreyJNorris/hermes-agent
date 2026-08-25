@@ -20,8 +20,6 @@ from gateway.durable_action_runner import (
 from gateway.durable_actions import (
     DurableActionStatus,
     DurableActionStore,
-    PreparedDurableAction,
-    encode_durable_action_payload,
 )
 from gateway.durable_requests import (
     DurableRequestOption,
@@ -80,20 +78,32 @@ def _paused_job() -> dict:
     return paused
 
 
-def _post_resume(job_id: str, *, actor_id: str = "42") -> dict:
+def _post_resume(
+    job_id: str,
+    *,
+    actor_id: str = "42",
+    session_key: str = "discord:guild:source:user",
+    session_id: str = "physical-session",
+    profile_name: str = "test-profile",
+    **hostile_metadata: object,
+) -> dict:
     entry = registry.get_entry("cronjob")
     assert entry is not None
     tokens = set_session_vars(
         platform="discord",
-        session_key="discord:guild:source:user",
-        session_id="physical-session",
+        session_key=session_key,
+        session_id=session_id,
         user_id=actor_id,
-        profile="test-profile",
+        profile=profile_name,
         cron_session="",
         cron_job_id="",
     )
     try:
-        return json.loads(entry.handler({"action": "resume", "job_id": job_id}))
+        return json.loads(
+            entry.handler(
+                {"action": "resume", "job_id": job_id, **hostile_metadata}
+            )
+        )
     finally:
         clear_session_vars(tokens)
 
@@ -176,7 +186,7 @@ def test_phase4b_profile_upgrade_preserves_request_without_ticket_or_wake(
 
 
 @pytest.mark.asyncio
-async def test_generic_approve_and_stored_import_path_cannot_execute(
+async def test_generic_approve_and_hostile_model_metadata_cannot_select_action(
     profile: Path,
 ) -> None:
     job = _paused_job()
@@ -224,56 +234,30 @@ async def test_generic_approve_and_stored_import_path_cannot_execute(
     with sqlite3.connect(profile / "state.db") as conn:
         assert conn.execute("SELECT COUNT(*) FROM durable_action_tickets").fetchone()[0] == 0
 
-    forged = store.create_with_action(
-        DurableRequestSpec(
-            kind="trusted.action",
-            title="Forged",
-            body="Must fail closed.",
-            options=(
-                DurableRequestOption("approve", "Approve"),
-                DurableRequestOption("reject", "Reject"),
-            ),
-            ttl_seconds=3600,
-        ),
-        action=PreparedDurableAction(
-            action_type="evil.import",
-            action_version=1,
-            payload_json=encode_durable_action_payload(
-                {"handler": "os.system", "credential": "secret-canary"}
-            ),
-            fingerprint="private-fingerprint",
-            idempotency_key="evil-import-once",
-        ),
-        target=DurableRequestTarget("discord", "123456789012345678"),
-        responder_mode=DurableResponderMode.INITIATOR,
-        expected_actor_id="42",
-        origin_type="session",
-        origin_id="forged-session",
-        origin_session_id="forged-physical-session",
+    trusted = _post_resume(
+        job["id"],
+        action_type="evil.import",
+        action_version=99,
+        handler="os.system",
+        callback="module:callable",
+        command="hostile-command-canary",
+        payload={"handler": "os.system"},
     )
-    claim = store.claim_next_pending(["discord"])
-    assert claim is not None
-    store.bind_delivery(
-        request_id=forged.request.request_id,
-        claim_id=claim.claim_id,
-        platform="discord",
-        message_id="forged-message",
-    )
-    store.resolve(
-        request_id=forged.request.request_id,
-        option_token="1",
-        platform="discord",
-        channel_id="123456789012345678",
-        message_id="forged-message",
-        actor_id="42",
-    )
+    ticket = _ticket(profile, trusted["request_id"])
+    assert (ticket["action_type"], ticket["action_version"]) == ("cron.resume", 1)
+    assert json.loads(ticket["payload_json"]) == {"job_id": job["id"]}
+    assert durable_actions.lookup_durable_action_handler("evil.import", 99) is None
+    _approve(trusted["request_id"])
     await DurableActionRunner(
         DurableActionStore(profile / "state.db"),
         enabled=True,
         allowed_actions={"evil.import"},
     ).process_once()
-    ticket = _ticket(profile, forged.request.request_id)
-    assert ticket["status"] == "handler_unavailable"
+    ticket = _ticket(profile, trusted["request_id"])
+    assert (ticket["status"], ticket["outcome_reason"]) == (
+        "handler_unavailable",
+        "action_not_allowlisted",
+    )
     assert jobs.get_job(job["id"])["enabled"] is False
 
 
@@ -319,6 +303,65 @@ async def test_approved_cron_resume_executes_and_notifies_exactly_once(profile: 
 
 
 @pytest.mark.asyncio
+async def test_restart_before_approval_recovers_and_never_replays(profile: Path) -> None:
+    job = _paused_job()
+    request_id = _post_resume(job["id"])["request_id"]
+
+    reset_durable_request_store_cache()
+    _approve(request_id, message_id="message-after-restart")
+    first_gateway = object.__new__(GatewayRunner)
+    first_gateway._classify_completion_target = AsyncMock(return_value="active")
+    first_gateway._build_process_event_source = MagicMock(return_value=object())
+    first_gateway._adapter_for_source = MagicMock(return_value=object())
+    first_gateway._inject_watch_notification = AsyncMock(return_value=True)
+
+    async def first_notify(claim):
+        return await first_gateway._dispatch_durable_action_notification(
+            claim,
+            profile_name="primary",
+            adapters={Platform.DISCORD: object()},
+        )
+
+    first_runner = DurableActionRunner(
+        DurableActionStore(profile / "state.db"),
+        enabled=True,
+        allowed_actions={"cron.resume"},
+        notification_handler=first_notify,
+    )
+    assert await first_runner.process_once() is True
+    first_gateway._inject_watch_notification.assert_awaited_once()
+    assert jobs.get_job(job["id"])["enabled"] is True
+
+    reset_durable_request_store_cache()
+    second_gateway = object.__new__(GatewayRunner)
+    second_gateway._classify_completion_target = AsyncMock(return_value="active")
+    second_gateway._build_process_event_source = MagicMock(return_value=object())
+    second_gateway._adapter_for_source = MagicMock(return_value=object())
+    second_gateway._inject_watch_notification = AsyncMock(return_value=True)
+
+    async def second_notify(claim):
+        return await second_gateway._dispatch_durable_action_notification(
+            claim,
+            profile_name="primary",
+            adapters={Platform.DISCORD: object()},
+        )
+
+    second_runner = DurableActionRunner(
+        DurableActionStore(profile / "state.db"),
+        enabled=True,
+        allowed_actions={"cron.resume"},
+        notification_handler=second_notify,
+    )
+    assert await second_runner.process_once() is False
+    ticket = _ticket(profile, request_id)
+    assert (ticket["status"], ticket["notification_status"]) == (
+        "succeeded",
+        "delivered",
+    )
+    second_gateway._inject_watch_notification.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_changed_state_invalidates_without_mutation(
     profile: Path,
 ) -> None:
@@ -349,13 +392,22 @@ async def test_composed_failure_notification_and_logs_are_structural_only(
     actor_canary = "actor-canary"
     provider_canary = "provider-message-canary"
     exception_canary = "raw-handler-exception-canary"
+    session_key_canary = "discord:guild:routing-session-canary"
+    session_id_canary = "physical-session-canary"
+    profile_canary = "profile-routing-canary"
     _paused_job()
     records = jobs.load_jobs()
     records[0]["id"] = payload_canary
     jobs.save_jobs(records)
 
     with caplog.at_level("INFO"):
-        response = _post_resume(payload_canary, actor_id=actor_canary)
+        response = _post_resume(
+            payload_canary,
+            actor_id=actor_canary,
+            session_key=session_key_canary,
+            session_id=session_id_canary,
+            profile_name=profile_canary,
+        )
         ticket = _ticket(profile, response["request_id"])
         fingerprint_canary = ticket["fingerprint"]
         idempotency_canary = ticket["idempotency_key"]
@@ -399,17 +451,18 @@ async def test_composed_failure_notification_and_logs_are_structural_only(
 
     terminal = _ticket(profile, response["request_id"])
     assert (terminal["status"], terminal["outcome_reason"]) == (
-        "failed",
+        "unknown",
         "handler_exception",
     )
     text, event = gateway._inject_watch_notification.await_args.args
-    assert "Action status: failed" in text
+    assert "Action status: unknown" in text
+    assert "result is ambiguous" in text
     assert "Reason: handler_exception" in text
     rendered_logs = repr(
         [(record.msg, record.args, record.__dict__) for record in caplog.records]
     )
-    public_surfaces = (repr(response), text, repr(event), rendered_logs)
-    private_values = (
+    model_surfaces = (repr(response), text, rendered_logs)
+    action_private_values = (
         payload_canary,
         fingerprint_canary,
         idempotency_canary,
@@ -419,9 +472,13 @@ async def test_composed_failure_notification_and_logs_are_structural_only(
         notification_claims[0],
         exception_canary,
     )
-    for surface in public_surfaces:
-        for private in private_values:
+    for surface in (*model_surfaces, repr(event)):
+        for private in action_private_values:
             assert private not in surface
+    for routing_value in (session_key_canary, session_id_canary, profile_canary):
+        assert routing_value in repr(event)
+        for surface in model_surfaces:
+            assert routing_value not in surface
 
 
 @pytest.mark.asyncio
