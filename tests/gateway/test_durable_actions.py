@@ -1577,9 +1577,13 @@ def test_pruning_deletes_terminal_action_and_parent_together(
         conn.execute(
             """UPDATE durable_action_tickets
                SET notification_status = ?, notification_completed_at = 1001.0,
-                   completed_at = 1000.0
+                   completed_at = ?
                WHERE request_id = ?""",
-            (notification, created.request.request_id),
+            (
+                notification,
+                1_999.0 if overflow else 1_000.0,
+                created.request.request_id,
+            ),
         )
         if overflow:
             conn.execute(

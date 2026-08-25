@@ -2069,6 +2069,16 @@ class DurableRequestStore:
                   AND ticket.status IN ({action_placeholders})
                   AND ticket.notification_status IN (?, ?)
                   AND ticket.completed_at IS NOT NULL
+            )
+        )"""
+        action_retention_due = """(
+            NOT EXISTS (
+                SELECT 1 FROM durable_action_tickets AS ticket
+                WHERE ticket.request_id = durable_requests.request_id
+            )
+            OR EXISTS (
+                SELECT 1 FROM durable_action_tickets AS ticket
+                WHERE ticket.request_id = durable_requests.request_id
                   AND ticket.completed_at <= ?
             )
         )"""
@@ -2076,7 +2086,6 @@ class DurableRequestStore:
             *_TERMINAL_ACTION_STATUSES,
             DurableActionNotificationStatus.DELIVERED.value,
             DurableActionNotificationStatus.DROPPED.value,
-            cutoff,
         )
         age_ids = [
             row["request_id"]
@@ -2085,13 +2094,15 @@ class DurableRequestStore:
                     WHERE status IN ({placeholders})
                       AND wake_status NOT IN (?, ?)
                       AND COALESCE(resolved_at, updated_at) <= ?
-                      AND {eligible_action}""",
+                      AND {eligible_action}
+                      AND {action_retention_due}""",
                 (
                     *terminal_values,
                     DurableWakeStatus.PENDING.value,
                     DurableWakeStatus.CLAIMED.value,
                     cutoff,
                     *action_params,
+                    cutoff,
                 ),
             )
         ]
