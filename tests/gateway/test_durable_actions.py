@@ -6,8 +6,31 @@ from pathlib import Path
 
 import pytest
 
-from gateway.durable_requests import DurableRequestStore, _DURABLE_SCHEMA_SQL
+from gateway.durable_requests import DurableRequestStore
 from hermes_state_common import SCHEMA_SQL
+
+
+_PHASE4B_DURABLE_REQUEST_SCHEMA_SQL = """
+CREATE TABLE durable_requests (
+    request_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    options_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    platform TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    responder_mode TEXT NOT NULL,
+    origin_type TEXT NOT NULL,
+    origin_id TEXT NOT NULL,
+    reference TEXT,
+    resolved_at REAL,
+    delivery_claimed_at REAL
+);
+"""
 
 
 EXPECTED_COLUMNS = {
@@ -101,7 +124,9 @@ def test_fresh_database_contains_action_ticket_ledger(
     assert unique["idx_durable_action_tickets_idempotency"] == 1
 
 
-def test_action_ticket_payload_and_outcome_are_database_bounded(tmp_path: Path) -> None:
+def test_action_ticket_payload_and_outcome_are_database_bounded_by_bytes(
+    tmp_path: Path,
+) -> None:
     from gateway.durable_actions import (
         MAX_DURABLE_ACTION_OUTCOME_JSON_BYTES,
         MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH,
@@ -130,17 +155,39 @@ def test_action_ticket_payload_and_outcome_are_database_bounded(tmp_path: Path) 
                 ),
             )
 
+    payload_at_limit = (
+        '"' + "é" * ((MAX_DURABLE_ACTION_PAYLOAD_BYTES - 2) // 2) + '"'
+    )
+    payload_over_limit = payload_at_limit[:-1] + 'é"'
+    outcome_at_limit = (
+        '"' + "é" * ((MAX_DURABLE_ACTION_OUTCOME_JSON_BYTES - 2) // 2) + '"'
+    )
+    outcome_over_limit = outcome_at_limit[:-1] + 'é"'
+
+    assert len(payload_at_limit.encode("utf-8")) == MAX_DURABLE_ACTION_PAYLOAD_BYTES
+    assert len(payload_over_limit) < MAX_DURABLE_ACTION_PAYLOAD_BYTES
+    assert len(payload_over_limit.encode("utf-8")) > MAX_DURABLE_ACTION_PAYLOAD_BYTES
+    assert (
+        len(outcome_at_limit.encode("utf-8"))
+        == MAX_DURABLE_ACTION_OUTCOME_JSON_BYTES
+    )
+    assert len(outcome_over_limit) < MAX_DURABLE_ACTION_OUTCOME_JSON_BYTES
+    assert (
+        len(outcome_over_limit.encode("utf-8"))
+        > MAX_DURABLE_ACTION_OUTCOME_JSON_BYTES
+    )
+
     insert(
-        payload_json="x" * MAX_DURABLE_ACTION_PAYLOAD_BYTES,
+        payload_json=payload_at_limit,
         outcome_reason="x" * MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH,
-        outcome_json="x" * MAX_DURABLE_ACTION_OUTCOME_JSON_BYTES,
+        outcome_json=outcome_at_limit,
     )
     with pytest.raises(sqlite3.IntegrityError):
-        insert(payload_json="x" * (MAX_DURABLE_ACTION_PAYLOAD_BYTES + 1))
+        insert(payload_json=payload_over_limit)
     with pytest.raises(sqlite3.IntegrityError):
         insert(outcome_reason="x" * (MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH + 1))
     with pytest.raises(sqlite3.IntegrityError):
-        insert(outcome_json="x" * (MAX_DURABLE_ACTION_OUTCOME_JSON_BYTES + 1))
+        insert(outcome_json=outcome_over_limit)
 
 
 def test_phase4b_database_reconciliation_preserves_requests_without_tickets(
@@ -149,7 +196,7 @@ def test_phase4b_database_reconciliation_preserves_requests_without_tickets(
     db_path = tmp_path / "phase4b.db"
     conn = sqlite3.connect(db_path)
     try:
-        conn.executescript(_DURABLE_SCHEMA_SQL)
+        conn.executescript(_PHASE4B_DURABLE_REQUEST_SCHEMA_SQL)
         conn.execute(
             """INSERT INTO durable_requests (
                    request_id, kind, title, body, options_json, status,
