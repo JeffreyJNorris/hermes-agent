@@ -99,6 +99,29 @@ def test_disabled_policy_preserves_immediate_model_resume(
     assert jobs.get_job(job["id"])["enabled"] is True
 
 
+@pytest.mark.parametrize(
+    "policy_yaml",
+    [
+        "durable_approvals: malformed\n",
+        "durable_approvals:\n  enabled: \"false\"\n  allowed_actions: []\n",
+        "durable_approvals:\n  enabled: 0\n  allowed_actions: []\n",
+    ],
+)
+def test_malformed_policy_fails_closed_without_resuming(
+    durable_cron_home: Path,
+    policy_yaml: str,
+) -> None:
+    config = _config(enabled=False, allowlisted=False)
+    config = config[: config.index("durable_approvals:")] + policy_yaml
+    (durable_cron_home / "config.yaml").write_text(config, encoding="utf-8")
+    job = _paused_job()
+
+    result = _model_handler(job["id"])
+
+    assert result == {"error": "durable approvals configuration is invalid"}
+    assert jobs.get_job(job["id"])["enabled"] is False
+
+
 def test_allowlisted_model_resume_creates_redacted_approval(
     durable_cron_home: Path,
 ) -> None:

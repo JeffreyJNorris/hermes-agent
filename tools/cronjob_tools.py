@@ -1208,7 +1208,12 @@ def _model_cronjob(args: Dict[str, Any], *, task_id: Optional[str] = None) -> st
 
             raw_config = load_config_readonly()
             policy = raw_config.get("durable_approvals", {})
-            if not isinstance(policy, dict) or policy.get("enabled") is not True:
+            if not isinstance(policy, dict):
+                return tool_error("durable approvals configuration is invalid")
+            enabled = policy.get("enabled", False)
+            if not isinstance(enabled, bool):
+                return tool_error("durable approvals configuration is invalid")
+            if enabled is False:
                 return cronjob(
                     action=args.get("action", ""),
                     job_id=args.get("job_id"),
