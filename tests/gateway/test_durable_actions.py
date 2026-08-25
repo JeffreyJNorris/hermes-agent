@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from gateway import durable_actions
 from gateway.durable_requests import DurableRequestStore
 from hermes_state_common import SCHEMA_SQL
 
@@ -54,6 +55,11 @@ EXPECTED_COLUMNS = {
     "created_at",
     "updated_at",
 }
+
+
+@pytest.fixture(autouse=True)
+def _isolate_durable_action_handlers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(durable_actions, "_DURABLE_ACTION_HANDLERS", {})
 
 
 def _schema_details(
@@ -293,3 +299,287 @@ def test_action_value_types_are_closed_and_immutable() -> None:
         ticket.status = DurableActionStatus.READY  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
         outcome.reason = "changed"  # type: ignore[misc]
+
+
+def _prepared_action(_job_id: str) -> durable_actions.PreparedDurableAction:
+    return durable_actions.PreparedDurableAction(
+        action_type="test.resume",
+        action_version=1,
+        payload_json=durable_actions.encode_durable_action_payload(
+            {"job_id": "job-1"}
+        ),
+        fingerprint="sha256:fingerprint",
+        idempotency_key="test.resume:job-1:fingerprint",
+    )
+
+
+def _execute_action(
+    _context: durable_actions.DurableActionExecutionContext,
+) -> durable_actions.DurableActionOutcome:
+    return durable_actions.DurableActionOutcome(
+        status=durable_actions.DurableActionStatus.SUCCEEDED,
+        reason="done",
+    )
+
+
+def test_handler_registry_uses_exact_action_type_and_version() -> None:
+    durable_actions.register_durable_action_handler(
+        "test.resume",
+        1,
+        prepare=_prepared_action,
+        execute=_execute_action,
+    )
+
+    assert (
+        durable_actions.lookup_durable_action_preparer("test.resume", 1)
+        is _prepared_action
+    )
+    assert (
+        durable_actions.lookup_durable_action_handler("test.resume", 1)
+        is _execute_action
+    )
+    assert durable_actions.lookup_durable_action_handler("test.resume", 2) is None
+    assert durable_actions.lookup_durable_action_handler("test.pause", 1) is None
+    assert durable_actions.lookup_durable_action_handler("test.resume", True) is None
+
+
+def test_handler_registry_rejects_duplicate_registration() -> None:
+    durable_actions.register_durable_action_handler(
+        "test.resume",
+        1,
+        prepare=_prepared_action,
+        execute=_execute_action,
+    )
+
+    with pytest.raises(ValueError, match="already registered"):
+        durable_actions.register_durable_action_handler(
+            "test.resume",
+            1,
+            prepare=_prepared_action,
+            execute=_execute_action,
+        )
+
+
+@pytest.mark.parametrize("field", ["prepare", "execute"])
+def test_handler_registry_rejects_noncallable_handlers(field: str) -> None:
+    handlers = {"prepare": _prepared_action, "execute": _execute_action}
+    handlers[field] = "persisted.callback"
+
+    with pytest.raises(TypeError, match=field):
+        durable_actions.register_durable_action_handler(
+            "test.resume",
+            1,
+            **handlers,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    ("action_type", "version"),
+    [
+        ("", 1),
+        ("cron", 1),
+        ("Cron.resume", 1),
+        ("cron resume", 1),
+        ("cron.__import__()", 1),
+        ("cron.resume", 0),
+        ("cron.resume", -1),
+        ("cron.resume", True),
+    ],
+)
+def test_handler_registry_rejects_invalid_identity(
+    action_type: str,
+    version: int,
+) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        durable_actions.register_durable_action_handler(
+            action_type,
+            version,
+            prepare=_prepared_action,
+            execute=_execute_action,
+        )
+
+
+def test_payload_json_is_canonical_and_round_trips() -> None:
+    payload = {"z": "é", "a": [1, True, None]}
+
+    encoded = durable_actions.encode_durable_action_payload(payload)
+
+    assert encoded == '{"a":[1,true,null],"z":"é"}'
+    assert durable_actions.decode_durable_action_payload(encoded) == payload
+
+
+@pytest.mark.parametrize(
+    "value",
+    [object(), {"not-a-json-key": {1, 2}}, {1: "integer key"}, ("tuple",)],
+)
+def test_payload_json_rejects_non_json_values(value: object) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        durable_actions.encode_durable_action_payload(value)
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_payload_json_rejects_non_finite_numbers(value: float) -> None:
+    with pytest.raises(ValueError):
+        durable_actions.encode_durable_action_payload(value)
+
+
+def test_payload_json_rejects_noncanonical_persisted_text() -> None:
+    with pytest.raises(ValueError, match="canonical"):
+        durable_actions.decode_durable_action_payload('{"b": 2, "a": 1}')
+
+
+def test_payload_and_result_helpers_bound_utf8_encoded_bytes() -> None:
+    payload_at_limit = "é" * (
+        (durable_actions.MAX_DURABLE_ACTION_PAYLOAD_BYTES - 2) // 2
+    )
+    payload_over_limit = payload_at_limit + "é"
+    result_at_limit = "é" * (
+        (durable_actions.MAX_DURABLE_ACTION_OUTCOME_JSON_BYTES - 2) // 2
+    )
+    result_over_limit = result_at_limit + "é"
+
+    encoded_payload = durable_actions.encode_durable_action_payload(payload_at_limit)
+    encoded_result = durable_actions.encode_durable_action_result(result_at_limit)
+
+    assert (
+        len(encoded_payload.encode("utf-8"))
+        == durable_actions.MAX_DURABLE_ACTION_PAYLOAD_BYTES
+    )
+    assert (
+        len(encoded_result.encode("utf-8"))
+        == durable_actions.MAX_DURABLE_ACTION_OUTCOME_JSON_BYTES
+    )
+    assert (
+        durable_actions.decode_durable_action_payload(encoded_payload)
+        == payload_at_limit
+    )
+    assert durable_actions.decode_durable_action_result(encoded_result) == result_at_limit
+    with pytest.raises(ValueError, match="too large"):
+        durable_actions.encode_durable_action_payload(payload_over_limit)
+    with pytest.raises(ValueError, match="too large"):
+        durable_actions.encode_durable_action_result(result_over_limit)
+
+
+@pytest.mark.parametrize("field", ["fingerprint", "idempotency_key"])
+def test_prepared_action_rejects_blank_security_fields(field: str) -> None:
+    values = {
+        "action_type": "test.resume",
+        "action_version": 1,
+        "payload_json": durable_actions.encode_durable_action_payload({}),
+        "fingerprint": "sha256:fingerprint",
+        "idempotency_key": "test.resume:key",
+    }
+    values[field] = " \t"
+
+    with pytest.raises(ValueError, match=field):
+        durable_actions.PreparedDurableAction(**values)
+
+
+def test_prepared_action_rejects_noncanonical_or_oversized_payload() -> None:
+    values = {
+        "action_type": "test.resume",
+        "action_version": 1,
+        "fingerprint": "sha256:fingerprint",
+        "idempotency_key": "test.resume:key",
+    }
+
+    with pytest.raises(ValueError, match="canonical"):
+        durable_actions.PreparedDurableAction(
+            payload_json='{ "job_id": "job-1" }',
+            **values,
+        )
+    with pytest.raises(ValueError, match="too large"):
+        durable_actions.PreparedDurableAction(
+            payload_json=(
+                '"'
+                + "é" * durable_actions.MAX_DURABLE_ACTION_PAYLOAD_BYTES
+                + '"'
+            ),
+            **values,
+        )
+
+
+def test_execution_context_is_frozen_and_validates_persisted_fields() -> None:
+    context = durable_actions.DurableActionExecutionContext(
+        request_id="drq_1",
+        action_type="test.resume",
+        action_version=1,
+        payload_json=durable_actions.encode_durable_action_payload(
+            {"job_id": "job-1"}
+        ),
+        fingerprint="sha256:fingerprint",
+        idempotency_key="test.resume:key",
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        context.fingerprint = "changed"  # type: ignore[misc]
+
+
+def test_outcome_is_structural_canonical_and_bounded() -> None:
+    result_json = durable_actions.encode_durable_action_result({"changed": True})
+    outcome = durable_actions.DurableActionOutcome(
+        status=durable_actions.DurableActionStatus.SUCCEEDED,
+        reason="x" * durable_actions.MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH,
+        result_json=result_json,
+    )
+
+    assert outcome.result_json == '{"changed":true}'
+    with pytest.raises(TypeError, match="status"):
+        durable_actions.DurableActionOutcome(status="succeeded")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="execution outcome"):
+        durable_actions.DurableActionOutcome(
+            status=durable_actions.DurableActionStatus.READY,
+        )
+    with pytest.raises(ValueError, match="reason"):
+        durable_actions.DurableActionOutcome(
+            status=durable_actions.DurableActionStatus.FAILED,
+            reason="x"
+            * (durable_actions.MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH + 1),
+        )
+    with pytest.raises(ValueError, match="canonical"):
+        durable_actions.DurableActionOutcome(
+            status=durable_actions.DurableActionStatus.SUCCEEDED,
+            result_json='{ "changed": true }',
+        )
+    with pytest.raises(TypeError, match="result_json"):
+        durable_actions.DurableActionOutcome(
+            status=durable_actions.DurableActionStatus.FAILED,
+            result_json=RuntimeError("do not persist me"),  # type: ignore[arg-type]
+        )
+
+
+def test_decoding_persisted_payload_cannot_select_or_invoke_a_handler() -> None:
+    called = False
+
+    def safe_execute(
+        _context: durable_actions.DurableActionExecutionContext,
+    ) -> durable_actions.DurableActionOutcome:
+        nonlocal called
+        called = True
+        return durable_actions.DurableActionOutcome(
+            status=durable_actions.DurableActionStatus.SUCCEEDED,
+        )
+
+    durable_actions.register_durable_action_handler(
+        "test.safe",
+        1,
+        prepare=_prepared_action,
+        execute=safe_execute,
+    )
+    persisted_payload = durable_actions.encode_durable_action_payload(
+        {
+            "action_type": "test.safe",
+            "action_version": 1,
+            "import_path": "malicious.module:run",
+            "callback": "builtins.eval",
+        }
+    )
+
+    decoded = durable_actions.decode_durable_action_payload(persisted_payload)
+
+    assert decoded["import_path"] == "malicious.module:run"
+    assert (
+        durable_actions.lookup_durable_action_handler("persisted.payload", 1)
+        is None
+    )
+    assert called is False
