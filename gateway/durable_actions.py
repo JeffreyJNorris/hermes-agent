@@ -5,11 +5,19 @@ from __future__ import annotations
 import json
 import math
 import re
+import secrets
+import sqlite3
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from hermes_constants import get_hermes_home
 from hermes_state_common import (
+    DURABLE_ACTION_SCHEMA_SQL,
     MAX_DURABLE_ACTION_OUTCOME_JSON_BYTES,
     MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH,
     MAX_DURABLE_ACTION_PAYLOAD_BYTES,
@@ -222,6 +230,13 @@ class DurableActionCreateResult:
 
 
 @dataclass(frozen=True)
+class DurableActionClaim:
+    context: DurableActionExecutionContext
+    token: str
+    claimed_at: float
+
+
+@dataclass(frozen=True)
 class DurableActionOutcome:
     status: DurableActionStatus
     reason: str | None = None
@@ -295,14 +310,213 @@ def lookup_durable_action_handler(
     return registered[1] if registered is not None else None
 
 
+class DurableActionStore:
+    """SQLite persistence for execution claims and immutable outcomes."""
+
+    def __init__(
+        self,
+        db_path: str | Path | None = None,
+        *,
+        wall_clock=time.time,
+    ) -> None:
+        self._db_path = Path(db_path or Path(get_hermes_home()) / "state.db")
+        self._wall_clock = wall_clock
+        self._lock = threading.RLock()
+        with self._connect() as conn:
+            conn.executescript(DURABLE_ACTION_SCHEMA_SQL)
+
+    def _connect(self) -> sqlite3.Connection:
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self._db_path, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 10000")
+        from hermes_state import apply_wal_with_fallback
+
+        apply_wal_with_fallback(conn, db_label="state.db (durable_actions)")
+        return conn
+
+    @contextmanager
+    def _transaction(self):
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def claim_next(self) -> DurableActionClaim | None:
+        now = float(self._wall_clock())
+        token = secrets.token_urlsafe(24)
+        with self._lock, self._transaction() as conn:
+            row = conn.execute(
+                """SELECT request_id, action_type, action_version, payload_json,
+                          fingerprint, idempotency_key
+                   FROM durable_action_tickets
+                   WHERE status = ?
+                   ORDER BY created_at, request_id
+                   LIMIT 1""",
+                (DurableActionStatus.READY.value,),
+            ).fetchone()
+            if row is None:
+                return None
+            context = DurableActionExecutionContext(
+                request_id=row["request_id"],
+                action_type=row["action_type"],
+                action_version=int(row["action_version"]),
+                payload_json=row["payload_json"],
+                fingerprint=row["fingerprint"],
+                idempotency_key=row["idempotency_key"],
+            )
+            changed = conn.execute(
+                """UPDATE durable_action_tickets
+                   SET status = ?, execution_claim = ?, execution_claimed_at = ?,
+                       updated_at = ?
+                   WHERE request_id = ? AND status = ?""",
+                (
+                    DurableActionStatus.CLAIMED.value,
+                    token,
+                    now,
+                    now,
+                    context.request_id,
+                    DurableActionStatus.READY.value,
+                ),
+            ).rowcount
+            if changed != 1:
+                return None
+        return DurableActionClaim(context=context, token=token, claimed_at=now)
+
+    def mark_executing(self, request_id: str, token: str) -> bool:
+        now = float(self._wall_clock())
+        with self._lock, self._transaction() as conn:
+            return conn.execute(
+                """UPDATE durable_action_tickets
+                   SET status = ?, execution_started_at = ?, updated_at = ?
+                   WHERE request_id = ? AND status = ? AND execution_claim = ?""",
+                (
+                    DurableActionStatus.EXECUTING.value,
+                    now,
+                    now,
+                    request_id,
+                    DurableActionStatus.CLAIMED.value,
+                    token,
+                ),
+            ).rowcount == 1
+
+    def complete(
+        self,
+        request_id: str,
+        token: str,
+        outcome: DurableActionOutcome,
+    ) -> bool:
+        if not isinstance(outcome, DurableActionOutcome):
+            raise TypeError("outcome must be a DurableActionOutcome")
+        now = float(self._wall_clock())
+        with self._lock, self._transaction() as conn:
+            return conn.execute(
+                """UPDATE durable_action_tickets
+                   SET status = ?, execution_claim = NULL,
+                       execution_claimed_at = NULL, outcome_reason = ?,
+                       outcome_json = ?, completed_at = ?,
+                       notification_status = ?, updated_at = ?
+                   WHERE request_id = ? AND status = ? AND execution_claim = ?""",
+                (
+                    outcome.status.value,
+                    outcome.reason,
+                    outcome.result_json,
+                    now,
+                    DurableActionNotificationStatus.PENDING.value,
+                    now,
+                    request_id,
+                    DurableActionStatus.EXECUTING.value,
+                    token,
+                ),
+            ).rowcount == 1
+
+    def mark_handler_unavailable(
+        self,
+        request_id: str,
+        token: str,
+        *,
+        reason: str,
+    ) -> bool:
+        outcome = DurableActionOutcome(
+            DurableActionStatus.HANDLER_UNAVAILABLE,
+            reason=reason,
+        )
+        now = float(self._wall_clock())
+        with self._lock, self._transaction() as conn:
+            return conn.execute(
+                """UPDATE durable_action_tickets
+                   SET status = ?, execution_claim = NULL,
+                       execution_claimed_at = NULL, outcome_reason = ?,
+                       outcome_json = NULL, completed_at = ?,
+                       notification_status = ?, updated_at = ?
+                   WHERE request_id = ? AND status = ? AND execution_claim = ?""",
+                (
+                    outcome.status.value,
+                    outcome.reason,
+                    now,
+                    DurableActionNotificationStatus.PENDING.value,
+                    now,
+                    request_id,
+                    DurableActionStatus.CLAIMED.value,
+                    token,
+                ),
+            ).rowcount == 1
+
+    def recover_stale(self, stale_after_seconds: float) -> tuple[int, int]:
+        if stale_after_seconds < 0:
+            raise ValueError("stale_after_seconds must not be negative")
+        now = float(self._wall_clock())
+        cutoff = now - stale_after_seconds
+        with self._lock, self._transaction() as conn:
+            claimed = conn.execute(
+                """UPDATE durable_action_tickets
+                   SET status = ?, execution_claim = NULL,
+                       execution_claimed_at = NULL, updated_at = ?
+                   WHERE status = ? AND execution_started_at IS NULL
+                     AND execution_claimed_at <= ?""",
+                (
+                    DurableActionStatus.READY.value,
+                    now,
+                    DurableActionStatus.CLAIMED.value,
+                    cutoff,
+                ),
+            ).rowcount
+            executing = conn.execute(
+                """UPDATE durable_action_tickets
+                   SET status = ?, execution_claim = NULL,
+                       execution_claimed_at = NULL,
+                       outcome_reason = 'execution_interrupted',
+                       outcome_json = NULL, completed_at = ?,
+                       notification_status = ?, updated_at = ?
+                   WHERE status = ? AND execution_started_at <= ?""",
+                (
+                    DurableActionStatus.UNKNOWN.value,
+                    now,
+                    DurableActionNotificationStatus.PENDING.value,
+                    now,
+                    DurableActionStatus.EXECUTING.value,
+                    cutoff,
+                ),
+            ).rowcount
+        return claimed, executing
+
+
 __all__ = [
     "DurableActionCreateResult",
+    "DurableActionClaim",
     "DurableActionNotificationStatus",
     "DurableActionOutcome",
     "DurableActionExecutionContext",
     "DurableActionHandler",
     "DurableActionPreparer",
     "DurableActionStatus",
+    "DurableActionStore",
     "DurableActionTicket",
     "MAX_DURABLE_ACTION_OUTCOME_JSON_BYTES",
     "MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH",
