@@ -542,3 +542,46 @@ async def test_disable_pauses_ready_ticket_and_reenable_executes_once(
     assert _ticket(profile, response["request_id"])["status"] == "succeeded"
     assert jobs.get_job(job["id"])["enabled"] is True
     assert provider_notifications == [True]
+
+
+@pytest.mark.asyncio
+async def test_gateway_worker_failure_log_omits_profile_name(
+    profile: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    profile_canary = "private-profile-canary"
+    secondary_home = profile / "secondary-profile-home"
+    gateway = object.__new__(GatewayRunner)
+    gateway._running = True
+    gateway._shutdown_event = asyncio.Event()
+    gateway._durable_request_home = profile
+    gateway._durable_action_task = None
+    gateway.adapters = {}
+    gateway.config = SimpleNamespace(multiplex_profiles=True)
+    gateway._profile_adapters = {profile_canary: {}}
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: secondary_home if name == profile_canary else profile,
+    )
+    original_store = DurableActionStore
+
+    def fail_secondary(db_path):
+        if Path(db_path).parent == secondary_home:
+            gateway._running = False
+            gateway._shutdown_event.set()
+            raise RuntimeError("structural failure")
+        return original_store(db_path)
+
+    monkeypatch.setattr(durable_actions, "DurableActionStore", fail_secondary)
+    with caplog.at_level("WARNING", logger="gateway.run"):
+        await gateway._run_durable_action_worker()
+
+    warnings = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "Durable action worker pass failed"
+        and getattr(record, "exception_class", None) == "RuntimeError"
+    ]
+    assert len(warnings) == 1
+    assert profile_canary not in repr(warnings[0].__dict__)

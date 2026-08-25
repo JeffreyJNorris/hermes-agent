@@ -10794,7 +10794,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.warning(
                             "Durable action worker pass failed",
                             extra={
-                                "profile": profile_name,
                                 "exception_class": type(exc).__name__,
                             },
                         )
