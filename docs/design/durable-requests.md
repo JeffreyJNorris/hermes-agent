@@ -251,6 +251,79 @@ continuation when the request terminates. The continuation must query or trust
 only the authoritative request result, revalidate current application state,
 and retain all normal approval gates before mutation.
 
+## Trusted durable action tickets
+
+A generic `durable_request` remains persisted user input only. It cannot name
+an action, attach a payload, or execute application code, even when an option is
+labelled `Approve`. Trusted durable actions are created only inside a domain
+tool that owns the fixed action type, version, payload schema, prompt,
+destination, responder scope, fingerprint, and idempotency key. No generic
+model-facing durable-action tool exists.
+
+The request and its separate `durable_action_tickets` row are committed in one
+SQLite transaction before provider delivery. The request owns the human
+decision; the ticket owns execution and notification state. The initial pilot
+is `cron.resume` version 1 and is disabled by default:
+
+```yaml
+durable_approvals:
+  enabled: false
+  allowed_actions: []
+```
+
+To opt in, set `enabled: true` and add `cron.resume` to `allowed_actions`.
+This changes only model-initiated resume calls. Explicit CLI, API, and operator
+resume paths keep their existing immediate semantics. The existing durable
+request inbox is reused.
+
+### Ticket lifecycle and crash boundary
+
+```text
+waiting_for_decision
+  approve -> ready -> claimed -> executing
+                              -> succeeded | already_applied | invalidated
+                              -> failed | unknown
+  reject  -> declined
+  expiry  -> expired
+  cancel  -> cancelled
+  delivery terminal failure -> abandoned
+```
+
+Only the canonical internal `approve` option makes a ticket ready. Display
+labels are not authority. Before mutation, the registered in-process handler
+reloads current state, rechecks the allowlist and policy, and compares the
+stored fingerprint. A removed or changed job becomes `invalidated` without a
+mutation. Payload rows never contain callbacks, Python import paths, shell
+commands, or credentials.
+
+Execution is at most once by default. A stale `claimed` ticket whose handler
+never started may return to `ready`. Hermes records `executing` before entering
+application code; if that execution becomes stale, the ticket becomes
+`unknown` and is never replayed automatically. Handler code runs outside the
+SQLite transaction, and a terminal outcome is persisted before notification.
+
+For `unknown`, an operator must inspect the current domain state and structural
+ticket outcome before acting. Do not edit the SQLite row or reset it to
+`ready`. Reconcile through the normal operator surface; request a new trusted
+approval only after the target has a new, unambiguous state/fingerprint.
+
+### Completion notification and privacy
+
+An attached action suppresses the ordinary request-terminal wake. Hermes sends
+one fresh completion event only after the action is terminal. Rejection,
+expiry, cancellation, abandonment, invalidation, failure, unavailable handlers,
+and unknown outcomes all report that no new action was applied (or that the
+result is ambiguous). Notification failure never changes the action outcome.
+Session notifications follow the Phase 4B lineage checks, so `/new` drops them
+rather than injecting into a replacement session. Cron notifications use a
+schedule-neutral execution with source `durable_action` and the request ID as
+its trigger ID.
+
+Tool responses and completion events expose only bounded structural fields such
+as request ID, action type, terminal status, and reason. They omit payloads,
+fingerprints, idempotency keys, actor/profile/provider identifiers, routing,
+claims, credentials, and raw exceptions. Ordinary logs follow the same rule.
+
 ## Security and privacy
 
 A durable request is user input, not an authorization token. It does not
@@ -264,5 +337,6 @@ disables Discord mention expansion and logs structural fields rather than
 request content at ordinary log levels.
 
 This phase deliberately excludes serialized callbacks, arbitrary continuation
-payloads, automatic application mutations, text fallback, multiselect, forms,
-modals, and arbitrary provider components.
+payloads or action selection, text fallback, multiselect, forms, modals, and
+arbitrary provider components. Automatic application mutation is limited to
+explicitly allowlisted, statically registered trusted handlers.
