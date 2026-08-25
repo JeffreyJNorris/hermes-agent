@@ -683,6 +683,40 @@ def _create_approval(
     )
 
 
+def _action_ticket(db_path: Path, request_id: str) -> sqlite3.Row | None:
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            "SELECT * FROM durable_action_tickets WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+
+
+def _open_approval(store: DurableRequestStore):
+    created = _create_approval(store)
+    claim = store.claim_next_pending(["discord"])
+    assert claim is not None
+    opened = store.bind_delivery(
+        request_id=created.request.request_id,
+        claim_id=claim.claim_id,
+        platform="discord",
+        message_id="message-1",
+    )
+    assert opened is not None
+    return created
+
+
+def _resolve_approval(store: DurableRequestStore, request_id: str, slot: str):
+    return store.resolve(
+        request_id=request_id,
+        option_token=slot,
+        platform="discord",
+        channel_id="thread-1",
+        message_id="message-1",
+        actor_id="actor-1",
+    )
+
+
 def test_create_with_action_persists_one_joined_approval_and_retains_lineage(
     tmp_path: Path,
 ) -> None:
@@ -1231,3 +1265,329 @@ def test_create_with_action_logs_no_action_secrets(
         "secret-profile-marker",
     ):
         assert secret not in rendered
+
+
+@pytest.mark.parametrize(
+    ("slot", "status", "notification", "completed", "reason"),
+    [
+        ("1", "ready", "not_ready", False, None),
+        ("2", "declined", "pending", True, "rejected"),
+    ],
+)
+def test_action_decision_transitions_atomically(
+    tmp_path: Path,
+    slot: str,
+    status: str,
+    notification: str,
+    completed: bool,
+    reason: str | None,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = DurableRequestStore(db_path, wall_clock=lambda: 1_000.0)
+    created = _open_approval(store)
+
+    result = _resolve_approval(store, created.request.request_id, slot)
+
+    assert result.status.value == "resolved"
+    assert result.request is not None
+    assert result.request.wake_status is DurableWakeStatus.NOT_REQUESTED
+    assert result.request.terminal_reason == reason
+    ticket = _action_ticket(db_path, created.request.request_id)
+    assert ticket is not None
+    assert ticket["status"] == status
+    assert ticket["notification_status"] == notification
+    assert (ticket["completed_at"] is not None) is completed
+    assert ticket["outcome_reason"] == reason
+
+
+def test_action_decision_uses_internal_id_not_approve_label(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = DurableRequestStore(db_path, wall_clock=lambda: 1_000.0)
+    created = _open_approval(store)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE durable_requests SET options_json = ? WHERE request_id = ?",
+            (
+                '[{"id":"not_approve","label":"Approve","style":"success"},'
+                '{"id":"reject","label":"Reject","style":"danger"}]',
+                created.request.request_id,
+            ),
+        )
+
+    result = _resolve_approval(store, created.request.request_id, "1")
+
+    assert result.status.value == "resolved"
+    assert result.request is not None
+    assert result.request.terminal_reason == "invalid_decision"
+    ticket = _action_ticket(db_path, created.request.request_id)
+    assert ticket is not None
+    assert (ticket["status"], ticket["notification_status"]) == (
+        "abandoned",
+        "pending",
+    )
+    assert ticket["completed_at"] == 1_000.0
+
+
+def test_duplicate_action_resolution_does_not_requeue_terminal_ticket(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = DurableRequestStore(db_path, wall_clock=lambda: 1_000.0)
+    created = _open_approval(store)
+    _resolve_approval(store, created.request.request_id, "2")
+    ticket = _action_ticket(db_path, created.request.request_id)
+    assert ticket is not None
+    before = tuple(ticket)
+
+    replay = _resolve_approval(store, created.request.request_id, "2")
+
+    assert replay.status.value == "already_resolved"
+    ticket = _action_ticket(db_path, created.request.request_id)
+    assert ticket is not None
+    assert tuple(ticket) == before
+
+
+@pytest.mark.parametrize("bulk", [False, True], ids=["get", "expire_due"])
+def test_action_expiry_transitions_through_single_and_bulk_paths(
+    tmp_path: Path,
+    bulk: bool,
+) -> None:
+    db_path = tmp_path / "state.db"
+    now = [1_000.0]
+    store = DurableRequestStore(db_path, wall_clock=lambda: now[0])
+    created = _create_approval(store)
+    now[0] = 1_061.0
+
+    if bulk:
+        assert store.expire_due() == 1
+    else:
+        assert store.get(request_id=created.request.request_id).status.value == "expired"
+
+    request = store.get(request_id=created.request.request_id)
+    ticket = _action_ticket(db_path, created.request.request_id)
+    assert request is not None and request.wake_status is DurableWakeStatus.NOT_REQUESTED
+    assert ticket is not None
+    assert (
+        ticket["status"],
+        ticket["notification_status"],
+        ticket["outcome_reason"],
+        ticket["completed_at"],
+    ) == ("expired", "pending", "deadline_elapsed", 1_061.0)
+
+
+def test_action_cancellation_is_terminal_and_idempotent(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    store = DurableRequestStore(db_path, wall_clock=lambda: 1_000.0)
+    created = _create_approval(store)
+
+    cancelled = store.cancel(
+        origin_type="session",
+        origin_id="discord:guild:user",
+        request_id=created.request.request_id,
+        reason="private caller text",
+    )
+    ticket = _action_ticket(db_path, created.request.request_id)
+    assert ticket is not None
+    before = tuple(ticket)
+    replay = store.cancel(
+        origin_type="session",
+        origin_id="discord:guild:user",
+        request_id=created.request.request_id,
+    )
+
+    assert cancelled is not None and cancelled.terminal_reason == "cancelled_by_origin"
+    assert cancelled.wake_status is DurableWakeStatus.NOT_REQUESTED
+    assert replay is not None
+    ticket = _action_ticket(db_path, created.request.request_id)
+    assert ticket is not None
+    assert tuple(ticket) == before
+    assert ticket["status"] == "cancelled"
+    assert ticket["outcome_reason"] == "cancelled_by_origin"
+    assert ticket["notification_status"] == "pending"
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [
+        DurableRequestStatus.UNSUPPORTED,
+        DurableRequestStatus.DELIVERY_FAILED,
+        DurableRequestStatus.DELIVERY_UNKNOWN,
+    ],
+)
+def test_all_fail_delivery_outcomes_abandon_action(
+    tmp_path: Path,
+    terminal_status: DurableRequestStatus,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = DurableRequestStore(db_path, wall_clock=lambda: 1_000.0)
+    created = _create_approval(store)
+    claim = store.claim_next_pending(["discord"])
+    assert claim is not None
+
+    request = store.fail_delivery(
+        request_id=created.request.request_id,
+        claim_id=claim.claim_id,
+        status=terminal_status,
+        reason="private provider text",
+    )
+
+    ticket = _action_ticket(db_path, created.request.request_id)
+    assert request is not None and request.terminal_reason == terminal_status.value
+    assert request.wake_status is DurableWakeStatus.NOT_REQUESTED
+    assert ticket is not None
+    assert (ticket["status"], ticket["notification_status"]) == (
+        "abandoned",
+        "pending",
+    )
+    assert ticket["outcome_reason"] == terminal_status.value
+    before = tuple(ticket)
+    assert store.fail_delivery(
+        request_id=created.request.request_id,
+        claim_id=claim.claim_id,
+        status=terminal_status,
+        reason="different private provider text",
+    ) is None
+    ticket = _action_ticket(db_path, created.request.request_id)
+    assert ticket is not None and tuple(ticket) == before
+
+
+def test_stale_delivery_and_open_failure_abandon_actions(tmp_path: Path) -> None:
+    stale_db = tmp_path / "stale.db"
+    now = [1_000.0]
+    stale_store = DurableRequestStore(stale_db, wall_clock=lambda: now[0])
+    stale = _create_approval(stale_store)
+    assert stale_store.claim_next_pending(["discord"]) is not None
+    now[0] = 1_006.0
+    assert stale_store.recover_stale_delivery_claims(stale_after_seconds=5) == 1
+
+    stale_ticket = _action_ticket(stale_db, stale.request.request_id)
+    assert stale_ticket is not None
+    assert (stale_ticket["status"], stale_ticket["outcome_reason"]) == (
+        "abandoned",
+        "delivery_unknown",
+    )
+    stale_before = tuple(stale_ticket)
+    now[0] = 1_007.0
+    assert stale_store.recover_stale_delivery_claims(stale_after_seconds=5) == 0
+    stale_ticket = _action_ticket(stale_db, stale.request.request_id)
+    assert stale_ticket is not None and tuple(stale_ticket) == stale_before
+
+    open_db = tmp_path / "open.db"
+    open_store = DurableRequestStore(open_db, wall_clock=lambda: 2_000.0)
+    opened = _open_approval(open_store)
+    failed = open_store.mark_open_failed(
+        request_id=opened.request.request_id,
+        message_id="message-1",
+        reason="private provider text",
+    )
+    open_ticket = _action_ticket(open_db, opened.request.request_id)
+    assert failed is not None and failed.terminal_reason == "delivery_failed"
+    assert open_ticket is not None
+    assert (open_ticket["status"], open_ticket["outcome_reason"]) == (
+        "abandoned",
+        "delivery_failed",
+    )
+
+
+@pytest.mark.parametrize("overflow", [False, True], ids=["age", "overflow"])
+@pytest.mark.parametrize("action_status", ["ready", "claimed", "executing"])
+def test_pruning_protects_nonterminal_action_tickets(
+    tmp_path: Path,
+    action_status: str,
+    overflow: bool,
+) -> None:
+    db_path = tmp_path / "state.db"
+    now = [1_000.0]
+    store = DurableRequestStore(
+        db_path,
+        wall_clock=lambda: now[0],
+        max_terminal=0 if overflow else 10,
+    )
+    created = _open_approval(store)
+    _resolve_approval(store, created.request.request_id, "1")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE durable_action_tickets SET status = ? WHERE request_id = ?",
+            (action_status, created.request.request_id),
+        )
+        if overflow:
+            conn.execute(
+                "UPDATE durable_requests SET resolved_at = 1999.0 WHERE request_id = ?",
+                (created.request.request_id,),
+            )
+    now[0] = 2_000.0
+
+    assert store.prune_terminal(retention_seconds=10) == 0
+    assert store.get(request_id=created.request.request_id) is not None
+    assert _action_ticket(db_path, created.request.request_id) is not None
+
+
+@pytest.mark.parametrize("overflow", [False, True], ids=["age", "overflow"])
+@pytest.mark.parametrize("notification", ["pending", "claimed"])
+def test_pruning_protects_undelivered_action_notifications(
+    tmp_path: Path,
+    notification: str,
+    overflow: bool,
+) -> None:
+    db_path = tmp_path / "state.db"
+    now = [1_000.0]
+    store = DurableRequestStore(
+        db_path,
+        wall_clock=lambda: now[0],
+        max_terminal=0 if overflow else 10,
+    )
+    created = _open_approval(store)
+    _resolve_approval(store, created.request.request_id, "2")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """UPDATE durable_action_tickets
+               SET notification_status = ?, completed_at = 1000.0
+               WHERE request_id = ?""",
+            (notification, created.request.request_id),
+        )
+        if overflow:
+            conn.execute(
+                "UPDATE durable_requests SET resolved_at = 1999.0 WHERE request_id = ?",
+                (created.request.request_id,),
+            )
+    now[0] = 2_000.0
+
+    assert store.prune_terminal(retention_seconds=10) == 0
+    assert store.get(request_id=created.request.request_id) is not None
+    assert _action_ticket(db_path, created.request.request_id) is not None
+
+
+@pytest.mark.parametrize("notification", ["delivered", "dropped"])
+@pytest.mark.parametrize("overflow", [False, True], ids=["age", "overflow"])
+def test_pruning_deletes_terminal_action_and_parent_together(
+    tmp_path: Path,
+    notification: str,
+    overflow: bool,
+) -> None:
+    db_path = tmp_path / "state.db"
+    now = [1_000.0]
+    store = DurableRequestStore(
+        db_path,
+        wall_clock=lambda: now[0],
+        max_terminal=0 if overflow else 10,
+    )
+    created = _open_approval(store)
+    _resolve_approval(store, created.request.request_id, "2")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """UPDATE durable_action_tickets
+               SET notification_status = ?, notification_completed_at = 1001.0,
+                   completed_at = 1000.0
+               WHERE request_id = ?""",
+            (notification, created.request.request_id),
+        )
+        if overflow:
+            conn.execute(
+                "UPDATE durable_requests SET resolved_at = 1999.0 WHERE request_id = ?",
+                (created.request.request_id,),
+            )
+    now[0] = 2_000.0
+
+    assert store.prune_terminal(retention_seconds=10) == 1
+    assert store.get(request_id=created.request.request_id) is None
+    assert _action_ticket(db_path, created.request.request_id) is None

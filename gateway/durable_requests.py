@@ -123,6 +123,17 @@ _ACTIVE_STATUSES = frozenset(
         DurableRequestStatus.OPEN,
     }
 )
+_TERMINAL_ACTION_STATUSES = tuple(
+    status.value
+    for status in DurableActionStatus
+    if status
+    not in {
+        DurableActionStatus.WAITING_FOR_DECISION,
+        DurableActionStatus.READY,
+        DurableActionStatus.CLAIMED,
+        DurableActionStatus.EXECUTING,
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -1059,6 +1070,12 @@ class DurableRequestStore:
                         row["request_id"],
                     ),
                 )
+                self._transition_action_for_terminal_request_locked(
+                    conn,
+                    request_id=row["request_id"],
+                    request_status=DurableRequestStatus.CANCELLED,
+                    now=now,
+                )
                 row = conn.execute(
                     "SELECT * FROM durable_requests WHERE request_id = ?",
                     (row["request_id"],),
@@ -1319,6 +1336,12 @@ class DurableRequestStore:
                     rid,
                 ),
             )
+            self._transition_action_for_terminal_request_locked(
+                conn,
+                request_id=rid,
+                request_status=status,
+                now=now,
+            )
             terminal = conn.execute(
                 "SELECT * FROM durable_requests WHERE request_id = ?",
                 (rid,),
@@ -1337,6 +1360,16 @@ class DurableRequestStore:
         cutoff = now - float(stale_after_seconds)
         with self._lock, self._transaction(immediate=True) as conn:
             self._expire_due_locked(conn, now)
+            request_ids = [
+                row["request_id"]
+                for row in conn.execute(
+                    """SELECT request_id FROM durable_requests
+                       WHERE status = ? AND delivery_claim IS NOT NULL
+                         AND delivery_claimed_at IS NOT NULL
+                         AND delivery_claimed_at <= ?""",
+                    (DurableRequestStatus.PENDING_DELIVERY.value, cutoff),
+                )
+            ]
             updated = conn.execute(
                 """UPDATE durable_requests
                    SET status = ?, terminal_reason = ?, resolved_at = ?,
@@ -1362,6 +1395,13 @@ class DurableRequestStore:
                     cutoff,
                 ),
             ).rowcount
+            for request_id in request_ids:
+                self._transition_action_for_terminal_request_locked(
+                    conn,
+                    request_id=request_id,
+                    request_status=DurableRequestStatus.DELIVERY_UNKNOWN,
+                    now=now,
+                )
             return int(updated)
 
     def claim_next_wake(self) -> DurableWakeClaim | None:
@@ -1687,6 +1727,14 @@ class DurableRequestStore:
                     mapped or DurableResolveStatus.NOT_DELIVERED
                 )
 
+            self._transition_action_for_terminal_request_locked(
+                conn,
+                request_id=rid,
+                request_status=DurableRequestStatus.SELECTED,
+                selected_option_id=selected_option.id,
+                now=now,
+            )
+
             resolved = conn.execute(
                 "SELECT * FROM durable_requests WHERE request_id = ?",
                 (rid,),
@@ -1753,6 +1801,12 @@ class DurableRequestStore:
                     DurableWakeStatus.PENDING.value,
                     rid,
                 ),
+            )
+            self._transition_action_for_terminal_request_locked(
+                conn,
+                request_id=rid,
+                request_status=DurableRequestStatus.DELIVERY_FAILED,
+                now=now,
             )
             terminal = conn.execute(
                 "SELECT * FROM durable_requests WHERE request_id = ?",
@@ -1839,7 +1893,7 @@ class DurableRequestStore:
             DurableRequestStatus(row["status"]) in _ACTIVE_STATUSES
             and float(row["expires_at"]) <= now
         ):
-            conn.execute(
+            updated = conn.execute(
                 """UPDATE durable_requests
                    SET status = ?, terminal_reason = ?, resolved_at = ?,
                        updated_at = ?, delivery_claim = NULL,
@@ -1862,7 +1916,14 @@ class DurableRequestStore:
                     DurableRequestStatus.PENDING_DELIVERY.value,
                     DurableRequestStatus.OPEN.value,
                 ),
-            )
+            ).rowcount
+            if updated == 1:
+                self._transition_action_for_terminal_request_locked(
+                    conn,
+                    request_id=row["request_id"],
+                    request_status=DurableRequestStatus.EXPIRED,
+                    now=now,
+                )
             refreshed = conn.execute(
                 "SELECT * FROM durable_requests WHERE request_id = ?",
                 (row["request_id"],),
@@ -1872,7 +1933,19 @@ class DurableRequestStore:
         return row
 
     def _expire_due_locked(self, conn: sqlite3.Connection, now: float) -> int:
-        return int(
+        request_ids = [
+            row["request_id"]
+            for row in conn.execute(
+                """SELECT request_id FROM durable_requests
+                   WHERE status IN (?, ?) AND expires_at <= ?""",
+                (
+                    DurableRequestStatus.PENDING_DELIVERY.value,
+                    DurableRequestStatus.OPEN.value,
+                    now,
+                ),
+            )
+        ]
+        updated = int(
             conn.execute(
                 """UPDATE durable_requests
                    SET status = ?, terminal_reason = ?, resolved_at = ?,
@@ -1898,6 +1971,81 @@ class DurableRequestStore:
                 ),
             ).rowcount
         )
+        for request_id in request_ids:
+            self._transition_action_for_terminal_request_locked(
+                conn,
+                request_id=request_id,
+                request_status=DurableRequestStatus.EXPIRED,
+                now=now,
+            )
+        return updated
+
+    @staticmethod
+    def _transition_action_for_terminal_request_locked(
+        conn: sqlite3.Connection,
+        *,
+        request_id: str,
+        request_status: DurableRequestStatus,
+        now: float,
+        selected_option_id: str | None = None,
+    ) -> None:
+        if request_status is DurableRequestStatus.SELECTED:
+            action_status, reason = {
+                "approve": (DurableActionStatus.READY, None),
+                "reject": (DurableActionStatus.DECLINED, "rejected"),
+            }.get(
+                selected_option_id,
+                (DurableActionStatus.ABANDONED, "invalid_decision"),
+            )
+        else:
+            action_status, reason = {
+                DurableRequestStatus.EXPIRED: (
+                    DurableActionStatus.EXPIRED,
+                    "deadline_elapsed",
+                ),
+                DurableRequestStatus.CANCELLED: (
+                    DurableActionStatus.CANCELLED,
+                    "cancelled_by_origin",
+                ),
+            }.get(
+                request_status,
+                (DurableActionStatus.ABANDONED, request_status.value),
+            )
+        completed_at = None if action_status is DurableActionStatus.READY else now
+        notification_status = (
+            DurableActionNotificationStatus.NOT_READY
+            if action_status is DurableActionStatus.READY
+            else DurableActionNotificationStatus.PENDING
+        )
+
+        updated = conn.execute(
+            """UPDATE durable_action_tickets
+               SET status = ?, outcome_reason = ?, completed_at = ?,
+                   notification_status = ?, updated_at = ?
+               WHERE request_id = ? AND status = ?""",
+            (
+                action_status.value,
+                reason,
+                completed_at,
+                notification_status.value,
+                now,
+                request_id,
+                DurableActionStatus.WAITING_FOR_DECISION.value,
+            ),
+        ).rowcount
+        if updated == 1:
+            conn.execute(
+                """UPDATE durable_requests
+                   SET terminal_reason = ?, wake_requested = 0,
+                       wake_status = ?, wake_claim = NULL,
+                       wake_claimed_at = NULL, wake_reason = NULL
+                   WHERE request_id = ?""",
+                (
+                    reason,
+                    DurableWakeStatus.NOT_REQUESTED.value,
+                    request_id,
+                ),
+            )
 
     def _prune_locked(
         self,
@@ -1908,19 +2056,53 @@ class DurableRequestStore:
     ) -> int:
         terminal_values = tuple(status.value for status in _TERMINAL_STATUSES)
         placeholders = ",".join("?" for _ in terminal_values)
+        action_placeholders = ",".join("?" for _ in _TERMINAL_ACTION_STATUSES)
         cutoff = now - retention_seconds
-        deleted = conn.execute(
-            f"""DELETE FROM durable_requests
-                WHERE status IN ({placeholders})
-                  AND wake_status NOT IN (?, ?)
-                  AND COALESCE(resolved_at, updated_at) <= ?""",
-            (
-                *terminal_values,
-                DurableWakeStatus.PENDING.value,
-                DurableWakeStatus.CLAIMED.value,
-                cutoff,
-            ),
-        ).rowcount
+        eligible_action = f"""(
+            NOT EXISTS (
+                SELECT 1 FROM durable_action_tickets AS ticket
+                WHERE ticket.request_id = durable_requests.request_id
+            )
+            OR EXISTS (
+                SELECT 1 FROM durable_action_tickets AS ticket
+                WHERE ticket.request_id = durable_requests.request_id
+                  AND ticket.status IN ({action_placeholders})
+                  AND ticket.notification_status IN (?, ?)
+                  AND ticket.completed_at IS NOT NULL
+                  AND ticket.completed_at <= ?
+            )
+        )"""
+        action_params = (
+            *_TERMINAL_ACTION_STATUSES,
+            DurableActionNotificationStatus.DELIVERED.value,
+            DurableActionNotificationStatus.DROPPED.value,
+            cutoff,
+        )
+        age_ids = [
+            row["request_id"]
+            for row in conn.execute(
+                f"""SELECT request_id FROM durable_requests
+                    WHERE status IN ({placeholders})
+                      AND wake_status NOT IN (?, ?)
+                      AND COALESCE(resolved_at, updated_at) <= ?
+                      AND {eligible_action}""",
+                (
+                    *terminal_values,
+                    DurableWakeStatus.PENDING.value,
+                    DurableWakeStatus.CLAIMED.value,
+                    cutoff,
+                    *action_params,
+                ),
+            )
+        ]
+        conn.executemany(
+            "DELETE FROM durable_action_tickets WHERE request_id = ?",
+            ((request_id,) for request_id in age_ids),
+        )
+        conn.executemany(
+            "DELETE FROM durable_requests WHERE request_id = ?",
+            ((request_id,) for request_id in age_ids),
+        )
         terminal_count = conn.execute(
             f"""SELECT COUNT(*) FROM durable_requests
                 WHERE status IN ({placeholders})
@@ -1932,24 +2114,35 @@ class DurableRequestStore:
             ),
         ).fetchone()[0]
         excess = int(terminal_count) - self._max_terminal
+        overflow_ids: list[str] = []
         if excess > 0:
-            deleted += conn.execute(
-                f"""DELETE FROM durable_requests
-                    WHERE request_id IN (
-                        SELECT request_id FROM durable_requests
+            overflow_ids = [
+                row["request_id"]
+                for row in conn.execute(
+                    f"""SELECT request_id FROM durable_requests
                         WHERE status IN ({placeholders})
                           AND wake_status NOT IN (?, ?)
+                          AND {eligible_action}
                         ORDER BY COALESCE(resolved_at, updated_at), request_id
-                        LIMIT ?
-                    )""",
+                        LIMIT ?""",
                 (
                     *terminal_values,
                     DurableWakeStatus.PENDING.value,
                     DurableWakeStatus.CLAIMED.value,
+                    *action_params,
                     excess,
                 ),
-            ).rowcount
-        return int(deleted)
+                )
+            ]
+            conn.executemany(
+                "DELETE FROM durable_action_tickets WHERE request_id = ?",
+                ((request_id,) for request_id in overflow_ids),
+            )
+            conn.executemany(
+                "DELETE FROM durable_requests WHERE request_id = ?",
+                ((request_id,) for request_id in overflow_ids),
+            )
+        return len(age_ids) + len(overflow_ids)
 
     @staticmethod
     def _row_to_request(row: sqlite3.Row) -> DurableRequest:
