@@ -661,14 +661,12 @@ class DurableRequestStore:
                         "SELECT * FROM durable_action_tickets WHERE request_id = ?",
                         (existing_request["request_id"],),
                     ).fetchone()
-                    if (
-                        existing_ticket is None
-                        or existing_ticket["action_type"] != action.action_type
-                        or existing_ticket["idempotency_key"]
-                        != action.idempotency_key
+                    if existing_ticket is None or not self._ticket_matches_action(
+                        existing_ticket,
+                        action,
                     ):
                         raise DurableRequestError(
-                            "reference belongs to a different durable request or action"
+                            "reference conflicts with the prepared durable action"
                         )
                     return DurableActionCreateResult(
                         request=self._row_to_request(existing_request),
@@ -682,6 +680,10 @@ class DurableRequestStore:
                 (action.action_type, action.idempotency_key),
             ).fetchone()
             if existing_ticket is not None:
+                if not self._ticket_matches_action(existing_ticket, action):
+                    raise DurableRequestError(
+                        "idempotency key conflicts with the prepared durable action"
+                    )
                 existing_request = conn.execute(
                     "SELECT * FROM durable_requests WHERE request_id = ?",
                     (existing_ticket["request_id"],),
@@ -727,6 +729,19 @@ class DurableRequestStore:
                 ticket=self._row_to_action_ticket(ticket_row),
                 created=True,
             )
+
+    @staticmethod
+    def _ticket_matches_action(
+        row: sqlite3.Row,
+        action: PreparedDurableAction,
+    ) -> bool:
+        return (
+            row["action_type"] == action.action_type
+            and int(row["action_version"]) == action.action_version
+            and row["payload_json"] == action.payload_json
+            and row["fingerprint"] == action.fingerprint
+            and row["idempotency_key"] == action.idempotency_key
+        )
 
     def _validate_create_inputs(
         self,

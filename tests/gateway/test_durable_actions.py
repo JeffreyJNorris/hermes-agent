@@ -647,15 +647,18 @@ def _approval_spec(
 def _action(
     *,
     action_type: str = "cron.resume",
+    action_version: int = 1,
+    job_id: str = "job-1",
+    fingerprint: str = "sha256:fingerprint",
     idempotency_key: str = "cron.resume:job-1:fingerprint",
 ) -> durable_actions.PreparedDurableAction:
     return durable_actions.PreparedDurableAction(
         action_type=action_type,
-        action_version=1,
+        action_version=action_version,
         payload_json=durable_actions.encode_durable_action_payload(
-            {"job_id": "job-1"}
+            {"job_id": job_id}
         ),
-        fingerprint="sha256:fingerprint",
+        fingerprint=fingerprint,
         idempotency_key=idempotency_key,
     )
 
@@ -775,6 +778,49 @@ def test_create_with_action_returns_terminal_ticket_idempotently(
         )
 
 
+@pytest.mark.parametrize("reference", ["resume-job-1", None])
+@pytest.mark.parametrize(
+    "action",
+    [
+        _action(action_version=2),
+        _action(job_id="job-2"),
+        _action(fingerprint="sha256:changed"),
+    ],
+    ids=["version", "payload", "fingerprint"],
+)
+def test_create_with_action_rejects_idempotency_conflicts_without_changes(
+    tmp_path: Path,
+    reference: str | None,
+    action: durable_actions.PreparedDurableAction,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = DurableRequestStore(db_path, wall_clock=lambda: 1_000.0)
+    first = _create_approval(store)
+    with sqlite3.connect(db_path) as conn:
+        before_requests = conn.execute(
+            "SELECT * FROM durable_requests ORDER BY request_id"
+        ).fetchall()
+        before_tickets = conn.execute(
+            "SELECT * FROM durable_action_tickets ORDER BY request_id"
+        ).fetchall()
+
+    with pytest.raises(DurableRequestError, match="conflict"):
+        _create_approval(
+            store,
+            spec=_approval_spec(reference=reference),
+            action=action,
+        )
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute(
+            "SELECT * FROM durable_requests ORDER BY request_id"
+        ).fetchall() == before_requests
+        assert conn.execute(
+            "SELECT * FROM durable_action_tickets ORDER BY request_id"
+        ).fetchall() == before_tickets
+    assert store.get(request_id=first.request.request_id) == first.request
+
+
 def test_create_with_action_reference_cannot_attach_to_generic_request(
     tmp_path: Path,
 ) -> None:
@@ -851,27 +897,34 @@ def test_create_with_action_rolls_back_request_when_ticket_insert_fails(
         )
 
 
-def test_create_with_action_rolls_back_trigger_ticket_when_request_insert_fails(
+def test_create_with_action_rolls_back_ticket_when_request_insert_helper_fails(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     db_path = tmp_path / "state.db"
     store = DurableRequestStore(db_path, wall_clock=lambda: 1_000.0)
-    with sqlite3.connect(db_path) as conn:
+
+    def insert_ticket_then_fail(
+        conn: sqlite3.Connection,
+        *,
+        values: object,
+        now: float,
+    ) -> None:
         conn.execute(
-            """CREATE TRIGGER fail_request_insert
-               BEFORE INSERT ON durable_requests
-               BEGIN
-                   INSERT INTO durable_action_tickets (
-                       request_id, action_type, action_version, payload_json,
-                       fingerprint, idempotency_key, status,
-                       notification_status, created_at, updated_at
-                   ) VALUES (
-                       NEW.request_id, 'test.injected', 1, '{}', 'fingerprint',
-                       NEW.request_id, 'waiting_for_decision', 'not_ready', 1, 1
-                   );
-                   SELECT RAISE(ABORT, 'injected request failure');
-               END"""
+            """INSERT INTO durable_action_tickets (
+                   request_id, action_type, action_version, payload_json,
+                   fingerprint, idempotency_key, status,
+                   notification_status, created_at, updated_at
+               ) VALUES (
+                   'drq_injected_transaction_failure', 'test.injected', 1,
+                   '{}', 'fingerprint', 'injected-key',
+                   'waiting_for_decision', 'not_ready', ?, ?
+               )""",
+            (now, now),
         )
+        raise sqlite3.IntegrityError("injected request failure")
+
+    monkeypatch.setattr(store, "_insert_request_locked", insert_ticket_then_fail)
 
     with pytest.raises(sqlite3.IntegrityError, match="injected request failure"):
         _create_approval(store)
