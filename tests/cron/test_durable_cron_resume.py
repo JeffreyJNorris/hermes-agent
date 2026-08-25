@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 import threading
 from datetime import timedelta
 
@@ -86,25 +88,59 @@ def _allow(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    "imports",
+    [
+        "import gateway.durable_actions as durable_actions",
+        "import cron.jobs; import gateway.durable_actions as durable_actions",
+    ],
+)
+def test_registry_is_eager_for_both_fresh_import_orders(imports):
+    code = (
+        f"{imports}; "
+        "assert ('cron.resume', 1) in durable_actions._DURABLE_ACTION_HANDLERS; "
+        "assert ('cron.resume', 2) not in durable_actions._DURABLE_ACTION_HANDLERS"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
 def test_registry_has_exact_cron_resume_v1():
     assert lookup_durable_action_preparer("cron.resume", 1) is not None
     assert lookup_durable_action_handler("cron.resume", 1) is not None
     assert lookup_durable_action_handler("cron.resume", 2) is None
 
 
-def test_prepare_resolves_id_and_name_to_same_minimal_payload(cron_store):
+def test_prepare_uses_canonical_id_and_minimal_payload(cron_store):
     _save(_job())
     prepare = lookup_durable_action_preparer("cron.resume", 1)
     assert prepare is not None
 
     by_id = prepare("job-123")
-    by_name = prepare("private report")
 
-    assert by_id == by_name
     assert decode_durable_action_payload(by_id.payload_json) == {"job_id": "job-123"}
     assert by_id.idempotency_key == f"cron.resume:job-123:{by_id.fingerprint}"
     assert "SECRET_VALUE" not in repr(by_id)
     assert "secret.example" not in repr(by_id)
+
+
+@pytest.mark.parametrize("ref", ["private report", "private", "job-12"])
+def test_prepare_rejects_noncanonical_job_references(cron_store, ref):
+    _save(_job())
+    prepare = lookup_durable_action_preparer("cron.resume", 1)
+    with pytest.raises(ValueError, match="not found"):
+        prepare(ref)
+
+
+def test_prepare_rejects_ambiguous_name_instead_of_resolving_it(cron_store):
+    jobs.save_jobs(
+        [
+            _job(id="job-123"),
+            _job(id="job-456"),
+        ]
+    )
+    prepare = lookup_durable_action_preparer("cron.resume", 1)
+    with pytest.raises(ValueError, match="not found"):
+        prepare("private report")
 
 
 @pytest.mark.parametrize(
@@ -216,6 +252,55 @@ def test_execute_invalidates_changed_missing_or_invalid_job(cron_store, monkeypa
     assert "secret" not in (outcome.reason or "").lower()
 
 
+@pytest.mark.parametrize(
+    "invalid_update",
+    [
+        {"schedule": {"kind": "cron", "expr": "not a cron expression"}},
+        {"repeat": {"times": 4, "completed": -1}},
+        {"repeat": {"times": 4, "completed": 4}},
+        {"repeat": {"times": 4, "completed": True}},
+    ],
+)
+def test_execute_invalidates_malformed_cron_and_repeat_state(
+    cron_store,
+    monkeypatch,
+    invalid_update,
+):
+    _allow(monkeypatch)
+    _save(_job())
+    prepare = lookup_durable_action_preparer("cron.resume", 1)
+    execute = lookup_durable_action_handler("cron.resume", 1)
+    context = _context(prepare("job-123"))
+    _save({**_job(), **invalid_update})
+    before = jobs.JOBS_FILE.read_bytes()
+
+    outcome = execute(context)
+
+    assert outcome.status is DurableActionStatus.INVALIDATED
+    assert outcome.reason == "job_invalid"
+    assert jobs.JOBS_FILE.read_bytes() == before
+
+
+def test_execute_invalidates_cron_when_croniter_is_unavailable(
+    cron_store,
+    monkeypatch,
+):
+    _allow(monkeypatch)
+    _save(_job())
+    prepare = lookup_durable_action_preparer("cron.resume", 1)
+    execute = lookup_durable_action_handler("cron.resume", 1)
+    context = _context(prepare("job-123"))
+    _save(_job(schedule={"kind": "cron", "expr": "0 9 * * *"}))
+    monkeypatch.setattr(jobs, "HAS_CRONITER", False)
+    before = jobs.JOBS_FILE.read_bytes()
+
+    outcome = execute(context)
+
+    assert outcome.status is DurableActionStatus.INVALIDATED
+    assert outcome.reason == "job_invalid"
+    assert jobs.JOBS_FILE.read_bytes() == before
+
+
 def test_execute_revalidates_policy_before_mutation(cron_store, monkeypatch):
     _save(_job())
     prepare = lookup_durable_action_preparer("cron.resume", 1)
@@ -267,6 +352,31 @@ def test_provider_notification_is_after_save_and_best_effort(cron_store, monkeyp
     outcome = execute(context)
     assert outcome.status is DurableActionStatus.SUCCEEDED
     assert observed == [True]
+
+
+def test_provider_notification_import_failure_is_best_effort(
+    cron_store,
+    monkeypatch,
+):
+    import builtins
+
+    _allow(monkeypatch)
+    _save(_job())
+    prepare = lookup_durable_action_preparer("cron.resume", 1)
+    execute = lookup_durable_action_handler("cron.resume", 1)
+    context = _context(prepare("job-123"))
+    original_import = builtins.__import__
+
+    def fail_scheduler_import(name, *args, **kwargs):
+        if name == "cron.scheduler":
+            raise ImportError("provider secret")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fail_scheduler_import)
+    outcome = execute(context)
+
+    assert outcome.status is DurableActionStatus.SUCCEEDED
+    assert jobs.get_job("job-123")["enabled"] is True
 
 
 def test_fingerprint_and_save_share_one_lock(cron_store, monkeypatch):

@@ -1708,6 +1708,11 @@ def _valid_durable_resume_definition(job: Dict[str, Any]) -> bool:
     times = repeat.get("times")
     if times is not None and (type(times) is not int or times <= 0):
         return False
+    completed = repeat.get("completed")
+    if type(completed) is not int or completed < 0:
+        return False
+    if times is not None and completed >= times:
+        return False
     kind = schedule.get("kind")
     if kind == "once":
         run_at = schedule.get("run_at")
@@ -1727,6 +1732,12 @@ def _valid_durable_resume_definition(job: Dict[str, Any]) -> bool:
             return False
     elif kind == "cron":
         if not isinstance(schedule.get("expr"), str) or not schedule["expr"].strip():
+            return False
+        if not _ensure_croniter():
+            return False
+        try:
+            croniter(schedule["expr"], _hermes_now()).get_next(datetime)
+        except Exception:
             return False
     else:
         return False
@@ -1778,10 +1789,7 @@ def prepare_durable_cron_resume(job_ref: str):
 
     if not isinstance(job_ref, str) or not job_ref.strip():
         raise ValueError("job reference is required")
-    try:
-        job = resolve_job_ref(job_ref)
-    except AmbiguousJobReference:
-        raise ValueError("job reference is ambiguous") from None
+    job = get_job(job_ref)
     if job is None:
         raise ValueError("cron job was not found")
     if job.get("enabled") is not False or job.get("state") != "paused":
@@ -1839,9 +1847,9 @@ def execute_durable_cron_resume(context):
     status, reason = resume_job_if_unchanged(payload["job_id"], context.fingerprint)
     outcome = DurableActionOutcome(DurableActionStatus(status), reason=reason)
     if outcome.status is DurableActionStatus.SUCCEEDED:
-        from cron.scheduler import _notify_provider_jobs_changed
-
         try:
+            from cron.scheduler import _notify_provider_jobs_changed
+
             _notify_provider_jobs_changed()
         except Exception:
             pass
