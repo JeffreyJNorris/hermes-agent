@@ -157,7 +157,7 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     except Exception:
         return True  # fail safe: inability to prove death must not rewrite state
     if started_at is None:
-        return pid == os.getpid()
+        return True
     current = _process_start_time(pid)
     return current is not None and current == started_at
 

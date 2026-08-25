@@ -162,8 +162,10 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
         [
             sys.executable,
             "-c",
-            "import json; from cron.executions import recover_interrupted_executions, list_executions; "
+            "import json; from cron.executions import create_execution, recover_interrupted_executions, list_executions; "
             "print(recover_interrupted_executions()); "
+            "replacement=create_execution('restart-job', source='builtin'); "
+            "print(replacement['id']); "
             "print(json.dumps(list_executions(job_id='restart-job'))) ",
         ],
         cwd=repo,
@@ -174,15 +176,16 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
     )
     lines = recover.stdout.strip().splitlines()
     assert lines[0] == "1"
-    records = json.loads(lines[1])
-    assert len(records) == 1
-    assert records[0]["id"] == execution_id
-    assert records[0]["status"] == "unknown"
-    assert records[0]["finished_at"]
-    assert "restart" in records[0]["error"].lower()
-    # Recovery only classifies the old attempt. It must not manufacture a new
-    # claimed record (which would imply an automatic retry).
-    assert [r["status"] for r in records] == ["unknown"]
+    replacement_id = lines[1]
+    records = json.loads(lines[2])
+    assert len(records) == 2
+    assert [(row["id"], row["status"]) for row in records] == [
+        (replacement_id, "claimed"),
+        (execution_id, "unknown"),
+    ]
+    interrupted = records[1]
+    assert interrupted["finished_at"]
+    assert "restart" in interrupted["error"].lower()
 
 
 def test_live_execution_in_another_process_blocks_durable_reservation(
@@ -221,6 +224,37 @@ def test_live_execution_in_another_process_blocks_durable_reservation(
                 trigger_id="drq_cross_process",
             )
         assert len(executions.list_executions(job_id="shared-job")) == 1
+    finally:
+        holder.terminate()
+        holder.wait(timeout=10)
+
+
+def test_live_foreign_pid_without_start_identity_remains_live(monkeypatch, tmp_path):
+    """Restricted process metadata must fail closed, not permit overlap."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        with executions._transaction() as conn:
+            conn.execute(
+                """INSERT INTO executions
+                   (id, job_id, source, process_id, pid, process_started_at,
+                    status, claimed_at)
+                   VALUES ('foreign-live', 'shared-job', 'direct', 'foreign',
+                           ?, NULL, 'running', '2026-08-25T00:00:00+00:00')""",
+                (holder.pid,),
+            )
+
+        with pytest.raises(executions.ExecutionAlreadyRunning):
+            executions.create_triggered_execution(
+                "shared-job",
+                source="durable_request",
+                trigger_id="drq_null_start_identity",
+            )
+
+        rows = executions.list_executions(job_id="shared-job")
+        assert [(row["id"], row["status"]) for row in rows] == [
+            ("foreign-live", "running")
+        ]
     finally:
         holder.terminate()
         holder.wait(timeout=10)

@@ -15,6 +15,7 @@ import threading
 import time
 from unittest.mock import patch
 
+from cron.executions import ExecutionAlreadyRunning
 from tools.cronjob_tools import cronjob, _execute_job_now
 from tools.environments.base import set_activity_callback
 
@@ -42,11 +43,18 @@ class TestCronjobRunExecutesImmediately:
 
     def test_execute_job_now_bails_without_claim(self):
         """_execute_job_now never calls run_one_job when the claim is lost."""
-        with patch("tools.cronjob_tools.claim_job_for_fire", return_value=False), \
-             patch("cron.scheduler.run_one_job") as m_run:
+        with patch(
+            "cron.executions.create_execution",
+            return_value={"id": "exec-job-run-1"},
+        ), patch(
+            "cron.executions.abandon_claimed_execution"
+        ) as m_abandon, patch(
+            "tools.cronjob_tools.claim_job_for_fire", return_value=False
+        ), patch("cron.scheduler.run_one_job") as m_run:
             res = _execute_job_now(dict(_JOB))
         assert res["claimed"] is False
         assert res["success"] is False
+        m_abandon.assert_called_once_with("exec-job-run-1")
         m_run.assert_not_called()
 
     def test_execute_job_now_marks_failure_on_exception(self):
@@ -60,6 +68,27 @@ class TestCronjobRunExecutesImmediately:
         assert res["success"] is False
         assert "boom" in res["error"]
         m_mark.assert_called_once()
+
+    def test_execute_job_now_does_not_mutate_job_when_execution_is_busy(self):
+        """A losing manual contender must not claim or mark the active job."""
+        with patch(
+            "cron.executions.create_execution",
+            side_effect=ExecutionAlreadyRunning("active owner"),
+        ), patch(
+            "tools.cronjob_tools.claim_job_for_fire"
+        ) as m_claim, patch(
+            "tools.cronjob_tools.mark_job_run"
+        ) as m_mark, patch(
+            "cron.scheduler.run_one_job"
+        ) as m_run:
+            res = _execute_job_now(dict(_JOB))
+
+        assert res["claimed"] is False
+        assert res["success"] is False
+        assert "already running" in res["error"].lower()
+        m_claim.assert_not_called()
+        m_mark.assert_not_called()
+        m_run.assert_not_called()
 
     def test_execute_job_now_heartbeats_while_job_runs(self):
         """A manual run ticks the caller's activity tracker while the job

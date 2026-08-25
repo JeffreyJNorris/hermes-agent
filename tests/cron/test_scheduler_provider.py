@@ -20,6 +20,8 @@ import threading
 import time
 from unittest.mock import patch
 
+import pytest
+
 
 def _wait_until(predicate, timeout=10.0, interval=0.005):
     """Block until ``predicate()`` is truthy or ``timeout`` elapses.
@@ -247,6 +249,10 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
     ran = []
     monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid: True, raising=False)
     monkeypatch.setattr(jobs, "get_job", lambda jid: {"id": jid, "name": "t"})
+    monkeypatch.setattr(
+        "cron.executions.create_execution",
+        lambda *_args, **_kwargs: {"id": "exec-j1"},
+    )
     monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(job["id"]) or True)
 
     assert InProcessCronScheduler().fire_due("j1") is True
@@ -257,7 +263,11 @@ def test_fire_due_loses_to_execution_owned_by_another_process(monkeypatch):
     from cron.executions import ExecutionAlreadyRunning
     from cron.scheduler_provider import InProcessCronScheduler
 
-    monkeypatch.setattr("cron.jobs.claim_job_for_fire", lambda _job_id: True)
+    claims = []
+    monkeypatch.setattr(
+        "cron.jobs.claim_job_for_fire",
+        lambda job_id: claims.append(job_id) or True,
+    )
     monkeypatch.setattr("cron.jobs.get_job", lambda _job_id: {"id": "j1"})
     monkeypatch.setattr(
         "cron.executions.create_execution",
@@ -273,6 +283,76 @@ def test_fire_due_loses_to_execution_owned_by_another_process(monkeypatch):
     )
 
     assert InProcessCronScheduler().fire_due("j1") is False
+    assert claims == []
+
+
+@pytest.mark.parametrize("failure_point", ["claim", "fetch"])
+def test_fire_due_abandons_reservation_when_pre_dispatch_step_raises(
+    monkeypatch, failure_point
+):
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    abandoned = []
+    monkeypatch.setattr(
+        "cron.executions.create_execution",
+        lambda *_args, **_kwargs: {"id": "exec-j1"},
+    )
+    monkeypatch.setattr(
+        "cron.executions.abandon_claimed_execution",
+        lambda execution_id: abandoned.append(execution_id),
+    )
+
+    def claim(_job_id):
+        if failure_point == "claim":
+            raise RuntimeError("claim failed")
+        return True
+
+    def fetch(_job_id):
+        if failure_point == "fetch":
+            raise RuntimeError("fetch failed")
+        return {"id": "j1"}
+
+    monkeypatch.setattr("cron.jobs.claim_job_for_fire", claim)
+    monkeypatch.setattr("cron.jobs.get_job", fetch)
+    monkeypatch.setattr(
+        "cron.scheduler.run_one_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("pre-dispatch failure must not run")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match=failure_point):
+        InProcessCronScheduler().fire_due("j1")
+
+    assert abandoned == ["exec-j1"]
+
+
+@pytest.mark.parametrize(
+    ("claimed", "job"),
+    [(False, {"id": "j1"}), (True, None)],
+)
+def test_fire_due_abandons_reservation_when_pre_dispatch_step_declines(
+    monkeypatch, claimed, job
+):
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    abandoned = []
+    monkeypatch.setattr(
+        "cron.executions.create_execution",
+        lambda *_args, **_kwargs: {"id": "exec-j1"},
+    )
+    monkeypatch.setattr(
+        "cron.executions.abandon_claimed_execution",
+        lambda execution_id: abandoned.append(execution_id),
+    )
+    monkeypatch.setattr("cron.jobs.claim_job_for_fire", lambda _job_id: claimed)
+    monkeypatch.setattr("cron.jobs.get_job", lambda _job_id: job)
+    run = patch("cron.scheduler.run_one_job")
+    with run as mocked_run:
+        assert InProcessCronScheduler().fire_due("j1") is False
+
+    assert abandoned == ["exec-j1"]
+    mocked_run.assert_not_called()
 
 
 # ── F2a: ticker liveness — survival, heartbeat, honest status (#32612, #32895) ──
