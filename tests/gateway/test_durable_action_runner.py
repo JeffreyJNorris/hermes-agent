@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -84,6 +85,29 @@ def _register(execute) -> None:
     )
 
 
+def _run_after_transaction_wait(store: DurableActionStore, now, advanced, operation):
+    original = store._transaction
+    waiting = threading.Event()
+    release = threading.Event()
+
+    @contextmanager
+    def blocked():
+        waiting.set()
+        assert release.wait(5)
+        with original() as conn:
+            yield conn
+
+    store._transaction = blocked  # type: ignore[method-assign]
+    results = []
+    thread = threading.Thread(target=lambda: results.append(operation()))
+    thread.start()
+    assert waiting.wait(5)
+    now[0] = advanced
+    release.set()
+    thread.join()
+    return results[0]
+
+
 def test_two_independent_stores_have_exactly_one_claim_winner(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     request_id = _ready_ticket(db_path)
@@ -141,6 +165,86 @@ def test_claim_token_timestamp_and_token_guards(tmp_path: Path) -> None:
     row = _ticket(db_path, request_id)
     assert row["execution_started_at"] == 2_000.0
     assert row["status"] == "succeeded"
+
+
+def test_claim_timestamp_is_sampled_after_lock_wait(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    request_id = _ready_ticket(db_path)
+    now = [1_000.0]
+    store = DurableActionStore(db_path, wall_clock=lambda: now[0])
+    claim = _run_after_transaction_wait(store, now, 1_400.0, store.claim_next)
+    assert claim is not None
+    assert claim.claimed_at == 1_400.0
+    assert _ticket(db_path, request_id)["execution_claimed_at"] == 1_400.0
+    assert store.recover_stale(300) == (0, 0)
+
+
+def test_execution_timestamp_is_sampled_after_lock_wait(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    request_id = _ready_ticket(db_path)
+    now = [1_000.0]
+    store = DurableActionStore(db_path, wall_clock=lambda: now[0])
+    claim = store.claim_next()
+    assert claim is not None
+    started = _run_after_transaction_wait(
+        store,
+        now,
+        1_800.0,
+        lambda: store.mark_executing(request_id, claim.token),
+    )
+    assert started is True
+    assert _ticket(db_path, request_id)["execution_started_at"] == 1_800.0
+    assert store.recover_stale(300) == (0, 0)
+
+
+@pytest.mark.parametrize("transition", ["complete", "handler_unavailable"])
+def test_terminal_timestamps_are_sampled_after_lock_wait(
+    tmp_path: Path,
+    transition: str,
+) -> None:
+    db_path = tmp_path / "state.db"
+    request_id = _ready_ticket(db_path)
+    now = [1_000.0]
+    store = DurableActionStore(db_path, wall_clock=lambda: now[0])
+    claim = store.claim_next()
+    assert claim is not None
+    if transition == "complete":
+        assert store.mark_executing(request_id, claim.token)
+        operation = lambda: store.complete(
+            request_id,
+            claim.token,
+            DurableActionOutcome(DurableActionStatus.SUCCEEDED),
+        )
+    else:
+        operation = lambda: store.mark_handler_unavailable(
+            request_id,
+            claim.token,
+            reason="handler_unavailable",
+        )
+    changed = _run_after_transaction_wait(store, now, 1_400.0, operation)
+
+    assert changed is True
+    row = _ticket(db_path, request_id)
+    assert row["completed_at"] == 1_400.0
+    assert row["updated_at"] == 1_400.0
+
+
+def test_stale_recovery_samples_cutoff_after_lock_wait(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    request_id = _ready_ticket(db_path)
+    now = [1_000.0]
+    store = DurableActionStore(db_path, wall_clock=lambda: now[0])
+    assert store.claim_next() is not None
+    recovered = _run_after_transaction_wait(
+        store, now, 1_400.0, lambda: store.recover_stale(300)
+    )
+
+    assert recovered == (1, 0)
+    row = _ticket(db_path, request_id)
+    assert row["status"] == "ready"
+    assert row["updated_at"] == 1_400.0
 
 
 def test_stale_claim_recovery_and_stale_execution_terminalization(tmp_path: Path) -> None:

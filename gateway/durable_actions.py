@@ -349,7 +349,6 @@ class DurableActionStore:
             conn.close()
 
     def claim_next(self) -> DurableActionClaim | None:
-        now = float(self._wall_clock())
         token = secrets.token_urlsafe(24)
         with self._lock, self._transaction() as conn:
             row = conn.execute(
@@ -371,6 +370,7 @@ class DurableActionStore:
                 fingerprint=row["fingerprint"],
                 idempotency_key=row["idempotency_key"],
             )
+            now = float(self._wall_clock())
             changed = conn.execute(
                 """UPDATE durable_action_tickets
                    SET status = ?, execution_claim = ?, execution_claimed_at = ?,
@@ -390,8 +390,8 @@ class DurableActionStore:
         return DurableActionClaim(context=context, token=token, claimed_at=now)
 
     def mark_executing(self, request_id: str, token: str) -> bool:
-        now = float(self._wall_clock())
         with self._lock, self._transaction() as conn:
+            now = float(self._wall_clock())
             return conn.execute(
                 """UPDATE durable_action_tickets
                    SET status = ?, execution_started_at = ?, updated_at = ?
@@ -414,8 +414,8 @@ class DurableActionStore:
     ) -> bool:
         if not isinstance(outcome, DurableActionOutcome):
             raise TypeError("outcome must be a DurableActionOutcome")
-        now = float(self._wall_clock())
         with self._lock, self._transaction() as conn:
+            now = float(self._wall_clock())
             return conn.execute(
                 """UPDATE durable_action_tickets
                    SET status = ?, execution_claim = NULL,
@@ -447,8 +447,8 @@ class DurableActionStore:
             DurableActionStatus.HANDLER_UNAVAILABLE,
             reason=reason,
         )
-        now = float(self._wall_clock())
         with self._lock, self._transaction() as conn:
+            now = float(self._wall_clock())
             return conn.execute(
                 """UPDATE durable_action_tickets
                    SET status = ?, execution_claim = NULL,
@@ -471,9 +471,9 @@ class DurableActionStore:
     def recover_stale(self, stale_after_seconds: float) -> tuple[int, int]:
         if stale_after_seconds < 0:
             raise ValueError("stale_after_seconds must not be negative")
-        now = float(self._wall_clock())
-        cutoff = now - stale_after_seconds
         with self._lock, self._transaction() as conn:
+            now = float(self._wall_clock())
+            cutoff = now - stale_after_seconds
             claimed = conn.execute(
                 """UPDATE durable_action_tickets
                    SET status = ?, execution_claim = NULL,
