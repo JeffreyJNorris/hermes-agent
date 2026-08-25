@@ -547,6 +547,24 @@ def test_triggered_execution_is_idempotent_by_source_and_trigger(
     assert independent["id"] != first["id"]
 
 
+def test_durable_action_trigger_has_its_own_idempotency_scope(
+    monkeypatch,
+    tmp_path,
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    action, created = executions.create_triggered_execution(
+        "job-1", source="durable_action", trigger_id="drq_1"
+    )
+    replay, replay_created = executions.create_triggered_execution(
+        "job-1", source="durable_action", trigger_id="drq_1"
+    )
+
+    assert created is True
+    assert replay_created is False
+    assert replay["id"] == action["id"]
+
+
 def test_abandon_triggered_reservation_only_removes_claimed_attempt(
     monkeypatch,
     tmp_path,

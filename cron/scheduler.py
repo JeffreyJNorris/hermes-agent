@@ -4131,6 +4131,8 @@ def enqueue_durable_request_continuation(
     terminal_reason: str | None,
     adapters=None,
     loop=None,
+    _execution_source: str = "durable_request",
+    _action_completion: tuple[str, str, str | None] | None = None,
 ) -> tuple[str, str | None]:
     """Accept one schedule-neutral continuation for a durable request.
 
@@ -4164,7 +4166,7 @@ def enqueue_durable_request_continuation(
     try:
         execution, created = create_triggered_execution(
             job["id"],
-            source="durable_request",
+            source=_execution_source,
             trigger_id=str(request_id),
         )
     except ExecutionAlreadyRunning:
@@ -4190,16 +4192,26 @@ def enqueue_durable_request_continuation(
     # schedule's data-collection script or replay context from prior jobs.
     continuation_job.pop("script", None)
     continuation_job.pop("context_from", None)
-    continuation_job["prompt"] = _durable_request_continuation_prompt(
-        original_prompt=str(job.get("prompt") or ""),
-        request_id=str(request_id),
-        reference=reference,
-        status=str(status),
-        title=str(title),
-        question=str(question),
-        selected_index=selected_index,
-        selected_label=selected_label,
-        terminal_reason=terminal_reason,
+    continuation_job["prompt"] = (
+        _durable_action_continuation_prompt(
+            original_prompt=str(job.get("prompt") or ""),
+            request_id=str(request_id),
+            action_type=_action_completion[0],
+            action_status=_action_completion[1],
+            outcome_reason=_action_completion[2],
+        )
+        if _action_completion is not None
+        else _durable_request_continuation_prompt(
+            original_prompt=str(job.get("prompt") or ""),
+            request_id=str(request_id),
+            reference=reference,
+            status=str(status),
+            title=str(title),
+            question=str(question),
+            selected_index=selected_index,
+            selected_label=selected_label,
+            terminal_reason=terminal_reason,
+        )
     )
 
     context = contextvars.copy_context()
@@ -4252,6 +4264,73 @@ def enqueue_durable_request_continuation(
             return "accepted", "continuation_dispatch_unknown"
         return "retry", "executor_dispatch_failed"
     return "accepted", None
+
+
+def enqueue_durable_action_continuation(
+    *,
+    job_id: str,
+    request_id: str,
+    action_type: str,
+    action_status: str,
+    outcome_reason: str | None,
+    adapters=None,
+    loop=None,
+) -> tuple[str, str | None]:
+    """Accept one schedule-neutral trusted-action completion turn."""
+    return enqueue_durable_request_continuation(
+        job_id=job_id,
+        request_id=request_id,
+        reference=None,
+        status=action_status,
+        title="",
+        question="",
+        selected_index=None,
+        selected_label=None,
+        terminal_reason=outcome_reason,
+        adapters=adapters,
+        loop=loop,
+        _execution_source="durable_action",
+        _action_completion=(action_type, action_status, outcome_reason),
+    )
+
+
+def _durable_action_continuation_prompt(
+    *,
+    original_prompt: str,
+    request_id: str,
+    action_type: str,
+    action_status: str,
+    outcome_reason: str | None,
+) -> str:
+    decision = (
+        "rejected"
+        if action_status == "declined"
+        else action_status
+        if action_status in {"expired", "cancelled", "abandoned"}
+        else "approved"
+    )
+    lines = [
+        "[IMPORTANT: A trusted durable action reached a terminal state.",
+        f"Request ID: {request_id}",
+        f"Action: {action_type}",
+        f"Decision: {decision}",
+        f"Action status: {action_status}",
+    ]
+    if outcome_reason:
+        lines.append(f"Reason: {outcome_reason}")
+    lines.extend(
+        [
+            "",
+            "The action outcome is persisted. Do not treat the original "
+            "selection as authorization for a different action.]",
+        ]
+    )
+    event = "\n".join(lines)
+    return (
+        f"{original_prompt.strip()}\n\n---\n\n{event}"
+        if original_prompt.strip()
+        else event
+    )
 
 
 def _durable_request_continuation_prompt(

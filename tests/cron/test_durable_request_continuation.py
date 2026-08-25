@@ -58,6 +58,20 @@ def _enqueue(**overrides):
     return scheduler.enqueue_durable_request_continuation(**arguments)
 
 
+def _enqueue_action(**overrides):
+    arguments = {
+        "job_id": "job-1",
+        "request_id": "drq_abcdefghijklmnopqrstuvwxyz012345",
+        "action_type": "cron.resume",
+        "action_status": "succeeded",
+        "outcome_reason": "job_resumed",
+        "adapters": {"discord": object()},
+        "loop": object(),
+    }
+    arguments.update(overrides)
+    return scheduler.enqueue_durable_action_continuation(**arguments)
+
+
 class ImmediatePool:
     def __init__(self) -> None:
         self.submissions = 0
@@ -123,6 +137,63 @@ def test_continuation_uses_current_job_without_mutating_schedule(
     assert kwargs["loop"] is not None
     assert job == original
     assert scheduler.get_running_job_ids() == frozenset()
+
+
+def test_action_completion_uses_separate_idempotent_schedule_neutral_source(
+    monkeypatch,
+) -> None:
+    job = _job(prompt="Use the current job policy.")
+    original = deepcopy(job)
+    executions = []
+    runs = []
+    monkeypatch.setattr(jobs, "get_job", lambda _job_id: job)
+    monkeypatch.setattr(
+        scheduler,
+        "create_triggered_execution",
+        lambda job_id, *, source, trigger_id: (
+            executions.append((job_id, source, trigger_id))
+            or ({"id": "action-execution"}, True)
+        ),
+    )
+    monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: ImmediatePool())
+    monkeypatch.setattr(
+        scheduler,
+        "run_one_job",
+        lambda continuation, **kwargs: runs.append((continuation, kwargs)) or True,
+    )
+
+    assert _enqueue_action() == ("accepted", None)
+
+    assert executions == [
+        ("job-1", "durable_action", "drq_abcdefghijklmnopqrstuvwxyz012345")
+    ]
+    assert len(runs) == 1
+    continuation, kwargs = runs[0]
+    assert "script" not in continuation
+    assert "context_from" not in continuation
+    assert "Use the current job policy." in continuation["prompt"]
+    assert "Action: cron.resume" in continuation["prompt"]
+    assert "Action status: succeeded" in continuation["prompt"]
+    assert "job_resumed" in continuation["prompt"]
+    assert "payload" not in continuation["prompt"]
+    assert kwargs["schedule_run"] is False
+    assert job == original
+
+
+def test_action_completion_replay_does_not_submit_twice(monkeypatch) -> None:
+    monkeypatch.setattr(jobs, "get_job", lambda _job_id: _job())
+    monkeypatch.setattr(
+        scheduler,
+        "create_triggered_execution",
+        lambda *_args, **_kwargs: ({"id": "existing"}, False),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_get_parallel_pool",
+        lambda _workers: pytest.fail("must not submit twice"),
+    )
+
+    assert _enqueue_action() == ("accepted", "continuation_already_recorded")
 
 
 @pytest.mark.parametrize(

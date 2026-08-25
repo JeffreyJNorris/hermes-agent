@@ -237,6 +237,20 @@ class DurableActionClaim:
 
 
 @dataclass(frozen=True)
+class DurableActionNotificationClaim:
+    request_id: str
+    action_type: str
+    action_status: DurableActionStatus
+    outcome_reason: str | None
+    origin_type: str
+    origin_id: str
+    origin_session_id: str | None
+    origin_ui_session_id: str | None
+    origin_profile: str | None
+    token: str
+
+
+@dataclass(frozen=True)
 class DurableActionOutcome:
     status: DurableActionStatus
     reason: str | None = None
@@ -586,11 +600,140 @@ class DurableActionStore:
             )
         return claimed, executing
 
+    def claim_next_notification(self) -> DurableActionNotificationClaim | None:
+        token = secrets.token_urlsafe(24)
+        with self._lock, self._transaction() as conn:
+            row = conn.execute(
+                """SELECT ticket.request_id, ticket.action_type, ticket.status,
+                          ticket.outcome_reason, request.origin_type,
+                          request.origin_id, request.origin_session_id,
+                          request.origin_ui_session_id, request.origin_profile
+                   FROM durable_action_tickets AS ticket
+                   JOIN durable_requests AS request
+                     ON request.request_id = ticket.request_id
+                   WHERE ticket.notification_status = ?
+                   ORDER BY ticket.completed_at, ticket.request_id
+                   LIMIT 1""",
+                (DurableActionNotificationStatus.PENDING.value,),
+            ).fetchone()
+            if row is None:
+                return None
+            now = self._now()
+            changed = conn.execute(
+                """UPDATE durable_action_tickets
+                   SET notification_status = ?, notification_claim = ?,
+                       notification_claimed_at = ?, updated_at = ?
+                   WHERE request_id = ? AND notification_status = ?""",
+                (
+                    DurableActionNotificationStatus.CLAIMED.value,
+                    token,
+                    now,
+                    now,
+                    row["request_id"],
+                    DurableActionNotificationStatus.PENDING.value,
+                ),
+            ).rowcount
+            if changed != 1:
+                return None
+        return DurableActionNotificationClaim(
+            request_id=row["request_id"],
+            action_type=row["action_type"],
+            action_status=DurableActionStatus(row["status"]),
+            outcome_reason=row["outcome_reason"],
+            origin_type=row["origin_type"],
+            origin_id=row["origin_id"],
+            origin_session_id=row["origin_session_id"],
+            origin_ui_session_id=row["origin_ui_session_id"],
+            origin_profile=row["origin_profile"],
+            token=token,
+        )
+
+    def recover_stale_notifications(self, stale_after_seconds: float) -> int:
+        stale_after_seconds = float(stale_after_seconds)
+        if not math.isfinite(stale_after_seconds) or stale_after_seconds <= 0:
+            raise ValueError("stale_after_seconds must be finite and positive")
+        with self._lock, self._transaction() as conn:
+            now = self._now()
+            return conn.execute(
+                """UPDATE durable_action_tickets
+                   SET notification_status = ?, notification_claim = NULL,
+                       notification_claimed_at = NULL, updated_at = ?
+                   WHERE notification_status = ? AND notification_claimed_at <= ?""",
+                (
+                    DurableActionNotificationStatus.PENDING.value,
+                    now,
+                    DurableActionNotificationStatus.CLAIMED.value,
+                    now - stale_after_seconds,
+                ),
+            ).rowcount
+
+    def complete_notification(self, request_id: str, token: str) -> bool:
+        return self._finish_notification(
+            request_id,
+            token,
+            status=DurableActionNotificationStatus.DELIVERED,
+        )
+
+    def drop_notification(self, request_id: str, token: str, *, reason: str) -> bool:
+        _validate_nonblank(reason, "reason")
+        if len(reason) > MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH:
+            raise ValueError("reason is too long")
+        return self._finish_notification(
+            request_id,
+            token,
+            status=DurableActionNotificationStatus.DROPPED,
+        )
+
+    def _finish_notification(
+        self,
+        request_id: str,
+        token: str,
+        *,
+        status: DurableActionNotificationStatus,
+    ) -> bool:
+        with self._lock, self._transaction() as conn:
+            now = self._now()
+            return conn.execute(
+                """UPDATE durable_action_tickets
+                   SET notification_status = ?, notification_claim = NULL,
+                       notification_claimed_at = NULL,
+                       notification_completed_at = ?, updated_at = ?
+                   WHERE request_id = ? AND notification_status = ?
+                     AND notification_claim = ?""",
+                (
+                    status.value,
+                    now,
+                    now,
+                    request_id,
+                    DurableActionNotificationStatus.CLAIMED.value,
+                    token,
+                ),
+            ).rowcount == 1
+
+    def release_notification(self, request_id: str, token: str) -> bool:
+        with self._lock, self._transaction() as conn:
+            now = self._now()
+            return conn.execute(
+                """UPDATE durable_action_tickets
+                   SET notification_status = ?, notification_claim = NULL,
+                       notification_claimed_at = NULL, updated_at = ?
+                   WHERE request_id = ? AND notification_status = ?
+                     AND notification_claim = ?""",
+                (
+                    DurableActionNotificationStatus.PENDING.value,
+                    now,
+                    request_id,
+                    DurableActionNotificationStatus.CLAIMED.value,
+                    token,
+                ),
+            ).rowcount == 1
+
 
 __all__ = [
     "DurableActionCreateResult",
     "DurableActionClaim",
     "DurableActionNotificationStatus",
+    "DurableActionNotificationClaim",
     "DurableActionOutcome",
     "DurableActionExecutionContext",
     "DurableActionHandler",

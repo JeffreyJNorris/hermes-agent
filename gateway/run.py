@@ -3331,6 +3331,44 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         )
         return "\n".join(lines)
 
+    if evt_type == "durable_action_terminal":
+        status = str(evt.get("action_status") or "unknown")
+        decision = {
+            "declined": "rejected",
+            "expired": "expired",
+            "cancelled": "cancelled",
+            "abandoned": "abandoned",
+        }.get(status, "approved")
+        if status == "succeeded":
+            effect = "Action was applied."
+        elif status == "already_applied":
+            effect = "The action was already applied; it was not applied again."
+        elif status == "unknown":
+            effect = (
+                "The action result is ambiguous and must be inspected before any retry."
+            )
+        else:
+            effect = "No action was applied."
+        lines = [
+            "[IMPORTANT: A trusted durable action reached a terminal state.",
+            f"Request ID: {evt.get('request_id', 'unknown')}",
+            f"Action: {evt.get('action_type', 'unknown')}",
+            f"Decision: {decision}",
+            f"Action status: {status}",
+        ]
+        reason = str(evt.get("outcome_reason") or "").strip()
+        if reason:
+            lines.append(f"Reason: {reason}")
+        lines.extend(
+            [
+                "",
+                effect,
+                "The durable approval result remains persisted. Do not treat "
+                "the original selection as authorization for a different action.]",
+            ]
+        )
+        return "\n".join(lines)
+
     return None
 
 
@@ -6238,6 +6276,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._durable_request_bridges: Dict[str, Any] = {}
         self._durable_request_home = Path(get_hermes_home())
         self._durable_request_task: Optional[asyncio.Task] = None
+        self._durable_action_task: Optional[asyncio.Task] = None
 
         # Event-loop liveness heartbeat (#66892): rewritten every 30s while
         # the loop is dispatching. External supervisors use the file mtime /
@@ -10677,6 +10716,98 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             on_spawn=lambda task: setattr(self, "_durable_request_task", task),
         )
 
+    def _start_durable_action_worker(self) -> None:
+        """Start the profile-aware trusted-action runner."""
+        existing = getattr(self, "_durable_action_task", None)
+        if existing is not None and not existing.done():
+            return
+        self._durable_action_task = self._spawn_supervised(
+            self._run_durable_action_worker,
+            "durable_action_worker",
+            on_spawn=lambda task: setattr(self, "_durable_action_task", task),
+        )
+
+    async def _run_durable_action_worker(self) -> None:
+        from gateway.durable_action_runner import DurableActionRunner
+        from gateway.durable_actions import DurableActionStore
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        try:
+            while self._running and not self._shutdown_event.is_set():
+                profiles: list[tuple[str, Path, Dict[Platform, BasePlatformAdapter]]] = [
+                    (
+                        "primary",
+                        Path(getattr(self, "_durable_request_home", get_hermes_home())),
+                        dict(self.adapters),
+                    )
+                ]
+                if getattr(self.config, "multiplex_profiles", False):
+                    try:
+                        from hermes_cli.profiles import get_profile_dir
+
+                        profiles.extend(
+                            (name, Path(get_profile_dir(name)), dict(adapters))
+                            for name, adapters in list(
+                                getattr(self, "_profile_adapters", {}).items()
+                            )
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Could not enumerate durable-action profile scopes",
+                            exc_info=True,
+                        )
+
+                for profile_name, profile_home, adapters in profiles:
+                    token = set_hermes_home_override(profile_home)
+                    try:
+                        from hermes_cli.config import load_config_readonly
+
+                        raw = load_config_readonly().get("durable_approvals", {})
+                        enabled = isinstance(raw, dict) and raw.get("enabled") is True
+                        allowed = raw.get("allowed_actions", []) if isinstance(raw, dict) else []
+                        if not isinstance(allowed, list) or not all(
+                            isinstance(item, str) for item in allowed
+                        ):
+                            enabled, allowed = False, []
+
+                        async def _notify(
+                            claim,
+                            _profile=profile_name,
+                            _adapters=adapters,
+                        ):
+                            return await self._dispatch_durable_action_notification(
+                                claim,
+                                profile_name=_profile,
+                                adapters=_adapters,
+                            )
+
+                        action_runner = DurableActionRunner(
+                            DurableActionStore(profile_home / "state.db"),
+                            enabled=enabled,
+                            allowed_actions=allowed,
+                            notification_handler=_notify,
+                        )
+                        await action_runner.process_once()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "Durable action worker pass failed",
+                            extra={
+                                "profile": profile_name,
+                                "exception_class": type(exc).__name__,
+                            },
+                        )
+                    finally:
+                        reset_hermes_home_override(token)
+
+                try:
+                    await asyncio.wait_for(self._shutdown_event.wait(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            self._durable_action_task = None
+
     async def _run_durable_request_worker(self) -> None:
         from gateway.durable_request_bridge import DurableRequestBridge
         from hermes_constants import (
@@ -10903,6 +11034,123 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return DurableWakeDispatchResult(
             DurableWakeDisposition.RETRY,
             "origin_adapter_unavailable",
+        )
+
+    async def _dispatch_durable_action_notification(
+        self,
+        claim,
+        *,
+        profile_name: str,
+        adapters: Dict[Platform, BasePlatformAdapter],
+    ):
+        """Route one bounded trusted-action outcome to its verified origin."""
+        from gateway.durable_action_runner import (
+            DurableActionNotificationDisposition,
+            DurableActionNotificationResult,
+        )
+
+        if claim.origin_type == "cron":
+            try:
+                from cron.scheduler import enqueue_durable_action_continuation
+
+                outcome, reason = await asyncio.to_thread(
+                    enqueue_durable_action_continuation,
+                    job_id=claim.origin_id,
+                    request_id=claim.request_id,
+                    action_type=claim.action_type,
+                    action_status=claim.action_status.value,
+                    outcome_reason=claim.outcome_reason,
+                    adapters=adapters,
+                    loop=asyncio.get_running_loop(),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "Durable action cron notification failed",
+                    extra={
+                        "request_id": claim.request_id,
+                        "exception_class": type(exc).__name__,
+                    },
+                )
+                return DurableActionNotificationResult(
+                    DurableActionNotificationDisposition.RETRY,
+                    "cron_continuation_error",
+                )
+            return DurableActionNotificationResult(
+                {
+                    "accepted": DurableActionNotificationDisposition.DELIVERED,
+                    "dropped": DurableActionNotificationDisposition.DROPPED,
+                }.get(outcome, DurableActionNotificationDisposition.RETRY),
+                reason,
+            )
+
+        if claim.origin_type != "session":
+            return DurableActionNotificationResult(
+                DurableActionNotificationDisposition.DROPPED,
+                "unsupported_origin_type",
+            )
+        parent_session_id = str(claim.origin_session_id or "").strip()
+        if not parent_session_id:
+            return DurableActionNotificationResult(
+                DurableActionNotificationDisposition.DROPPED,
+                "origin_session_missing",
+            )
+        verdict = await self._classify_completion_target(parent_session_id)
+        if verdict == "terminal":
+            return DurableActionNotificationResult(
+                DurableActionNotificationDisposition.DROPPED,
+                "origin_session_ended",
+            )
+        if verdict == "retry":
+            return DurableActionNotificationResult(
+                DurableActionNotificationDisposition.RETRY,
+                "origin_session_unavailable",
+            )
+
+        event_profile = claim.origin_profile
+        if not event_profile and profile_name != "primary":
+            event_profile = profile_name
+        evt = {
+            "type": "durable_action_terminal",
+            "request_id": claim.request_id,
+            "action_type": claim.action_type,
+            "action_status": claim.action_status.value,
+            "outcome_reason": claim.outcome_reason or "",
+            "session_key": claim.origin_id,
+            "parent_session_id": parent_session_id,
+            "origin_session_id": parent_session_id,
+            "origin_ui_session_id": claim.origin_ui_session_id or "",
+            "profile": event_profile or "",
+            "message_id": f"durable-action:{claim.request_id}",
+        }
+        source = self._build_process_event_source(evt)
+        if source is None:
+            return DurableActionNotificationResult(
+                DurableActionNotificationDisposition.DROPPED,
+                "origin_route_missing",
+            )
+        if self._adapter_for_source(source) is None:
+            return DurableActionNotificationResult(
+                DurableActionNotificationDisposition.RETRY,
+                "origin_adapter_unavailable",
+            )
+        synth_text = _format_gateway_process_notification(evt)
+        if not synth_text:
+            return DurableActionNotificationResult(
+                DurableActionNotificationDisposition.DROPPED,
+                "notification_format_failed",
+            )
+        delivered = await self._inject_watch_notification(synth_text, evt)
+        if delivered is True:
+            return DurableActionNotificationResult(
+                DurableActionNotificationDisposition.DELIVERED
+            )
+        return DurableActionNotificationResult(
+            DurableActionNotificationDisposition.RETRY,
+            "origin_delivery_failed"
+            if delivered is False
+            else "origin_adapter_unavailable",
         )
 
     async def start(self) -> bool:
@@ -11595,6 +11843,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._running = True
         self._update_runtime_status("running")
         self._start_durable_request_worker()
+        self._start_durable_action_worker()
 
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
         # stops refreshing ``state/gateway.heartbeat``. Cancelled with the
