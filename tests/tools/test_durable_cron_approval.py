@@ -113,6 +113,11 @@ def test_disabled_policy_preserves_immediate_model_resume(
         "durable_approvals: malformed\n",
         "durable_approvals:\n  enabled: \"false\"\n  allowed_actions: []\n",
         "durable_approvals:\n  enabled: 0\n  allowed_actions: []\n",
+        (
+            "durable_approvals:\n"
+            "  enabled: true\n"
+            "  allowed_actions: [cron.resume, 1]\n"
+        ),
     ],
 )
 def test_malformed_policy_fails_closed_without_resuming(
@@ -128,6 +133,7 @@ def test_malformed_policy_fails_closed_without_resuming(
 
     assert result == {"error": "durable approvals configuration is invalid"}
     assert jobs.get_job(job["id"])["enabled"] is False
+    assert not (durable_cron_home / "state.db").exists()
 
 
 def test_allowlisted_model_resume_creates_redacted_approval(

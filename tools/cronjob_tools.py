@@ -1239,7 +1239,11 @@ def _model_cronjob(args: Dict[str, Any], *, task_id: Optional[str] = None) -> st
                     task_id=task_id,
                 )
             allowed = policy.get("allowed_actions")
-            if not isinstance(allowed, list) or "cron.resume" not in allowed:
+            if not isinstance(allowed, list) or any(
+                not isinstance(action, str) for action in allowed
+            ):
+                return tool_error("durable approvals configuration is invalid")
+            if "cron.resume" not in allowed:
                 return tool_error("cron.resume durable approval is not allowlisted")
 
             request_config = load_durable_requests_config()
