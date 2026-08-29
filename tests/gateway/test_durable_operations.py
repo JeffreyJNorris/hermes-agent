@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from gateway.durable_actions import PreparedDurableAction
+from gateway.durable_actions import DurableActionStatus, DurableActionStore, PreparedDurableAction
 from gateway.durable_operations import DurableOperationsStore
 from gateway.durable_requests import (
     DurableRequestOption,
@@ -200,3 +200,137 @@ def test_phase4_rows_without_action_tickets_remain_inspectable(tmp_path: Path) -
     assert request is not None
     assert request.action_status is None
     assert store.get_action("drq_older", now=500.0) is None
+
+
+def _set_action_state(
+    tmp_path: Path,
+    status: str,
+    *,
+    request_status: str = "selected",
+    execution_claim: str | None = None,
+) -> tuple[DurableOperationsStore, DurableActionStore]:
+    ops = seeded_operations_store(tmp_path)
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        db.execute(
+            "UPDATE durable_requests SET status = ?, resolved_at = 250 "
+            "WHERE request_id = 'drq_action'",
+            (request_status,),
+        )
+        db.execute(
+            "UPDATE durable_action_tickets SET status = ?, execution_claim = ?, "
+            "execution_claimed_at = CASE WHEN ? IS NULL THEN NULL ELSE 250 END "
+            "WHERE request_id = 'drq_action'",
+            (status, execution_claim, execution_claim),
+        )
+    return ops, DurableActionStore(tmp_path / "state.db", wall_clock=lambda: 500.0)
+
+
+def test_cancel_open_generic_request(tmp_path: Path) -> None:
+    ops = seeded_operations_store(tmp_path)
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        db.execute(
+            "UPDATE durable_requests SET status = 'open' WHERE request_id = 'drq_newer'"
+        )
+
+    result = ops.cancel_request("drq_newer", now=500.0)
+    detail = ops.get_request("drq_newer", now=500.0)
+
+    assert result.code == "cancelled"
+    assert result.request_status == "cancelled"
+    assert result.action_status is None
+    assert detail is not None
+    assert detail.status == "cancelled"
+    assert detail.resolved_at == 500.0
+
+
+def test_cancel_waiting_action_updates_request_and_ticket_atomically(tmp_path: Path) -> None:
+    ops = seeded_operations_store(tmp_path)
+
+    result = ops.cancel_action("drq_action", now=500.0)
+    request = ops.get_request("drq_action", now=500.0)
+    action = ops.get_action("drq_action", now=500.0)
+
+    assert result.code == "cancelled"
+    assert request is not None and request.status == "cancelled"
+    assert action is not None and action.status == "cancelled"
+    assert action.notification_status == "pending"
+
+
+def test_cancel_ready_action_is_never_runnable(tmp_path: Path) -> None:
+    ops, runner = _set_action_state(tmp_path, "ready")
+
+    result = ops.cancel_action("drq_action", now=500.0)
+
+    assert result.code == "cancelled"
+    assert runner.claim_next() is None
+    action = ops.get_action("drq_action", now=500.0)
+    assert action is not None
+    assert action.notification_status == "pending"
+
+
+def test_cancel_ready_action_loses_to_runner_claim(tmp_path: Path) -> None:
+    ops, runner = _set_action_state(tmp_path, "ready")
+    claim = runner.claim_next()
+
+    result = ops.cancel_action("drq_action", now=500.0)
+
+    assert claim is not None
+    assert result.code == "execution_in_progress"
+    assert ops.get_action("drq_action").status == DurableActionStatus.CLAIMED.value  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("status", ["claimed", "executing"])
+def test_cancel_in_progress_action_is_rejected(tmp_path: Path, status: str) -> None:
+    ops, _ = _set_action_state(tmp_path, status, execution_claim="claim-secret")
+
+    result = ops.cancel_action("drq_action", now=500.0)
+
+    assert result.code == "execution_in_progress"
+    assert result.ok is False
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "succeeded",
+        "already_applied",
+        "declined",
+        "expired",
+        "cancelled",
+        "abandoned",
+        "invalidated",
+        "failed",
+        "unknown",
+        "handler_unavailable",
+    ],
+)
+def test_cancel_terminal_action_is_rejected(tmp_path: Path, status: str) -> None:
+    ops, _ = _set_action_state(tmp_path, status)
+
+    result = ops.cancel_action("drq_action", now=500.0)
+
+    assert result.code == "already_terminal"
+    assert result.action_status == status
+
+
+def test_cancel_unknown_receipt_is_not_found(tmp_path: Path) -> None:
+    result = seeded_operations_store(tmp_path).cancel_request("drq_missing")
+
+    assert result.code == "not_found"
+    assert result.ok is False
+
+
+def test_cancel_rolls_back_request_if_action_compare_and_set_fails(tmp_path: Path) -> None:
+    ops = seeded_operations_store(tmp_path)
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        db.execute(
+            """CREATE TRIGGER reject_action_cancel
+               BEFORE UPDATE OF status ON durable_action_tickets
+               WHEN NEW.status = 'cancelled'
+               BEGIN SELECT RAISE(ABORT, 'test conflict'); END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        ops.cancel_action("drq_action", now=500.0)
+
+    assert ops.get_request("drq_action").status == "pending_delivery"  # type: ignore[union-attr]

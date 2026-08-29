@@ -85,6 +85,15 @@ class OperatorPage(Generic[T]):
     next_offset: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class DurableOperatorResult:
+    ok: bool
+    code: str
+    request_id: str
+    request_status: str | None = None
+    action_status: str | None = None
+
+
 def _optional_float(value: object) -> float | None:
     return None if value is None else float(value)
 
@@ -136,6 +145,19 @@ class DurableOperationsStore:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA query_only = ON")
             conn.execute("PRAGMA busy_timeout = 10000")
+            return conn
+        except Exception:
+            conn.close()
+            raise
+
+    def _write_connection(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._db_path, timeout=10.0)
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout = 10000")
+            from hermes_state import apply_wal_with_fallback
+
+            apply_wal_with_fallback(conn, db_label="state.db (durable_operations)")
             return conn
         except Exception:
             conn.close()
@@ -314,6 +336,194 @@ class DurableOperationsStore:
             delivery_state=_delivery_state(row),
         )
 
+    def cancel_request(
+        self,
+        request_id: str,
+        *,
+        now: float | None = None,
+    ) -> DurableOperatorResult:
+        current_time = self._now(now)
+        with closing(self._write_connection()) as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    """SELECT request.status AS request_status,
+                              ticket.status AS action_status,
+                              ticket.execution_claim
+                       FROM durable_requests AS request
+                       LEFT JOIN durable_action_tickets AS ticket
+                         ON ticket.request_id = request.request_id
+                       WHERE request.request_id = ?""",
+                    (request_id,),
+                ).fetchone()
+                if row is None:
+                    conn.commit()
+                    return DurableOperatorResult(False, "not_found", request_id)
+                if row["action_status"] is not None:
+                    result = self._cancel_action_locked(
+                        conn, request_id, row, current_time
+                    )
+                else:
+                    result = self._cancel_generic_request_locked(
+                        conn, request_id, row["request_status"], current_time
+                    )
+                conn.commit()
+                return result
+            except Exception:
+                conn.rollback()
+                raise
+
+    def cancel_action(
+        self,
+        request_id: str,
+        *,
+        now: float | None = None,
+    ) -> DurableOperatorResult:
+        current_time = self._now(now)
+        with closing(self._write_connection()) as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    """SELECT request.status AS request_status, ticket.status AS action_status,
+                              ticket.execution_claim
+                       FROM durable_action_tickets AS ticket
+                       JOIN durable_requests AS request
+                         ON request.request_id = ticket.request_id
+                       WHERE ticket.request_id = ?""",
+                    (request_id,),
+                ).fetchone()
+                if row is None:
+                    conn.commit()
+                    return DurableOperatorResult(False, "not_found", request_id)
+                result = self._cancel_action_locked(conn, request_id, row, current_time)
+                conn.commit()
+                return result
+            except Exception:
+                conn.rollback()
+                raise
+
+    @staticmethod
+    def _cancel_generic_request_locked(
+        conn: sqlite3.Connection,
+        request_id: str,
+        request_status: str,
+        now: float,
+    ) -> DurableOperatorResult:
+        active = (
+            DurableRequestStatus.PENDING_DELIVERY.value,
+            DurableRequestStatus.OPEN.value,
+        )
+        if request_status not in active:
+            return DurableOperatorResult(
+                False,
+                "already_terminal",
+                request_id,
+                request_status=request_status,
+            )
+        changed = conn.execute(
+            """UPDATE durable_requests
+               SET status = 'cancelled', terminal_reason = 'cancelled_by_operator',
+                   updated_at = ?, resolved_at = ?, delivery_claim = NULL,
+                   delivery_claimed_at = NULL,
+                   wake_status = CASE
+                       WHEN wake_requested = 1 AND wake_status = 'not_requested'
+                           THEN 'pending'
+                       ELSE wake_status
+                   END,
+                   wake_claim = NULL, wake_claimed_at = NULL, wake_reason = NULL
+               WHERE request_id = ? AND status IN (?, ?)""",
+            (now, now, request_id, *active),
+        ).rowcount
+        if changed != 1:
+            return DurableOperatorResult(
+                False,
+                "concurrent_update",
+                request_id,
+                request_status=request_status,
+            )
+        return DurableOperatorResult(
+            True,
+            "cancelled",
+            request_id,
+            request_status=DurableRequestStatus.CANCELLED.value,
+        )
+
+    def _cancel_action_locked(
+        self,
+        conn: sqlite3.Connection,
+        request_id: str,
+        row: sqlite3.Row,
+        now: float,
+    ) -> DurableOperatorResult:
+        request_status = row["request_status"]
+        action_status = row["action_status"]
+        if action_status in {
+            DurableActionStatus.CLAIMED.value,
+            DurableActionStatus.EXECUTING.value,
+        } or (
+            action_status == DurableActionStatus.READY.value
+            and row["execution_claim"] is not None
+        ):
+            return DurableOperatorResult(
+                False,
+                "execution_in_progress",
+                request_id,
+                request_status=request_status,
+                action_status=action_status,
+            )
+        if action_status not in {
+            DurableActionStatus.WAITING_FOR_DECISION.value,
+            DurableActionStatus.READY.value,
+        }:
+            return DurableOperatorResult(
+                False,
+                "already_terminal",
+                request_id,
+                request_status=request_status,
+                action_status=action_status,
+            )
+        changed = conn.execute(
+            """UPDATE durable_action_tickets
+               SET status = 'cancelled', execution_claim = NULL,
+                   execution_claimed_at = NULL,
+                   outcome_reason = 'cancelled_by_operator', outcome_json = NULL,
+                   completed_at = ?, notification_status = 'pending',
+                   notification_claim = NULL, notification_claimed_at = NULL,
+                   notification_reason = NULL, updated_at = ?
+               WHERE request_id = ? AND status = ? AND execution_claim IS NULL""",
+            (now, now, request_id, action_status),
+        ).rowcount
+        if changed != 1:
+            conn.rollback()
+            return DurableOperatorResult(
+                False,
+                "concurrent_update",
+                request_id,
+                request_status=request_status,
+                action_status=action_status,
+            )
+        if action_status == DurableActionStatus.WAITING_FOR_DECISION.value:
+            request_result = self._cancel_generic_request_locked(
+                conn, request_id, request_status, now
+            )
+            if not request_result.ok:
+                conn.rollback()
+                return DurableOperatorResult(
+                    False,
+                    "concurrent_update",
+                    request_id,
+                    request_status=request_status,
+                    action_status=action_status,
+                )
+            request_status = DurableRequestStatus.CANCELLED.value
+        return DurableOperatorResult(
+            True,
+            "cancelled",
+            request_id,
+            request_status=request_status,
+            action_status=DurableActionStatus.CANCELLED.value,
+        )
+
     @staticmethod
     def _request_summary(row: sqlite3.Row, now: float) -> DurableRequestSummary:
         status = row["request_status"]
@@ -374,6 +584,7 @@ __all__ = [
     "DurableActionDetail",
     "DurableActionSummary",
     "DurableOperationsStore",
+    "DurableOperatorResult",
     "DurableRequestDetail",
     "DurableRequestSummary",
     "OperatorPage",
