@@ -318,3 +318,24 @@ def test_pruning_keeps_unreconciled_unknown_and_removes_linked_evidence_together
             "SELECT count(*) FROM durable_action_reconciliations WHERE request_id = ?",
             (request_id,),
         ).fetchone()[0] == 0
+
+
+def test_terminal_cap_cannot_prune_reconciled_unknown_before_retention(
+    tmp_path: Path,
+) -> None:
+    db_path, request_id, _ = _unknown_db(tmp_path)
+    DurableOperationsStore(db_path).reconcile_action(
+        request_id, outcome="abandoned", operator_identity="operator", now=200.0
+    )
+    young = DurableRequestStore(
+        db_path, wall_clock=lambda: 500.0, max_terminal=0
+    )
+
+    assert young.prune_terminal(1_000.0) == 0
+    assert DurableOperationsStore(db_path).get_action(request_id) is not None
+
+    old = DurableRequestStore(
+        db_path, wall_clock=lambda: 10_000.0, max_terminal=0
+    )
+    assert old.prune_terminal(1_000.0) >= 1
+    assert DurableOperationsStore(db_path).get_action(request_id) is None

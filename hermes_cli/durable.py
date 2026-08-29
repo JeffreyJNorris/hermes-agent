@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import getpass
+import json
 import sqlite3
 import sys
 from dataclasses import asdict
@@ -203,7 +203,10 @@ def durable_command(args) -> int:
                     )
                     return EXIT_INVALID
                 print_header(f"Reconcile durable action {args.request_id}")
-                print_info(f"status: {detail.status}; outcome: {args.outcome}")
+                preview = f"status: {detail.status}; outcome: {args.outcome}"
+                if args.superseded_by:
+                    preview += f"; superseded by: {args.superseded_by}"
+                print_info(preview)
                 if not prompt_yes_no("Record this immutable conclusion?", default=False):
                     print_warning("Confirmation required; no changes made.")
                     return EXIT_INVALID

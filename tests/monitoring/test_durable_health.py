@@ -38,8 +38,8 @@ def _create(store: DurableRequestStore, reference: str, *, action=False):
                 action_type="cron.resume",
                 action_version=1,
                 payload_json='{"canary":"PHASE4D-CANARY"}',
-                fingerprint="fingerprint-secret",
-                idempotency_key="idempotency-secret",
+                fingerprint=f"fingerprint-secret-{reference}",
+                idempotency_key=f"idempotency-secret-{reference}",
             ),
             origin_session_id="session-secret",
             **kwargs,
@@ -125,6 +125,44 @@ def test_snapshot_contains_no_high_cardinality_or_content_labels(tmp_path: Path)
         "idempotency-",
     ):
         assert canary not in rendered
+
+
+def test_snapshot_normalizes_malformed_enum_labels(tmp_path: Path) -> None:
+    db_path = seeded_db(tmp_path)
+    store = DurableRequestStore(db_path, wall_clock=lambda: 100.0)
+    second = _create(store, "second-malformed", action=True).request.request_id
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "UPDATE durable_requests SET status = 'selected', resolved_at = 200 "
+            "WHERE request_id = ?",
+            (second,),
+        )
+        db.execute(
+            "UPDATE durable_action_tickets SET status = 'unknown', completed_at = 250 "
+            "WHERE request_id = ?",
+            (second,),
+        )
+    DurableOperationsStore(db_path).reconcile_action(
+        second, outcome="abandoned", operator_identity="operator", now=300.0
+    )
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "UPDATE durable_action_tickets SET notification_status = "
+            "'PHASE4D-CANARY-notification-' || request_id"
+        )
+        db.execute(
+            "UPDATE durable_action_reconciliations SET outcome = "
+            "'PHASE4D-CANARY-outcome-' || request_id"
+        )
+
+    snapshot = build_durable_health_snapshot(db_path=db_path, now=500.0)
+
+    assert _values(snapshot, "hermes_durable_notifications") == [
+        (2, {"origin_type": "session", "status": "unknown"})
+    ]
+    assert _values(snapshot, "hermes_durable_reconciliations") == [
+        (2, {"action_type": "cron.resume", "outcome": "unknown"})
+    ]
 
 
 def test_snapshot_uses_read_only_query_only_connection(tmp_path: Path, monkeypatch) -> None:

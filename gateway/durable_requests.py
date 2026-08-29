@@ -2072,6 +2072,7 @@ class DurableRequestStore:
                       (ticket.status IN ({action_placeholders}) AND ticket.status != 'unknown')
                       OR (
                           ticket.status = 'unknown'
+                          AND ticket.completed_at <= ?
                           AND EXISTS (
                           SELECT 1 FROM durable_action_reconciliations AS reconciliation
                           WHERE reconciliation.request_id = ticket.request_id
@@ -2095,6 +2096,7 @@ class DurableRequestStore:
         )"""
         action_params = (
             *_TERMINAL_ACTION_STATUSES,
+            cutoff,
             DurableActionNotificationStatus.DELIVERED.value,
             DurableActionNotificationStatus.DROPPED.value,
         )

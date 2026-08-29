@@ -16,6 +16,7 @@ from typing import Generic, TypeVar
 from gateway.durable_actions import (
     DurableActionDiagnostic,
     DurableActionExecutionContext,
+    DurableActionNotificationStatus,
     DurableActionStatus,
     lookup_durable_action_diagnostic,
     lookup_durable_action_handler,
@@ -37,6 +38,18 @@ _ACTIONABLE_STATUSES = frozenset(
         DurableActionStatus.UNKNOWN.value,
     }
 )
+_NOTIFICATION_STATUSES = frozenset(
+    status.value for status in DurableActionNotificationStatus
+)
+_ACTION_AGE_SQL = """CASE
+    WHEN ticket.status IN ('claimed','executing')
+        THEN COALESCE(ticket.execution_claimed_at, ticket.updated_at, ticket.created_at)
+    WHEN ticket.status = 'ready'
+        THEN COALESCE(ticket.updated_at, ticket.created_at)
+    WHEN ticket.status = 'unknown' OR ticket.notification_status IN ('pending','claimed')
+        THEN COALESCE(ticket.completed_at, ticket.updated_at, ticket.created_at)
+    ELSE ticket.created_at
+END"""
 
 
 class DurableActionReconciliationOutcome(str, Enum):
@@ -44,6 +57,11 @@ class DurableActionReconciliationOutcome(str, Enum):
     CONFIRMED_NOT_APPLIED = "confirmed_not_applied"
     ABANDONED = "abandoned"
     SUPERSEDED = "superseded"
+
+
+_RECONCILIATION_OUTCOMES = frozenset(
+    outcome.value for outcome in DurableActionReconciliationOutcome
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,14 +346,15 @@ class DurableOperationsStore:
             where.append("ticket.action_type = ?")
             params.append(action_type)
         if minimum_age_seconds is not None:
-            where.append("ticket.created_at <= ?")
+            where.append(f"{_ACTION_AGE_SQL} <= ?")
             params.append(current_time - minimum_age_seconds)
         predicate = f"WHERE {' AND '.join(where)}" if where else ""
         with closing(self._read_connection()) as conn:
             rows = conn.execute(
                 f"""SELECT ticket.request_id, ticket.action_type,
                            ticket.action_version, ticket.status,
-                           ticket.created_at, ticket.execution_claimed_at,
+                           ticket.created_at, ticket.updated_at,
+                           ticket.execution_claimed_at,
                            ticket.completed_at, ticket.notification_status,
                            reconciliation.outcome AS effective_reconciliation
                     FROM durable_action_tickets AS ticket
@@ -364,7 +383,8 @@ class DurableOperationsStore:
             row = conn.execute(
                 """SELECT ticket.request_id, ticket.action_type,
                           ticket.action_version, ticket.status,
-                          ticket.created_at, ticket.execution_claimed_at,
+                          ticket.created_at, ticket.updated_at,
+                          ticket.execution_claimed_at,
                           ticket.execution_started_at, ticket.completed_at,
                           ticket.notification_status, ticket.outcome_reason,
                           ticket.notification_reason,
@@ -586,20 +606,28 @@ class DurableOperationsStore:
         )
 
         current_time = self._now(now)
-        metrics: list[DurableHealthDatum] = []
+        metrics: dict[
+            tuple[str, tuple[tuple[str, str], ...]], DurableHealthDatum
+        ] = {}
 
         def add(name: str, value: object, **attributes: object) -> None:
-            metrics.append(
-                DurableHealthDatum(
-                    name,
-                    int(value) if name != "hermes_durable_oldest_backlog_seconds" else float(value),
-                    tuple(
-                        sorted(
-                            (key, self._bounded_health_label(item))
-                            for key, item in attributes.items()
-                        )
-                    ),
+            labels = tuple(
+                sorted(
+                    (key, self._bounded_health_label(item))
+                    for key, item in attributes.items()
                 )
+            )
+            key = (name, labels)
+            number = (
+                float(value)
+                if name == "hermes_durable_oldest_backlog_seconds"
+                else int(value)
+            )
+            previous = metrics.get(key)
+            metrics[key] = DurableHealthDatum(
+                name,
+                number + (previous.value if previous is not None else 0),
+                labels,
             )
 
         with closing(self._read_connection()) as conn:
@@ -636,7 +664,11 @@ class DurableOperationsStore:
                 add(
                     "hermes_durable_notifications",
                     row["count"],
-                    status=row["status"],
+                    status=(
+                        row["status"]
+                        if row["status"] in _NOTIFICATION_STATUSES
+                        else "unknown"
+                    ),
                     origin_type=row["origin_type"],
                 )
             stale_queries = (
@@ -702,7 +734,11 @@ class DurableOperationsStore:
                     "hermes_durable_reconciliations",
                     row["count"],
                     action_type=row["action_type"],
-                    outcome=row["outcome"],
+                    outcome=(
+                        row["outcome"]
+                        if row["outcome"] in _RECONCILIATION_OUTCOMES
+                        else "unknown"
+                    ),
                 )
             backlog_queries = (
                 (
@@ -740,7 +776,7 @@ class DurableOperationsStore:
                         _age(current_time, timestamp),
                         queue_type=queue_type,
                     )
-        return tuple(metrics)
+        return tuple(metrics.values())
 
     def check_health(
         self,
@@ -752,8 +788,12 @@ class DurableOperationsStore:
         action_worker_alive: bool | None = None,
         now: float | None = None,
     ) -> DurableHealthResult:
-        if not self._db_path.exists():
-            return DurableHealthResult("ok", "not_initialized", ())
+        from gateway.durable_action_runner import DEFAULT_STALE_CLAIM_SECONDS
+        from gateway.durable_requests import (
+            DELIVERY_CLAIM_STALE_SECONDS,
+            WAKE_CLAIM_STALE_SECONDS,
+        )
+
         if (
             not isinstance(allowed_actions, (list, tuple))
             or any(type(item) is not str for item in allowed_actions)
@@ -763,8 +803,42 @@ class DurableOperationsStore:
         else:
             allowed = tuple(allowed_actions)
             invalid_allowlist = len(set(allowed)) != len(allowed)
+        missing_workers = int(
+            requests_enabled and request_worker_alive is not True
+        ) + int(actions_enabled and action_worker_alive is not True)
+        worker_unknown = (
+            requests_enabled and request_worker_alive is None
+        ) or (actions_enabled and action_worker_alive is None)
+        configured_handlers = {(action_type, 1) for action_type in allowed}
+        configured_missing_handlers = sum(
+            lookup_durable_action_handler(*key) is None
+            for key in configured_handlers
+        )
+
+        def uninitialized_result() -> DurableHealthResult:
+            counts = {}
+            if configured_missing_handlers:
+                counts["missing_handlers"] = configured_missing_handlers
+            if invalid_allowlist:
+                counts["invalid_allowlist"] = 1
+            if missing_workers:
+                counts["workers"] = missing_workers
+            if invalid_allowlist or configured_missing_handlers:
+                code = "invalid_allowlist"
+            elif missing_workers:
+                code = (
+                    "worker_confirmation_unavailable"
+                    if worker_unknown
+                    else "worker_unavailable"
+                )
+            else:
+                return DurableHealthResult("ok", "not_initialized", ())
+            return DurableHealthResult("warning", code, tuple(sorted(counts.items())))
+
+        if not self._db_path.exists():
+            return uninitialized_result()
         current_time = self._now(now)
-        cutoff = current_time - 300.0
+        backlog_cutoff = current_time - 300.0
         counts: dict[str, int] = {}
         try:
             with closing(self._read_connection()) as conn:
@@ -780,45 +854,46 @@ class DurableOperationsStore:
                     "durable_action_reconciliations",
                 }
                 if not (tables & durable_tables):
-                    return DurableHealthResult("ok", "not_initialized", ())
+                    return uninitialized_result()
                 if not durable_tables <= tables:
                     return DurableHealthResult("critical", "impossible_state", ())
                 queries = {
                     "pending_requests": (
                         "SELECT COUNT(*) FROM durable_requests "
                         "WHERE status = 'pending_delivery' AND created_at <= ?",
-                        (cutoff,),
+                        (backlog_cutoff,),
                     ),
                     "ready_actions": (
                         "SELECT COUNT(*) FROM durable_action_tickets "
                         "WHERE status = 'ready' AND updated_at <= ?",
-                        (cutoff,),
+                        (backlog_cutoff,),
                     ),
                     "pending_notifications": (
                         "SELECT COUNT(*) FROM durable_action_tickets "
                         "WHERE notification_status = 'pending' "
                         "AND COALESCE(completed_at, updated_at) <= ?",
-                        (cutoff,),
+                        (backlog_cutoff,),
                     ),
                     "stale_delivery_claims": (
                         "SELECT COUNT(*) FROM durable_requests "
                         "WHERE status = 'pending_delivery' AND delivery_claimed_at <= ?",
-                        (cutoff,),
+                        (current_time - DELIVERY_CLAIM_STALE_SECONDS,),
                     ),
                     "stale_wake_claims": (
                         "SELECT COUNT(*) FROM durable_requests "
                         "WHERE wake_status = 'claimed' AND wake_claimed_at <= ?",
-                        (cutoff,),
+                        (current_time - WAKE_CLAIM_STALE_SECONDS,),
                     ),
                     "stale_action_claims": (
                         "SELECT COUNT(*) FROM durable_action_tickets "
-                        "WHERE status = 'claimed' AND execution_claimed_at <= ?",
-                        (cutoff,),
+                        "WHERE status IN ('claimed','executing') "
+                        "AND execution_claimed_at <= ?",
+                        (current_time - DEFAULT_STALE_CLAIM_SECONDS,),
                     ),
                     "stale_notification_claims": (
                         "SELECT COUNT(*) FROM durable_action_tickets "
                         "WHERE notification_status = 'claimed' AND notification_claimed_at <= ?",
-                        (cutoff,),
+                        (current_time - DEFAULT_STALE_CLAIM_SECONDS,),
                     ),
                     "unreconciled_unknown": (
                         "SELECT COUNT(*) FROM durable_action_tickets AS ticket "
@@ -855,22 +930,17 @@ class DurableOperationsStore:
                 "critical", "unreconciled_unknown", tuple(sorted(counts.items()))
             )
 
-        missing_handlers = sum(
-            1
+        handler_keys = configured_handlers | {
+            (row["action_type"], int(row["action_version"]))
             for row in actionable_handlers
-            if lookup_durable_action_handler(row["action_type"], int(row["action_version"]))
-            is None
-        )
-        missing_handlers += sum(
-            1 for action_type in allowed if lookup_durable_action_handler(action_type, 1) is None
+        }
+        missing_handlers = sum(
+            lookup_durable_action_handler(*key) is None for key in handler_keys
         )
         if missing_handlers:
             counts["missing_handlers"] = missing_handlers
         if invalid_allowlist:
             counts["invalid_allowlist"] = 1
-        missing_workers = int(
-            requests_enabled and request_worker_alive is not True
-        ) + int(actions_enabled and action_worker_alive is not True)
         if missing_workers:
             counts["workers"] = missing_workers
 
@@ -888,9 +958,6 @@ class DurableOperationsStore:
         elif invalid_allowlist or missing_handlers:
             code = "invalid_allowlist"
         elif missing_workers:
-            worker_unknown = (
-                requests_enabled and request_worker_alive is None
-            ) or (actions_enabled and action_worker_alive is None)
             code = (
                 "worker_confirmation_unavailable"
                 if worker_unknown
@@ -1113,6 +1180,14 @@ class DurableOperationsStore:
             "pending",
             "claimed",
         }
+        if status in {"claimed", "executing"}:
+            actionable_since = row["execution_claimed_at"] or row["updated_at"]
+        elif status == "ready":
+            actionable_since = row["updated_at"]
+        elif status == "unknown" or notification_status in {"pending", "claimed"}:
+            actionable_since = row["completed_at"] or row["updated_at"]
+        else:
+            actionable_since = row["created_at"]
         return DurableActionSummary(
             request_id=row["request_id"],
             action_type=row["action_type"],
@@ -1124,12 +1199,7 @@ class DurableOperationsStore:
             notification_status=notification_status,
             effective_reconciliation=row["effective_reconciliation"],
             actionable_age_seconds=(
-                _age(
-                    now,
-                    row["execution_claimed_at"]
-                    or row["completed_at"]
-                    or row["created_at"],
-                )
+                _age(now, actionable_since)
                 if actionable
                 else None
             ),

@@ -203,6 +203,58 @@ def test_action_list_filters_status_type_and_minimum_age(tmp_path: Path) -> None
     assert too_old.items == ()
 
 
+def test_ready_action_age_starts_at_ready_transition(tmp_path: Path) -> None:
+    store = seeded_operations_store(tmp_path)
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        db.execute(
+            "UPDATE durable_action_tickets SET status = 'ready', updated_at = 490 "
+            "WHERE request_id = 'drq_action'"
+        )
+
+    page = store.list_actions(
+        status="ready", minimum_age_seconds=20, now=500.0
+    )
+    detail = store.get_action("drq_action", now=500.0)
+
+    assert page.items == ()
+    assert detail is not None and detail.actionable_age_seconds == 10.0
+
+
+def test_health_warns_for_stale_executing_claim(tmp_path: Path) -> None:
+    store = seeded_operations_store(tmp_path)
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        db.execute(
+            "UPDATE durable_action_tickets SET status = 'executing', "
+            "execution_claim = 'claim', execution_claimed_at = 100 "
+            "WHERE request_id = 'drq_action'"
+        )
+
+    health = store.check_health(
+        actions_enabled=True, action_worker_alive=True, now=500.0
+    )
+
+    assert health.severity == "warning"
+    assert dict(health.counts)["stale_action_claims"] == 1
+
+
+@pytest.mark.parametrize("existing_database", [False, True])
+def test_health_checks_enabled_worker_before_ledger_initialization(
+    tmp_path: Path,
+    existing_database: bool,
+) -> None:
+    db_path = tmp_path / "state.db"
+    if existing_database:
+        with sqlite3.connect(db_path) as db:
+            db.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+    health = DurableOperationsStore(db_path, reconcile_schema=False).check_health(
+        requests_enabled=True, request_worker_alive=False
+    )
+
+    assert health.severity == "warning"
+    assert health.code == "worker_unavailable"
+    assert health.counts == (("workers", 1),)
+
+
 def test_list_filters_reject_status_injection_and_treat_wildcards_literally(
     tmp_path: Path,
 ) -> None:

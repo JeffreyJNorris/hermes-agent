@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from gateway.durable_actions import PreparedDurableAction
+from gateway.durable_operations import DurableOperationsStore
 from gateway.durable_requests import (
     DurableRequestOption,
     DurableRequestSpec,
@@ -256,6 +257,36 @@ def test_json_reconcile_requires_yes_without_prompt(
     assert json.loads(capsys.readouterr().out)["code"] == "confirmation_required"
 
 
+def test_human_superseded_confirmation_names_successor(monkeypatch, capsys) -> None:
+    class FakeStore:
+        def __init__(self, _path) -> None:
+            pass
+
+        def get_action(self, _request_id):
+            return type("Detail", (), {"status": "unknown"})()
+
+    monkeypatch.setattr("hermes_cli.durable.DurableOperationsStore", FakeStore)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(
+        "hermes_cli.durable.prompt_yes_no", lambda *_args, **_kwargs: False
+    )
+    args = _parser().parse_args(
+        [
+            "durable",
+            "actions",
+            "reconcile",
+            "drq_old",
+            "--outcome",
+            "superseded",
+            "--superseded-by",
+            "drq_new",
+        ]
+    )
+
+    assert durable_command(args) == EXIT_INVALID
+    assert "drq_new" in capsys.readouterr().out
+
+
 def test_json_reconcile_records_local_identity_without_handler(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
@@ -323,6 +354,31 @@ def test_json_list_reports_corrupt_database_by_exception_class_only(
     output = capsys.readouterr().out
     payload = json.loads(output)
     assert payload == {"code": "database_unavailable", "error": "DatabaseError"}
+    assert "PHASE4D-CANARY" not in output
+
+
+def test_json_mutation_reports_locked_database_by_exception_class_only(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    request_id = _seed_home(tmp_path)
+    monkeypatch.setattr("hermes_cli.durable.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        DurableOperationsStore,
+        "_write_connection",
+        lambda _self: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database is locked PHASE4D-CANARY")
+        ),
+    )
+    args = _parser().parse_args(
+        ["durable", "requests", "cancel", request_id, "--yes", "--json"]
+    )
+
+    assert durable_command(args) == 5
+    output = capsys.readouterr().out
+    assert json.loads(output) == {
+        "code": "database_unavailable",
+        "error": "OperationalError",
+    }
     assert "PHASE4D-CANARY" not in output
 
 
