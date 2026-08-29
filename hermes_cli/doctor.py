@@ -226,6 +226,28 @@ def _fail_and_issue(text: str, detail: str, fix: str, issues: list[str]) -> None
     issues.append(fix)
 
 
+def _check_durable_operations(issues: list[str]) -> None:
+    """Render the shared read-only durable health result."""
+    _section("Durable operations")
+    try:
+        from hermes_cli.durable import durable_health_result
+
+        result = durable_health_result()
+    except Exception as exc:
+        check_fail("Durable health unavailable", f"({type(exc).__name__})")
+        issues.append("Inspect durable operations: hermes durable doctor")
+        return
+    detail = result.code.replace("_", " ")
+    if result.severity == "ok":
+        check_ok("Durable operations healthy", f"({detail})")
+        return
+    if result.severity == "warning":
+        check_warn("Durable operations degraded", f"({detail})")
+    else:
+        check_fail("Durable operations unhealthy", f"({detail})")
+    issues.append("Inspect durable operations: hermes durable doctor")
+
+
 # Deprecated / legacy config keys still read for back-compat. Doctor surfaces
 # them as non-failing warnings with the modern replacement — it does not
 # auto-migrate or delete (migrations live in config.py version steps).
@@ -751,6 +773,8 @@ def run_doctor(args):
     print(color("┌─────────────────────────────────────────────────────────┐", Colors.CYAN))
     print(color("│                 🩺 Hermes Doctor                        │", Colors.CYAN))
     print(color("└─────────────────────────────────────────────────────────┘", Colors.CYAN))
+
+    _check_durable_operations(issues)
 
     _section("Security Advisories")
     try:

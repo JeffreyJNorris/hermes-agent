@@ -18,6 +18,7 @@ from hermes_cli.cli_output import (
     prompt_yes_no,
 )
 from hermes_constants import get_hermes_home
+from hermes_cli.config import load_config_readonly
 
 
 EXIT_OK = 0
@@ -83,10 +84,56 @@ def _result_exit(code: str) -> int:
     return EXIT_FAILURE
 
 
+def durable_health_result():
+    from gateway.durable_operations import DurableOperationsStore
+
+    config = load_config_readonly() or {}
+    requests = config.get("durable_requests") if isinstance(config, dict) else None
+    actions = config.get("durable_approvals") if isinstance(config, dict) else None
+    return DurableOperationsStore(
+        get_hermes_home() / "state.db", reconcile_schema=False
+    ).check_health(
+        requests_enabled=isinstance(requests, dict) and requests.get("enabled") is True,
+        actions_enabled=isinstance(actions, dict) and actions.get("enabled") is True,
+        allowed_actions=(
+            actions.get("allowed_actions", ()) if isinstance(actions, dict) else ()
+        ),
+        request_worker_alive=None,
+        action_worker_alive=None,
+    )
+
+
 def durable_command(args) -> int:
     json_output = bool(getattr(args, "json", False))
     group = getattr(args, "durable_group", None)
     action = getattr(args, "durable_action", None)
+    if group == "doctor":
+        try:
+            result = durable_health_result()
+        except Exception as exc:
+            payload = {
+                "severity": "critical",
+                "code": "database_unavailable",
+                "counts": [],
+                "error": type(exc).__name__,
+            }
+            _emit(payload, json_output=json_output, error=True)
+            return EXIT_FAILURE
+        payload = asdict(result)
+        if json_output:
+            _emit(payload, json_output=True)
+        else:
+            print_header("Durable operations")
+            (print_info if result.severity == "ok" else print_warning)(
+                f"{result.severity}: {result.code.replace('_', ' ')}"
+            )
+            for key, value in result.counts:
+                print_info(f"{key}: {value}")
+        return {
+            "ok": EXIT_OK,
+            "warning": EXIT_WARNING,
+            "critical": EXIT_FAILURE,
+        }[result.severity]
     if group not in {"requests", "actions"} or action not in {
         "list",
         "inspect",
@@ -213,4 +260,5 @@ __all__ = [
     "EXIT_OK",
     "EXIT_WARNING",
     "durable_command",
+    "durable_health_result",
 ]

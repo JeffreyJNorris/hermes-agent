@@ -15,7 +15,7 @@ from gateway.durable_requests import (
     DurableRequestTarget,
     DurableResponderMode,
 )
-from hermes_cli.durable import EXIT_INVALID, EXIT_OK, durable_command
+from hermes_cli.durable import EXIT_INVALID, EXIT_OK, EXIT_WARNING, durable_command
 from hermes_cli.subcommands.durable import build_durable_parser
 
 
@@ -289,3 +289,20 @@ def test_json_reconcile_records_local_identity_without_handler(
         assert db.execute(
             "SELECT outcome, operator_identity, note FROM durable_action_reconciliations"
         ).fetchone() == ("confirmed_not_applied", "local-user", "operator checked")
+
+
+def test_durable_doctor_json_uses_shared_health_result(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    _seed_home(tmp_path)
+    monkeypatch.setattr("hermes_cli.durable.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "hermes_cli.durable.load_config_readonly",
+        lambda: {"durable_requests": {"enabled": False}},
+    )
+    args = _parser().parse_args(["durable", "doctor", "--json"])
+
+    assert durable_command(args) == EXIT_WARNING
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["severity"] == "warning"
+    assert payload["code"] == "actionable_backlog"

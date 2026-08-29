@@ -702,7 +702,7 @@ class TestHealthDetailedEndpoint:
     async def test_health_detailed_returns_ok(self, adapter):
         """GET /health/detailed returns status, platform, and runtime fields."""
         app = _create_app(adapter)
-        with patch("gateway.status.read_runtime_status", return_value={
+        with patch("gateway.readiness._probe_disk", return_value={"status": "ok"}), patch("gateway.status.read_runtime_status", return_value={
             "gateway_state": "running",
             "platforms": {"telegram": {"state": "connected"}},
             "active_agents": 2,
@@ -722,6 +722,7 @@ class TestHealthDetailedEndpoint:
                 # gateway, so running + 2 agents ⇒ busy and drainable.
                 assert data["gateway_busy"] is True
                 assert data["gateway_drainable"] is True
+                assert "durable" in data["readiness"]["checks"]
                 assert isinstance(data["pid"], int)
                 assert "updated_at" in data
 
@@ -2856,4 +2857,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-

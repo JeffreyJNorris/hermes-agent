@@ -24,6 +24,9 @@ def build_durable_parser(subparsers, *, cmd_durable: Callable) -> None:
     )
     groups = durable.add_subparsers(dest="durable_group", metavar="<ledger>")
 
+    doctor = groups.add_parser("doctor", help="Check durable-operation health")
+    doctor.add_argument("--json", action="store_true")
+
     requests = groups.add_parser("requests", help="Durable request ledger")
     request_commands = requests.add_subparsers(
         dest="durable_action", metavar="<command>"
@@ -69,6 +72,7 @@ def build_durable_parser(subparsers, *, cmd_durable: Callable) -> None:
 
     for parser in (
         durable,
+        doctor,
         requests,
         request_list,
         request_inspect,

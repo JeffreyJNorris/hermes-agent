@@ -18,6 +18,7 @@ from gateway.durable_actions import (
     DurableActionExecutionContext,
     DurableActionStatus,
     lookup_durable_action_diagnostic,
+    lookup_durable_action_handler,
 )
 from gateway.durable_requests import DurableRequestStatus, DurableWakeStatus
 from hermes_state_common import reconcile_durable_action_schema
@@ -115,6 +116,13 @@ class DurableHealthDatum:
     name: str
     value: int | float
     attributes: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DurableHealthResult:
+    severity: str
+    code: str
+    counts: tuple[tuple[str, int], ...]
 
 
 def _optional_float(value: object) -> float | None:
@@ -728,6 +736,164 @@ class DurableOperationsStore:
                     )
         return tuple(metrics)
 
+    def check_health(
+        self,
+        *,
+        requests_enabled: bool = False,
+        actions_enabled: bool = False,
+        allowed_actions: object = (),
+        request_worker_alive: bool | None = None,
+        action_worker_alive: bool | None = None,
+        now: float | None = None,
+    ) -> DurableHealthResult:
+        if not self._db_path.exists():
+            return DurableHealthResult("ok", "not_initialized", ())
+        if (
+            not isinstance(allowed_actions, (list, tuple))
+            or any(type(item) is not str for item in allowed_actions)
+        ):
+            allowed: tuple[str, ...] = ()
+            invalid_allowlist = True
+        else:
+            allowed = tuple(allowed_actions)
+            invalid_allowlist = len(set(allowed)) != len(allowed)
+        current_time = self._now(now)
+        cutoff = current_time - 300.0
+        counts: dict[str, int] = {}
+        try:
+            with closing(self._read_connection()) as conn:
+                tables = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                durable_tables = {
+                    "durable_requests",
+                    "durable_action_tickets",
+                    "durable_action_reconciliations",
+                }
+                if not (tables & durable_tables):
+                    return DurableHealthResult("ok", "not_initialized", ())
+                if not durable_tables <= tables:
+                    return DurableHealthResult("critical", "impossible_state", ())
+                queries = {
+                    "pending_requests": (
+                        "SELECT COUNT(*) FROM durable_requests "
+                        "WHERE status = 'pending_delivery' AND created_at <= ?",
+                        (cutoff,),
+                    ),
+                    "ready_actions": (
+                        "SELECT COUNT(*) FROM durable_action_tickets "
+                        "WHERE status = 'ready' AND updated_at <= ?",
+                        (cutoff,),
+                    ),
+                    "pending_notifications": (
+                        "SELECT COUNT(*) FROM durable_action_tickets "
+                        "WHERE notification_status = 'pending' "
+                        "AND COALESCE(completed_at, updated_at) <= ?",
+                        (cutoff,),
+                    ),
+                    "stale_delivery_claims": (
+                        "SELECT COUNT(*) FROM durable_requests "
+                        "WHERE status = 'pending_delivery' AND delivery_claimed_at <= ?",
+                        (cutoff,),
+                    ),
+                    "stale_wake_claims": (
+                        "SELECT COUNT(*) FROM durable_requests "
+                        "WHERE wake_status = 'claimed' AND wake_claimed_at <= ?",
+                        (cutoff,),
+                    ),
+                    "stale_action_claims": (
+                        "SELECT COUNT(*) FROM durable_action_tickets "
+                        "WHERE status = 'claimed' AND execution_claimed_at <= ?",
+                        (cutoff,),
+                    ),
+                    "stale_notification_claims": (
+                        "SELECT COUNT(*) FROM durable_action_tickets "
+                        "WHERE notification_status = 'claimed' AND notification_claimed_at <= ?",
+                        (cutoff,),
+                    ),
+                    "unreconciled_unknown": (
+                        "SELECT COUNT(*) FROM durable_action_tickets AS ticket "
+                        "LEFT JOIN durable_action_reconciliations AS reconciliation "
+                        "ON reconciliation.request_id = ticket.request_id "
+                        "WHERE ticket.status = 'unknown' AND reconciliation.request_id IS NULL",
+                        (),
+                    ),
+                    "orphan_actions": (
+                        "SELECT COUNT(*) FROM durable_action_tickets AS ticket "
+                        "LEFT JOIN durable_requests AS request ON request.request_id = ticket.request_id "
+                        "WHERE request.request_id IS NULL",
+                        (),
+                    ),
+                }
+                for name, (sql, params) in queries.items():
+                    value = int(conn.execute(sql, params).fetchone()[0])
+                    if value:
+                        counts[name] = value
+                actionable_handlers = conn.execute(
+                    """SELECT DISTINCT action_type, action_version
+                       FROM durable_action_tickets
+                       WHERE status IN ('ready','claimed','executing')"""
+                ).fetchall()
+        except (OSError, sqlite3.Error):
+            return DurableHealthResult("critical", "database_unavailable", ())
+
+        if counts.get("orphan_actions"):
+            return DurableHealthResult(
+                "critical", "impossible_state", tuple(sorted(counts.items()))
+            )
+        if counts.get("unreconciled_unknown"):
+            return DurableHealthResult(
+                "critical", "unreconciled_unknown", tuple(sorted(counts.items()))
+            )
+
+        missing_handlers = sum(
+            1
+            for row in actionable_handlers
+            if lookup_durable_action_handler(row["action_type"], int(row["action_version"]))
+            is None
+        )
+        missing_handlers += sum(
+            1 for action_type in allowed if lookup_durable_action_handler(action_type, 1) is None
+        )
+        if missing_handlers:
+            counts["missing_handlers"] = missing_handlers
+        if invalid_allowlist:
+            counts["invalid_allowlist"] = 1
+        missing_workers = int(
+            requests_enabled and request_worker_alive is not True
+        ) + int(actions_enabled and action_worker_alive is not True)
+        if missing_workers:
+            counts["workers"] = missing_workers
+
+        backlog_keys = {
+            "pending_requests",
+            "ready_actions",
+            "pending_notifications",
+            "stale_delivery_claims",
+            "stale_wake_claims",
+            "stale_action_claims",
+            "stale_notification_claims",
+        }
+        if any(counts.get(key) for key in backlog_keys):
+            code = "actionable_backlog"
+        elif invalid_allowlist or missing_handlers:
+            code = "invalid_allowlist"
+        elif missing_workers:
+            worker_unknown = (
+                requests_enabled and request_worker_alive is None
+            ) or (actions_enabled and action_worker_alive is None)
+            code = (
+                "worker_confirmation_unavailable"
+                if worker_unknown
+                else "worker_unavailable"
+            )
+        else:
+            return DurableHealthResult("ok", "healthy", tuple(sorted(counts.items())))
+        return DurableHealthResult("warning", code, tuple(sorted(counts.items())))
+
     @staticmethod
     def _bounded_health_label(value: object) -> str:
         text = str(value or "unknown")
@@ -969,6 +1135,7 @@ __all__ = [
     "DurableActionReconciliationOutcome",
     "DurableActionSummary",
     "DurableHealthDatum",
+    "DurableHealthResult",
     "DurableOperationsStore",
     "DurableOperatorResult",
     "DurableRequestDetail",
