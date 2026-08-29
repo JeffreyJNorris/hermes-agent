@@ -110,6 +110,13 @@ class DurableOperatorResult:
     action_status: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class DurableHealthDatum:
+    name: str
+    value: int | float
+    attributes: tuple[tuple[str, str], ...]
+
+
 def _optional_float(value: object) -> float | None:
     return None if value is None else float(value)
 
@@ -141,12 +148,19 @@ def _delivery_state(row: sqlite3.Row) -> str:
 class DurableOperationsStore:
     """Bounded, redacted operator access to a local ``state.db``."""
 
-    def __init__(self, db_path: str | Path, *, wall_clock=time.time) -> None:
+    def __init__(
+        self,
+        db_path: str | Path,
+        *,
+        wall_clock=time.time,
+        reconcile_schema: bool = True,
+    ) -> None:
         self._db_path = Path(db_path)
         self._wall_clock = wall_clock
-        with closing(self._write_connection()) as conn:
-            reconcile_durable_action_schema(conn)
-            conn.commit()
+        if reconcile_schema:
+            with closing(self._write_connection()) as conn:
+                reconcile_durable_action_schema(conn)
+                conn.commit()
 
     def _now(self, now: float | None) -> float:
         value = float(self._wall_clock() if now is None else now)
@@ -546,6 +560,184 @@ class DurableOperationsStore:
                 conn.rollback()
                 raise
 
+    def collect_health_data(
+        self,
+        *,
+        now: float | None = None,
+    ) -> tuple[DurableHealthDatum, ...]:
+        from gateway.durable_action_runner import DEFAULT_STALE_CLAIM_SECONDS
+        from gateway.durable_requests import (
+            DELIVERY_CLAIM_STALE_SECONDS,
+            WAKE_CLAIM_STALE_SECONDS,
+        )
+
+        current_time = self._now(now)
+        metrics: list[DurableHealthDatum] = []
+
+        def add(name: str, value: object, **attributes: object) -> None:
+            metrics.append(
+                DurableHealthDatum(
+                    name,
+                    int(value) if name != "hermes_durable_oldest_backlog_seconds" else float(value),
+                    tuple(
+                        sorted(
+                            (key, self._bounded_health_label(item))
+                            for key, item in attributes.items()
+                        )
+                    ),
+                )
+            )
+
+        with closing(self._read_connection()) as conn:
+            for row in conn.execute(
+                """SELECT status, platform, COUNT(*) AS count
+                   FROM durable_requests GROUP BY status, platform
+                   ORDER BY status, platform"""
+            ):
+                add(
+                    "hermes_durable_requests",
+                    row["count"],
+                    status=(row["status"] if row["status"] in _REQUEST_STATUSES else "unknown"),
+                    platform=row["platform"],
+                )
+            for row in conn.execute(
+                """SELECT status, action_type, COUNT(*) AS count
+                   FROM durable_action_tickets GROUP BY status, action_type
+                   ORDER BY status, action_type"""
+            ):
+                add(
+                    "hermes_durable_actions",
+                    row["count"],
+                    status=(row["status"] if row["status"] in _ACTION_STATUSES else "unknown"),
+                    action_type=row["action_type"],
+                )
+            for row in conn.execute(
+                """SELECT ticket.notification_status AS status, request.origin_type,
+                          COUNT(*) AS count
+                   FROM durable_action_tickets AS ticket
+                   JOIN durable_requests AS request ON request.request_id = ticket.request_id
+                   GROUP BY ticket.notification_status, request.origin_type
+                   ORDER BY ticket.notification_status, request.origin_type"""
+            ):
+                add(
+                    "hermes_durable_notifications",
+                    row["count"],
+                    status=row["status"],
+                    origin_type=row["origin_type"],
+                )
+            stale_queries = (
+                (
+                    "delivery",
+                    "SELECT COUNT(*) FROM durable_requests WHERE status = 'pending_delivery' "
+                    "AND delivery_claimed_at IS NOT NULL AND delivery_claimed_at <= ?",
+                    current_time - DELIVERY_CLAIM_STALE_SECONDS,
+                ),
+                (
+                    "wake",
+                    "SELECT COUNT(*) FROM durable_requests WHERE wake_status = 'claimed' "
+                    "AND wake_claimed_at IS NOT NULL AND wake_claimed_at <= ?",
+                    current_time - WAKE_CLAIM_STALE_SECONDS,
+                ),
+                (
+                    "execution",
+                    "SELECT COUNT(*) FROM durable_action_tickets WHERE status IN ('claimed','executing') "
+                    "AND execution_claimed_at IS NOT NULL AND execution_claimed_at <= ?",
+                    current_time - DEFAULT_STALE_CLAIM_SECONDS,
+                ),
+                (
+                    "notification",
+                    "SELECT COUNT(*) FROM durable_action_tickets WHERE notification_status = 'claimed' "
+                    "AND notification_claimed_at IS NOT NULL AND notification_claimed_at <= ?",
+                    current_time - DEFAULT_STALE_CLAIM_SECONDS,
+                ),
+            )
+            for claim_type, sql, cutoff in stale_queries:
+                count = int(conn.execute(sql, (cutoff,)).fetchone()[0])
+                if count:
+                    add(
+                        "hermes_durable_stale_claims",
+                        count,
+                        claim_type=claim_type,
+                    )
+            for row in conn.execute(
+                """SELECT ticket.action_type,
+                          CASE WHEN reconciliation.request_id IS NULL THEN 'false' ELSE 'true' END AS reconciled,
+                          COUNT(*) AS count
+                   FROM durable_action_tickets AS ticket
+                   LEFT JOIN durable_action_reconciliations AS reconciliation
+                     ON reconciliation.request_id = ticket.request_id
+                   WHERE ticket.status = 'unknown'
+                   GROUP BY ticket.action_type, reconciled
+                   ORDER BY ticket.action_type, reconciled"""
+            ):
+                add(
+                    "hermes_durable_unknown_actions",
+                    row["count"],
+                    action_type=row["action_type"],
+                    reconciled=row["reconciled"],
+                )
+            for row in conn.execute(
+                """SELECT ticket.action_type, reconciliation.outcome, COUNT(*) AS count
+                   FROM durable_action_reconciliations AS reconciliation
+                   JOIN durable_action_tickets AS ticket
+                     ON ticket.request_id = reconciliation.request_id
+                   GROUP BY ticket.action_type, reconciliation.outcome
+                   ORDER BY ticket.action_type, reconciliation.outcome"""
+            ):
+                add(
+                    "hermes_durable_reconciliations",
+                    row["count"],
+                    action_type=row["action_type"],
+                    outcome=row["outcome"],
+                )
+            backlog_queries = (
+                (
+                    "delivery",
+                    "SELECT MIN(created_at) FROM durable_requests WHERE status = 'pending_delivery'",
+                ),
+                (
+                    "wake",
+                    "SELECT MIN(COALESCE(wake_claimed_at, resolved_at, updated_at)) "
+                    "FROM durable_requests WHERE wake_status IN ('pending','claimed')",
+                ),
+                (
+                    "action",
+                    "SELECT MIN(COALESCE(execution_claimed_at, updated_at, created_at)) "
+                    "FROM durable_action_tickets WHERE status IN ('ready','claimed','executing')",
+                ),
+                (
+                    "notification",
+                    "SELECT MIN(COALESCE(notification_claimed_at, completed_at, updated_at)) "
+                    "FROM durable_action_tickets WHERE notification_status IN ('pending','claimed')",
+                ),
+                (
+                    "unknown",
+                    "SELECT MIN(ticket.completed_at) FROM durable_action_tickets AS ticket "
+                    "LEFT JOIN durable_action_reconciliations AS reconciliation "
+                    "ON reconciliation.request_id = ticket.request_id "
+                    "WHERE ticket.status = 'unknown' AND reconciliation.request_id IS NULL",
+                ),
+            )
+            for queue_type, sql in backlog_queries:
+                timestamp = conn.execute(sql).fetchone()[0]
+                if timestamp is not None:
+                    add(
+                        "hermes_durable_oldest_backlog_seconds",
+                        _age(current_time, timestamp),
+                        queue_type=queue_type,
+                    )
+        return tuple(metrics)
+
+    @staticmethod
+    def _bounded_health_label(value: object) -> str:
+        text = str(value or "unknown")
+        return (
+            text
+            if len(text) <= 128
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", text) is not None
+            else "unknown"
+        )
+
     @staticmethod
     def _validate_reconciliation_text(
         value: str,
@@ -776,6 +968,7 @@ __all__ = [
     "DurableActionDetail",
     "DurableActionReconciliationOutcome",
     "DurableActionSummary",
+    "DurableHealthDatum",
     "DurableOperationsStore",
     "DurableOperatorResult",
     "DurableRequestDetail",

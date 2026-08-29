@@ -116,8 +116,15 @@ def test_registered_observable_metric_names_cover_snapshot_metrics(monkeypatch):
         _M("hermes.cron.jobs.enabled"), _M("hermes.cron.jobs.running"),
         _M("hermes.cron.jobs.overdue"),
     ]})()
+    durable_snapshot = type("S", (), {"metrics": [
+        _M("hermes_durable_requests"), _M("hermes_durable_actions"),
+        _M("hermes_durable_notifications"), _M("hermes_durable_stale_claims"),
+        _M("hermes_durable_unknown_actions"), _M("hermes_durable_reconciliations"),
+        _M("hermes_durable_oldest_backlog_seconds"),
+    ]})()
     monkeypatch.setattr(gateway_health_export, "_read_gateway_snapshot", lambda config: gateway_snapshot)
     monkeypatch.setattr(gateway_health_export, "_read_cron_snapshot", lambda: cron_snapshot)
+    monkeypatch.setattr(gateway_health_export, "_read_durable_snapshot", lambda: durable_snapshot)
 
     snapshot_names = {m.name for m in gateway_health_export._read_runtime_snapshot({}).metrics}
 
@@ -127,6 +134,23 @@ def test_registered_observable_metric_names_cover_snapshot_metrics(monkeypatch):
 
     missing = snapshot_names - registered
     assert not missing, f"gauges emitted but NOT registered in metric_names (will be silently dropped): {sorted(missing)}"
+
+
+def test_durable_snapshot_failure_is_fail_open_and_redacted(monkeypatch, caplog):
+    from agent.monitoring import gateway_health_export
+
+    snapshot = type("S", (), {"metrics": [], "events": []})()
+    monkeypatch.setattr(gateway_health_export, "_read_gateway_snapshot", lambda config: snapshot)
+    monkeypatch.setattr(gateway_health_export, "_read_cron_snapshot", lambda: snapshot)
+    monkeypatch.setattr(
+        gateway_health_export,
+        "_read_durable_snapshot",
+        lambda: (_ for _ in ()).throw(RuntimeError("PHASE4D-CANARY secret")),
+    )
+
+    assert gateway_health_export._read_runtime_snapshot({}) is snapshot
+    assert "RuntimeError" in caplog.text
+    assert "PHASE4D-CANARY" not in caplog.text
 
 
 def test_monitoring_docs_distinguish_relay_health_scope_and_terminal_flush():

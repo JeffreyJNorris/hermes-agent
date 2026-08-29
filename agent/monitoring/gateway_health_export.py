@@ -301,6 +301,12 @@ def _read_cron_snapshot():
     return build_cron_health_snapshot()
 
 
+def _read_durable_snapshot():
+    from agent.monitoring.durable_health import build_durable_health_snapshot
+
+    return build_durable_health_snapshot()
+
+
 def _read_background_work_count() -> int:
     """Count live background/subagent work that ``active_agents`` does NOT include.
 
@@ -396,8 +402,18 @@ def _read_runtime_snapshot(config: Dict[str, Any]):
             type(exc).__name__,
         )
         logger.debug("cron health snapshot traceback", exc_info=True)
-        return gateway_snapshot
-    gateway_snapshot.metrics.extend(cron_snapshot.metrics)
+    else:
+        gateway_snapshot.metrics.extend(cron_snapshot.metrics)
+    try:
+        durable_snapshot = _read_durable_snapshot()
+    except Exception as exc:
+        logger.warning(
+            "durable health snapshot unavailable; durable telemetry not exported (error_type=%s)",
+            type(exc).__name__,
+        )
+        logger.debug("durable health snapshot traceback", exc_info=True)
+    else:
+        gateway_snapshot.metrics.extend(durable_snapshot.metrics)
     return gateway_snapshot
 
 
@@ -451,6 +467,13 @@ def _start_metric_provider(config: Dict[str, Any], sdk: Dict[str, Any]) -> Any:
         "hermes.cron.jobs.enabled",
         "hermes.cron.jobs.running",
         "hermes.cron.jobs.overdue",
+        "hermes_durable_requests",
+        "hermes_durable_actions",
+        "hermes_durable_notifications",
+        "hermes_durable_stale_claims",
+        "hermes_durable_unknown_actions",
+        "hermes_durable_reconciliations",
+        "hermes_durable_oldest_backlog_seconds",
     ]
 
     def callback(name: str):
