@@ -2068,7 +2068,16 @@ class DurableRequestStore:
             OR EXISTS (
                 SELECT 1 FROM durable_action_tickets AS ticket
                 WHERE ticket.request_id = durable_requests.request_id
-                  AND ticket.status IN ({action_placeholders})
+                  AND (
+                      (ticket.status IN ({action_placeholders}) AND ticket.status != 'unknown')
+                      OR (
+                          ticket.status = 'unknown'
+                          AND EXISTS (
+                          SELECT 1 FROM durable_action_reconciliations AS reconciliation
+                          WHERE reconciliation.request_id = ticket.request_id
+                          )
+                      )
+                  )
                   AND ticket.notification_status IN (?, ?)
                   AND ticket.completed_at IS NOT NULL
             )
@@ -2109,6 +2118,10 @@ class DurableRequestStore:
             )
         ]
         conn.executemany(
+            "DELETE FROM durable_action_reconciliations WHERE request_id = ?",
+            ((request_id,) for request_id in age_ids),
+        )
+        conn.executemany(
             "DELETE FROM durable_action_tickets WHERE request_id = ?",
             ((request_id,) for request_id in age_ids),
         )
@@ -2147,6 +2160,10 @@ class DurableRequestStore:
                 ),
                 )
             ]
+            conn.executemany(
+                "DELETE FROM durable_action_reconciliations WHERE request_id = ?",
+                ((request_id,) for request_id in overflow_ids),
+            )
             conn.executemany(
                 "DELETE FROM durable_action_tickets WHERE request_id = ?",
                 ((request_id,) for request_id in overflow_ids),

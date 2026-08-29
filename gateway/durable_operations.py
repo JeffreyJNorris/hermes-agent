@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import math
 import re
+import secrets
 import sqlite3
 import time
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
+from enum import Enum
 from typing import Generic, TypeVar
 
 from gateway.durable_actions import DurableActionStatus
 from gateway.durable_requests import DurableRequestStatus, DurableWakeStatus
+from hermes_state_common import reconcile_durable_action_schema
 
 
 _MAX_PAGE_SIZE = 100
@@ -28,6 +31,13 @@ _ACTIONABLE_STATUSES = frozenset(
         DurableActionStatus.UNKNOWN.value,
     }
 )
+
+
+class DurableActionReconciliationOutcome(str, Enum):
+    CONFIRMED_APPLIED = "confirmed_applied"
+    CONFIRMED_NOT_APPLIED = "confirmed_not_applied"
+    ABANDONED = "abandoned"
+    SUPERSEDED = "superseded"
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +138,9 @@ class DurableOperationsStore:
     def __init__(self, db_path: str | Path, *, wall_clock=time.time) -> None:
         self._db_path = Path(db_path)
         self._wall_clock = wall_clock
+        with closing(self._write_connection()) as conn:
+            reconcile_durable_action_schema(conn)
+            conn.commit()
 
     def _now(self, now: float | None) -> float:
         value = float(self._wall_clock() if now is None else now)
@@ -151,6 +164,7 @@ class DurableOperationsStore:
             raise
 
     def _write_connection(self) -> sqlite3.Connection:
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self._db_path, timeout=10.0)
         try:
             conn.row_factory = sqlite3.Row
@@ -288,8 +302,11 @@ class DurableOperationsStore:
                 f"""SELECT ticket.request_id, ticket.action_type,
                            ticket.action_version, ticket.status,
                            ticket.created_at, ticket.execution_claimed_at,
-                           ticket.completed_at, ticket.notification_status
+                           ticket.completed_at, ticket.notification_status,
+                           reconciliation.outcome AS effective_reconciliation
                     FROM durable_action_tickets AS ticket
+                    LEFT JOIN durable_action_reconciliations AS reconciliation
+                      ON reconciliation.request_id = ticket.request_id
                     {predicate}
                     ORDER BY ticket.created_at DESC, ticket.request_id DESC
                     LIMIT ? OFFSET ?""",
@@ -317,10 +334,13 @@ class DurableOperationsStore:
                           ticket.notification_status, ticket.outcome_reason,
                           ticket.notification_reason,
                           request.status AS request_status,
-                          request.delivery_claimed_at
+                          request.delivery_claimed_at,
+                          reconciliation.outcome AS effective_reconciliation
                    FROM durable_action_tickets AS ticket
                    JOIN durable_requests AS request
                      ON request.request_id = ticket.request_id
+                   LEFT JOIN durable_action_reconciliations AS reconciliation
+                     ON reconciliation.request_id = ticket.request_id
                    WHERE ticket.request_id = ?""",
                 (request_id,),
             ).fetchone()
@@ -372,6 +392,132 @@ class DurableOperationsStore:
             except Exception:
                 conn.rollback()
                 raise
+
+    def reconcile_action(
+        self,
+        request_id: str,
+        *,
+        outcome: DurableActionReconciliationOutcome | str,
+        operator_identity: str,
+        note: str | None = None,
+        superseded_by_request_id: str | None = None,
+        now: float | None = None,
+    ) -> DurableOperatorResult:
+        try:
+            outcome_value = DurableActionReconciliationOutcome(outcome).value
+        except (TypeError, ValueError) as exc:
+            raise ValueError("unsupported reconciliation outcome") from exc
+        self._validate_reconciliation_text(
+            operator_identity, field="operator_identity", maximum=128, required=True
+        )
+        if note is not None:
+            self._validate_reconciliation_text(
+                note, field="note", maximum=1024, required=False
+            )
+        if outcome_value == DurableActionReconciliationOutcome.SUPERSEDED.value:
+            if not superseded_by_request_id or superseded_by_request_id == request_id:
+                return DurableOperatorResult(
+                    False, "invalid_superseding_receipt", request_id
+                )
+        elif superseded_by_request_id is not None:
+            raise ValueError("superseding receipt requires superseded outcome")
+        current_time = self._now(now)
+        with closing(self._write_connection()) as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    """SELECT ticket.status AS action_status, ticket.action_type,
+                              request.status AS request_status,
+                              reconciliation.outcome AS existing_outcome
+                       FROM durable_action_tickets AS ticket
+                       LEFT JOIN durable_requests AS request
+                         ON request.request_id = ticket.request_id
+                       LEFT JOIN durable_action_reconciliations AS reconciliation
+                         ON reconciliation.request_id = ticket.request_id
+                       WHERE ticket.request_id = ?""",
+                    (request_id,),
+                ).fetchone()
+                if row is None:
+                    conn.commit()
+                    return DurableOperatorResult(False, "not_found", request_id)
+                if row["existing_outcome"] is not None:
+                    conn.commit()
+                    return DurableOperatorResult(
+                        False,
+                        "already_reconciled",
+                        request_id,
+                        request_status=row["request_status"],
+                        action_status=row["action_status"],
+                    )
+                if row["action_status"] != DurableActionStatus.UNKNOWN.value:
+                    conn.commit()
+                    return DurableOperatorResult(
+                        False,
+                        "invalid_state",
+                        request_id,
+                        request_status=row["request_status"],
+                        action_status=row["action_status"],
+                    )
+                if outcome_value == DurableActionReconciliationOutcome.SUPERSEDED.value:
+                    successor = conn.execute(
+                        """SELECT action_type FROM durable_action_tickets
+                           WHERE request_id = ?""",
+                        (superseded_by_request_id,),
+                    ).fetchone()
+                    if successor is None or successor["action_type"] != row["action_type"]:
+                        conn.commit()
+                        return DurableOperatorResult(
+                            False,
+                            "invalid_superseding_receipt",
+                            request_id,
+                            request_status=row["request_status"],
+                            action_status=row["action_status"],
+                        )
+                conn.execute(
+                    """INSERT INTO durable_action_reconciliations (
+                           reconciliation_id, request_id, outcome,
+                           operator_identity, note, superseded_by_request_id, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        f"drc_{secrets.token_urlsafe(18)}",
+                        request_id,
+                        outcome_value,
+                        operator_identity,
+                        note,
+                        superseded_by_request_id,
+                        current_time,
+                    ),
+                )
+                conn.commit()
+                return DurableOperatorResult(
+                    True,
+                    "reconciled",
+                    request_id,
+                    request_status=row["request_status"],
+                    action_status=row["action_status"],
+                )
+            except Exception:
+                conn.rollback()
+                raise
+
+    @staticmethod
+    def _validate_reconciliation_text(
+        value: str,
+        *,
+        field: str,
+        maximum: int,
+        required: bool,
+    ) -> None:
+        if not isinstance(value, str):
+            raise TypeError(f"{field} must be a string")
+        if required and not value.strip():
+            raise ValueError(f"{field} must not be blank")
+        if len(value) > maximum:
+            raise ValueError(f"{field} is too long")
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError(f"{field} must be valid UTF-8") from exc
 
     def cancel_action(
         self,
@@ -566,7 +712,7 @@ class DurableOperationsStore:
             execution_claimed_at=_optional_float(row["execution_claimed_at"]),
             completed_at=_optional_float(row["completed_at"]),
             notification_status=notification_status,
-            effective_reconciliation=None,
+            effective_reconciliation=row["effective_reconciliation"],
             actionable_age_seconds=(
                 _age(
                     now,
@@ -582,6 +728,7 @@ class DurableOperationsStore:
 
 __all__ = [
     "DurableActionDetail",
+    "DurableActionReconciliationOutcome",
     "DurableActionSummary",
     "DurableOperationsStore",
     "DurableOperatorResult",

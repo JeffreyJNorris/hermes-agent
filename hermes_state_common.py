@@ -152,7 +152,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -220,6 +220,16 @@ CREATE INDEX IF NOT EXISTS idx_durable_action_tickets_runnable
     ON durable_action_tickets(status, execution_claimed_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_durable_action_tickets_notification
     ON durable_action_tickets(notification_status, notification_claimed_at, updated_at);
+CREATE TABLE IF NOT EXISTS durable_action_reconciliations (
+    reconciliation_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL UNIQUE,
+    outcome TEXT NOT NULL,
+    operator_identity TEXT NOT NULL CHECK(length(operator_identity) <= 128),
+    note TEXT CHECK(note IS NULL OR length(note) <= 1024),
+    superseded_by_request_id TEXT,
+    created_at REAL NOT NULL,
+    FOREIGN KEY(request_id) REFERENCES durable_action_tickets(request_id)
+);
 """
 
 
