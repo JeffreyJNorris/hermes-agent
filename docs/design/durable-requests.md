@@ -312,6 +312,32 @@ ticket outcome before acting. Do not edit the SQLite row or reset it to
 `ready`. Reconcile through the normal operator surface; request a new trusted
 approval only after the target has a new, unambiguous state/fingerprint.
 
+### Local operator operations
+
+The trusted local `hermes durable` command reads bounded, redacted projections
+from the active profile's `state.db`. Operators can list and inspect requests
+and actions, safely cancel an active request, run a read-only diagnostic for an
+`unknown` action, record one immutable reconciliation, and check structural
+health. This command is not registered as a model tool, slash command, ACP
+operation, or API-server tool.
+
+An `unknown` action remains `unknown` after reconciliation. The separate
+reconciliation classifies the evidence as `confirmed_applied`,
+`confirmed_not_applied`, `abandoned`, or `superseded`; it never invokes or
+retries the handler. `superseded` links a different existing receipt of the
+same action type and does not assert that the newer action executed.
+
+Health, authenticated detailed readiness, and optional OTLP gauges reuse the
+same read-only ledger aggregation. Public `/health` remains a shallow liveness
+probe and does not open the durable database. Unreconciled UNKNOWN evidence is
+critical and is retained beyond normal terminal pruning; after reconciliation,
+the request, action, and reconciliation are pruned together only when the
+normal age, wake, and notification conditions permit it.
+
+See [Durable operations runbook](../operations/durable-operations.md) for exact
+commands, cancellation outcomes, health severity, metrics, retention, and
+rollback guidance.
+
 ### Completion notification and privacy
 
 An attached action suppresses the ordinary request-terminal wake. Hermes sends
