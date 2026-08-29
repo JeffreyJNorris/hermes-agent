@@ -1,0 +1,202 @@
+from __future__ import annotations
+
+import sqlite3
+from dataclasses import FrozenInstanceError
+from pathlib import Path
+
+import pytest
+
+from gateway.durable_actions import PreparedDurableAction
+from gateway.durable_operations import DurableOperationsStore
+from gateway.durable_requests import (
+    DurableRequestOption,
+    DurableRequestSpec,
+    DurableRequestStore,
+    DurableRequestTarget,
+    DurableResponderMode,
+)
+
+
+def _spec(reference: str) -> DurableRequestSpec:
+    return DurableRequestSpec(
+        kind="test.release",
+        title="PHASE4D-CANARY title",
+        body="PHASE4D-CANARY body",
+        options=(
+            DurableRequestOption("approve", "PHASE4D-CANARY approve"),
+            DurableRequestOption("reject", "PHASE4D-CANARY reject"),
+        ),
+        ttl_seconds=1_000,
+        reference=reference,
+    )
+
+
+def _create_request(store: DurableRequestStore, reference: str, *, action=False):
+    kwargs = dict(
+        target=DurableRequestTarget("discord", "channel-secret", "thread-secret"),
+        responder_mode=DurableResponderMode.ANY_AUTHORIZED,
+        expected_actor_id=None,
+        origin_type="session",
+        origin_id=f"origin-secret-{reference}",
+    )
+    if action:
+        return store.create_with_action(
+            _spec(reference),
+            action=PreparedDurableAction(
+                action_type="cron.resume",
+                action_version=1,
+                payload_json='{"canary":"PHASE4D-CANARY"}',
+                fingerprint=f"fingerprint-secret-{reference}",
+                idempotency_key=f"idempotency-secret-{reference}",
+            ),
+            origin_session_id=f"session-secret-{reference}",
+            **kwargs,
+        )
+    return store.create(_spec(reference), **kwargs)
+
+
+def seeded_operations_store(tmp_path: Path) -> DurableOperationsStore:
+    db_path = tmp_path / "state.db"
+    requests = DurableRequestStore(db_path, wall_clock=lambda: 100.0)
+    older = _create_request(requests, "older").request.request_id
+    newer = _create_request(requests, "newer").request.request_id
+    action = _create_request(requests, "action", action=True).request.request_id
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "UPDATE durable_requests SET request_id = 'drq_older', created_at = 100, "
+            "updated_at = 100 WHERE request_id = ?",
+            (older,),
+        )
+        db.execute(
+            "UPDATE durable_requests SET request_id = 'drq_newer', created_at = 200, "
+            "updated_at = 200 WHERE request_id = ?",
+            (newer,),
+        )
+        db.execute(
+            "UPDATE durable_requests SET request_id = 'drq_action', created_at = 150, "
+            "updated_at = 150 WHERE request_id = ?",
+            (action,),
+        )
+        db.execute(
+            "UPDATE durable_action_tickets SET request_id = 'drq_action', "
+            "created_at = 150, updated_at = 150 WHERE request_id = ?",
+            (action,),
+        )
+    return DurableOperationsStore(db_path, wall_clock=lambda: 500.0)
+
+
+def test_request_list_is_bounded_stable_and_redacted(tmp_path: Path) -> None:
+    store = seeded_operations_store(tmp_path)
+
+    page = store.list_requests(limit=1, offset=0, now=500.0)
+
+    assert tuple(item.request_id for item in page.items) == ("drq_newer",)
+    assert page.next_offset == 1
+    for name in (
+        "title",
+        "body",
+        "options",
+        "chat_id",
+        "thread_id",
+        "origin_id",
+        "expected_actor_id",
+    ):
+        assert not hasattr(page.items[0], name)
+    with pytest.raises(FrozenInstanceError):
+        page.items[0].status = "cancelled"  # type: ignore[misc]
+
+
+def test_request_list_filters_and_equal_timestamps_are_stable(tmp_path: Path) -> None:
+    store = seeded_operations_store(tmp_path)
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        db.execute("UPDATE durable_requests SET created_at = 200")
+        db.execute(
+            "UPDATE durable_requests SET status = 'open', message_id = 'secret' "
+            "WHERE request_id = 'drq_newer'"
+        )
+
+    page = store.list_requests(
+        status="pending_delivery", origin_type="session", now=500.0
+    )
+
+    assert tuple(item.request_id for item in page.items) == (
+        "drq_older",
+        "drq_action",
+    )
+    assert page.next_offset is None
+
+
+def test_request_projection_uses_one_clock_for_age_fields(tmp_path: Path) -> None:
+    calls = 0
+
+    def clock() -> float:
+        nonlocal calls
+        calls += 1
+        return 500.0
+
+    store = seeded_operations_store(tmp_path)
+    store = DurableOperationsStore(tmp_path / "state.db", wall_clock=clock)
+
+    page = store.list_requests()
+
+    assert calls == 1
+    assert {item.pending_age_seconds for item in page.items} == {300.0, 350.0, 400.0}
+
+
+@pytest.mark.parametrize("limit", [0, 101, True])
+def test_request_list_rejects_invalid_limits(tmp_path: Path, limit: object) -> None:
+    store = seeded_operations_store(tmp_path)
+
+    with pytest.raises((TypeError, ValueError)):
+        store.list_requests(limit=limit)  # type: ignore[arg-type]
+
+
+def test_request_list_rejects_negative_offset(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="offset"):
+        seeded_operations_store(tmp_path).list_requests(offset=-1)
+
+
+def test_request_lookup_returns_none_for_unknown_receipt(tmp_path: Path) -> None:
+    assert seeded_operations_store(tmp_path).get_request("drq_missing") is None
+
+
+def test_action_lookup_by_request_omits_execution_material(tmp_path: Path) -> None:
+    detail = seeded_operations_store(tmp_path).get_action("drq_action", now=500.0)
+
+    assert detail is not None
+    assert detail.action_type == "cron.resume"
+    assert detail.request_status == "pending_delivery"
+    for name in (
+        "payload_json",
+        "fingerprint",
+        "idempotency_key",
+        "execution_claim",
+        "notification_claim",
+        "outcome_json",
+    ):
+        assert not hasattr(detail, name)
+
+
+def test_action_list_filters_status_type_and_minimum_age(tmp_path: Path) -> None:
+    store = seeded_operations_store(tmp_path)
+
+    matching = store.list_actions(
+        status="waiting_for_decision",
+        action_type="cron.resume",
+        minimum_age_seconds=300,
+        now=500.0,
+    )
+    too_old = store.list_actions(minimum_age_seconds=351, now=500.0)
+
+    assert tuple(item.request_id for item in matching.items) == ("drq_action",)
+    assert too_old.items == ()
+
+
+def test_phase4_rows_without_action_tickets_remain_inspectable(tmp_path: Path) -> None:
+    store = seeded_operations_store(tmp_path)
+
+    request = store.get_request("drq_older", now=500.0)
+
+    assert request is not None
+    assert request.action_status is None
+    assert store.get_action("drq_older", now=500.0) is None
