@@ -86,6 +86,16 @@ def seeded_operations_store(tmp_path: Path) -> DurableOperationsStore:
     return DurableOperationsStore(db_path, wall_clock=lambda: 500.0)
 
 
+def test_operator_store_does_not_create_partial_schema_for_missing_database(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+
+    DurableOperationsStore(db_path)
+
+    assert not db_path.exists()
+
+
 def test_request_list_is_bounded_stable_and_redacted(tmp_path: Path) -> None:
     store = seeded_operations_store(tmp_path)
 

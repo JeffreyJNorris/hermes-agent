@@ -165,7 +165,7 @@ class DurableOperationsStore:
     ) -> None:
         self._db_path = Path(db_path)
         self._wall_clock = wall_clock
-        if reconcile_schema:
+        if reconcile_schema and self._db_path.exists():
             with closing(self._write_connection()) as conn:
                 reconcile_durable_action_schema(conn)
                 conn.commit()
