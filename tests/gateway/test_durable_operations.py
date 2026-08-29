@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -192,6 +193,23 @@ def test_action_list_filters_status_type_and_minimum_age(tmp_path: Path) -> None
     assert too_old.items == ()
 
 
+def test_list_filters_reject_status_injection_and_treat_wildcards_literally(
+    tmp_path: Path,
+) -> None:
+    store = seeded_operations_store(tmp_path)
+
+    with pytest.raises(ValueError, match="status"):
+        store.list_requests(status="open' OR 1=1 --")
+    with pytest.raises(ValueError, match="status"):
+        store.list_actions(status="ready' OR 1=1 --")
+    assert store.list_requests(origin_type="%").items == ()
+    assert store.list_actions(action_type="cron.%").items == ()
+    with pytest.raises(TypeError, match="origin_type"):
+        store.list_requests(origin_type=1)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="action_type"):
+        store.list_actions(action_type=1)  # type: ignore[arg-type]
+
+
 def test_phase4_rows_without_action_tickets_remain_inspectable(tmp_path: Path) -> None:
     store = seeded_operations_store(tmp_path)
 
@@ -277,6 +295,40 @@ def test_cancel_ready_action_loses_to_runner_claim(tmp_path: Path) -> None:
     assert claim is not None
     assert result.code == "execution_in_progress"
     assert ops.get_action("drq_action").status == DurableActionStatus.CLAIMED.value  # type: ignore[union-attr]
+
+
+def test_two_operator_cancels_racing_runner_have_one_safe_winner(
+    tmp_path: Path,
+) -> None:
+    _, runner = _set_action_state(tmp_path, "ready")
+    operators = [
+        DurableOperationsStore(tmp_path / "state.db") for _ in range(2)
+    ]
+    barrier = threading.Barrier(3)
+    cancel_codes: list[str] = []
+    claims = []
+
+    def cancel(store: DurableOperationsStore) -> None:
+        barrier.wait()
+        cancel_codes.append(store.cancel_action("drq_action").code)
+
+    def claim() -> None:
+        barrier.wait()
+        claims.append(runner.claim_next())
+
+    threads = [
+        threading.Thread(target=cancel, args=(store,)) for store in operators
+    ] + [threading.Thread(target=claim)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    if claims == [None]:
+        assert sorted(cancel_codes) == ["already_terminal", "cancelled"]
+    else:
+        assert claims[0] is not None
+        assert cancel_codes == ["execution_in_progress"] * 2
 
 
 @pytest.mark.parametrize("status", ["claimed", "executing"])

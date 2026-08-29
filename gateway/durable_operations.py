@@ -229,8 +229,11 @@ class DurableOperationsStore:
         limit, offset = self._page_values(limit, offset)
         if status is not None and status not in _REQUEST_STATUSES:
             raise ValueError("unsupported request status")
-        if origin_type is not None and not origin_type:
-            raise ValueError("origin_type must not be blank")
+        if origin_type is not None:
+            if not isinstance(origin_type, str):
+                raise TypeError("origin_type must be a string")
+            if not origin_type:
+                raise ValueError("origin_type must not be blank")
         current_time = self._now(now)
         where: list[str] = []
         params: list[object] = []
@@ -306,8 +309,11 @@ class DurableOperationsStore:
         limit, offset = self._page_values(limit, offset)
         if status is not None and status not in _ACTION_STATUSES:
             raise ValueError("unsupported action status")
-        if action_type is not None and not action_type:
-            raise ValueError("action_type must not be blank")
+        if action_type is not None:
+            if not isinstance(action_type, str):
+                raise TypeError("action_type must be a string")
+            if not action_type:
+                raise ValueError("action_type must not be blank")
         current_time = self._now(now)
         if minimum_age_seconds is not None:
             minimum_age_seconds = float(minimum_age_seconds)

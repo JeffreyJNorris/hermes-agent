@@ -18,6 +18,7 @@ from gateway.durable_requests import (
     DurableRequestTarget,
     DurableResponderMode,
 )
+from hermes_state_common import SCHEMA_SQL, SCHEMA_VERSION
 
 
 def _create_action(store: DurableRequestStore, reference: str, *, action_type="cron.resume"):
@@ -67,6 +68,8 @@ def _unknown_db(tmp_path: Path) -> tuple[Path, str, str]:
 
 def test_phase4c_database_upgrades_without_reconciliation_rows(tmp_path: Path) -> None:
     db_path, _, _ = _unknown_db(tmp_path)
+    with sqlite3.connect(db_path) as db:
+        db.execute("DROP TABLE durable_action_reconciliations")
 
     DurableOperationsStore(db_path)
     DurableOperationsStore(db_path)
@@ -76,6 +79,24 @@ def test_phase4c_database_upgrades_without_reconciliation_rows(tmp_path: Path) -
             "SELECT count(*) FROM durable_action_reconciliations"
         ).fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM durable_action_tickets").fetchone()[0] == 2
+
+
+def test_central_schema_contains_reconciliation_ledger_and_reopens_cleanly(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "central-state.db"
+    with sqlite3.connect(db_path) as db:
+        db.executescript(SCHEMA_SQL)
+
+    DurableOperationsStore(db_path)
+    DurableOperationsStore(db_path)
+
+    with sqlite3.connect(db_path) as db:
+        assert SCHEMA_VERSION >= 27
+        assert db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+            ("durable_action_reconciliations",),
+        ).fetchone() == ("durable_action_reconciliations",)
 
 
 @pytest.mark.parametrize(
@@ -188,6 +209,71 @@ def test_reconciliation_rejects_invalid_identity_and_note(
             operator_identity=identity,
             note=note,
         )
+
+
+def test_reconciliation_accepts_utf8_length_boundaries(tmp_path: Path) -> None:
+    db_path, request_id, _ = _unknown_db(tmp_path)
+
+    result = DurableOperationsStore(db_path).reconcile_action(
+        request_id,
+        outcome="abandoned",
+        operator_identity="☃" * 128,
+        note="é" * 1024,
+    )
+
+    assert result.code == "reconciled"
+
+
+def test_reconciliation_failure_before_insert_commit_rolls_back(tmp_path: Path) -> None:
+    db_path, request_id, _ = _unknown_db(tmp_path)
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            """CREATE TRIGGER reject_reconciliation
+               BEFORE INSERT ON durable_action_reconciliations
+               BEGIN SELECT RAISE(ABORT, 'test failure'); END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        DurableOperationsStore(db_path).reconcile_action(
+            request_id, outcome="abandoned", operator_identity="operator"
+        )
+
+    with sqlite3.connect(db_path) as db:
+        assert db.execute(
+            "SELECT count(*) FROM durable_action_reconciliations"
+        ).fetchone() == (0,)
+
+
+def test_reconciliation_commit_survives_caller_crash(tmp_path: Path, monkeypatch) -> None:
+    db_path, request_id, _ = _unknown_db(tmp_path)
+    ops = DurableOperationsStore(db_path)
+
+    class CommitThenRaise(sqlite3.Connection):
+        failed = False
+
+        def commit(self) -> None:
+            super().commit()
+            if not self.failed:
+                self.failed = True
+                raise RuntimeError("simulated caller crash")
+
+    connection = sqlite3.connect(db_path, factory=CommitThenRaise)
+    connection.row_factory = sqlite3.Row
+    monkeypatch.setattr(ops, "_write_connection", lambda: connection)
+
+    with pytest.raises(RuntimeError, match="caller crash"):
+        ops.reconcile_action(
+            request_id, outcome="abandoned", operator_identity="first"
+        )
+
+    retry = DurableOperationsStore(db_path).reconcile_action(
+        request_id, outcome="confirmed_applied", operator_identity="second"
+    )
+    assert retry.code == "already_reconciled"
+    with sqlite3.connect(db_path) as db:
+        assert db.execute(
+            "SELECT outcome, operator_identity FROM durable_action_reconciliations"
+        ).fetchone() == ("abandoned", "first")
 
 
 def test_concurrent_reconciliation_has_one_immutable_winner(tmp_path: Path) -> None:

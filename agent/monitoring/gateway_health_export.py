@@ -411,7 +411,9 @@ def _read_runtime_snapshot(config: Dict[str, Any]):
             "durable health snapshot unavailable; durable telemetry not exported (error_type=%s)",
             type(exc).__name__,
         )
-        logger.debug("durable health snapshot traceback", exc_info=True)
+        logger.debug(
+            "durable health snapshot failed (error_type=%s)", type(exc).__name__
+        )
     else:
         gateway_snapshot.metrics.extend(durable_snapshot.metrics)
     return gateway_snapshot

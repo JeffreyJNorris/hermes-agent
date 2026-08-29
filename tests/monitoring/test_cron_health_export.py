@@ -148,9 +148,13 @@ def test_durable_snapshot_failure_is_fail_open_and_redacted(monkeypatch, caplog)
         lambda: (_ for _ in ()).throw(RuntimeError("PHASE4D-CANARY secret")),
     )
 
-    assert gateway_health_export._read_runtime_snapshot({}) is snapshot
-    assert "RuntimeError" in caplog.text
-    assert "PHASE4D-CANARY" not in caplog.text
+    with caplog.at_level("DEBUG", logger="agent.monitoring.gateway_health_export"):
+        assert gateway_health_export._read_runtime_snapshot({}) is snapshot
+    records = repr(
+        [(record.msg, record.args, record.__dict__) for record in caplog.records]
+    )
+    assert "RuntimeError" in records
+    assert "PHASE4D-CANARY" not in records
 
 
 def test_monitoring_docs_distinguish_relay_health_scope_and_terminal_flush():

@@ -291,6 +291,41 @@ def test_json_reconcile_records_local_identity_without_handler(
         ).fetchone() == ("confirmed_not_applied", "local-user", "operator checked")
 
 
+def test_json_action_diagnostic_never_serializes_execution_material(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    request_id = _seed_unknown_home(tmp_path)
+    monkeypatch.setattr("hermes_cli.durable.get_hermes_home", lambda: tmp_path)
+    args = _parser().parse_args(
+        ["durable", "actions", "inspect", request_id, "--diagnose", "--json"]
+    )
+
+    assert durable_command(args) == EXIT_OK
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert payload["request_id"] == request_id
+    assert payload["diagnostic"]["code"] in {
+        "handler_unavailable",
+        "target_missing",
+    }
+    for canary in ("secret", "fingerprint", "idempotency", "payload_json"):
+        assert canary not in output
+
+
+def test_json_list_reports_corrupt_database_by_exception_class_only(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    (tmp_path / "state.db").write_bytes(b"PHASE4D-CANARY corrupt database")
+    monkeypatch.setattr("hermes_cli.durable.get_hermes_home", lambda: tmp_path)
+    args = _parser().parse_args(["durable", "requests", "list", "--json"])
+
+    assert durable_command(args) == 5
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+    assert payload == {"code": "database_unavailable", "error": "DatabaseError"}
+    assert "PHASE4D-CANARY" not in output
+
+
 def test_durable_doctor_json_uses_shared_health_result(
     tmp_path: Path, monkeypatch, capsys
 ) -> None:
