@@ -46,7 +46,26 @@ def build_durable_parser(subparsers, *, cmd_durable: Callable) -> None:
     _add_page_options(action_list, actions=True)
     action_inspect = action_commands.add_parser("inspect", help="Inspect an action")
     action_inspect.add_argument("request_id")
+    action_inspect.add_argument("--diagnose", action="store_true")
     action_inspect.add_argument("--json", action="store_true")
+    action_reconcile = action_commands.add_parser(
+        "reconcile", help="Record an operator conclusion for an UNKNOWN action"
+    )
+    action_reconcile.add_argument("request_id")
+    action_reconcile.add_argument(
+        "--outcome",
+        required=True,
+        choices=(
+            "confirmed_applied",
+            "confirmed_not_applied",
+            "abandoned",
+            "superseded",
+        ),
+    )
+    action_reconcile.add_argument("--note")
+    action_reconcile.add_argument("--superseded-by")
+    action_reconcile.add_argument("-y", "--yes", action="store_true")
+    action_reconcile.add_argument("--json", action="store_true")
 
     for parser in (
         durable,
@@ -57,6 +76,7 @@ def build_durable_parser(subparsers, *, cmd_durable: Callable) -> None:
         actions,
         action_list,
         action_inspect,
+        action_reconcile,
     ):
         parser.set_defaults(func=cmd_durable)
 

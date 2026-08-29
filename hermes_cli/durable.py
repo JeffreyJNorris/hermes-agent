@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import getpass
 import sqlite3
 import sys
 from dataclasses import asdict
@@ -66,11 +67,18 @@ def _emit_detail(detail, *, ledger: str, json_output: bool) -> None:
 
 
 def _result_exit(code: str) -> int:
-    if code == "cancelled":
+    if code in {"cancelled", "reconciled"}:
         return EXIT_OK
     if code == "not_found":
         return EXIT_NOT_FOUND
-    if code in {"already_terminal", "execution_in_progress", "concurrent_update"}:
+    if code in {
+        "already_terminal",
+        "already_reconciled",
+        "execution_in_progress",
+        "concurrent_update",
+        "invalid_state",
+        "invalid_superseding_receipt",
+    }:
         return EXIT_CONFLICT
     return EXIT_FAILURE
 
@@ -83,12 +91,13 @@ def durable_command(args) -> int:
         "list",
         "inspect",
         "cancel",
+        "reconcile",
     }:
         _emit({"code": "invalid_command"}, json_output=json_output, error=True)
         return EXIT_INVALID
 
-    store = DurableOperationsStore(get_hermes_home() / "state.db")
     try:
+        store = DurableOperationsStore(get_hermes_home() / "state.db")
         if action == "list":
             if group == "requests":
                 page = store.list_requests(
@@ -112,7 +121,9 @@ def durable_command(args) -> int:
             detail = (
                 store.get_request(args.request_id)
                 if group == "requests"
-                else store.get_action(args.request_id)
+                else store.inspect_action(
+                    args.request_id, diagnose=bool(getattr(args, "diagnose", False))
+                )
             )
             if detail is None:
                 _emit(
@@ -123,6 +134,41 @@ def durable_command(args) -> int:
                 return EXIT_NOT_FOUND
             _emit_detail(detail, ledger=group[:-1], json_output=json_output)
             return EXIT_OK
+
+        if action == "reconcile":
+            if group != "actions":
+                _emit({"code": "invalid_command"}, json_output=json_output, error=True)
+                return EXIT_INVALID
+            detail = store.get_action(args.request_id)
+            if detail is None:
+                _emit(
+                    {"code": "not_found", "request_id": args.request_id},
+                    json_output=json_output,
+                    error=True,
+                )
+                return EXIT_NOT_FOUND
+            if not args.yes:
+                if json_output or not sys.stdin.isatty():
+                    _emit(
+                        {"code": "confirmation_required", "request_id": args.request_id},
+                        json_output=json_output,
+                        error=True,
+                    )
+                    return EXIT_INVALID
+                print_header(f"Reconcile durable action {args.request_id}")
+                print_info(f"status: {detail.status}; outcome: {args.outcome}")
+                if not prompt_yes_no("Record this immutable conclusion?", default=False):
+                    print_warning("Confirmation required; no changes made.")
+                    return EXIT_INVALID
+            result = store.reconcile_action(
+                args.request_id,
+                outcome=args.outcome,
+                operator_identity=getpass.getuser(),
+                note=args.note,
+                superseded_by_request_id=args.superseded_by,
+            )
+            _emit(asdict(result), json_output=json_output, error=not result.ok)
+            return _result_exit(result.code)
 
         if group != "requests":
             _emit({"code": "invalid_command"}, json_output=json_output, error=True)

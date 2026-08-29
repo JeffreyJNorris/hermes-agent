@@ -286,8 +286,39 @@ DurableActionPreparer = Callable[..., PreparedDurableAction]
 DurableActionHandler = Callable[
     [DurableActionExecutionContext], DurableActionOutcome
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class DurableActionDiagnostic:
+    code: str
+    facts: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        token = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+        if token.fullmatch(self.code) is None:
+            raise ValueError("diagnostic code must be a bounded structural token")
+        if len(self.facts) > 16:
+            raise ValueError("diagnostic facts are too large")
+        for item in self.facts:
+            if (
+                type(item) is not tuple
+                or len(item) != 2
+                or any(
+                    type(value) is not str or token.fullmatch(value) is None
+                    for value in item
+                )
+            ):
+                raise ValueError("diagnostic facts must be bounded structural tokens")
+
+
+DurableActionDiagnosticHandler = Callable[
+    [DurableActionExecutionContext], DurableActionDiagnostic
+]
 _DURABLE_ACTION_HANDLERS: dict[
     tuple[str, int], tuple[DurableActionPreparer, DurableActionHandler]
+] = {}
+_DURABLE_ACTION_DIAGNOSTICS: dict[
+    tuple[str, int], DurableActionDiagnosticHandler
 ] = {}
 
 
@@ -297,22 +328,28 @@ def register_durable_action_handler(
     *,
     prepare: DurableActionPreparer,
     execute: DurableActionHandler,
+    diagnose_unknown: DurableActionDiagnosticHandler | None = None,
 ) -> None:
     _validate_action_identity(action_type, action_version)
     if not callable(prepare):
         raise TypeError("prepare must be callable")
     if not callable(execute):
         raise TypeError("execute must be callable")
+    if diagnose_unknown is not None and not callable(diagnose_unknown):
+        raise TypeError("diagnose_unknown must be callable or None")
     key = (action_type, action_version)
     if key in _DURABLE_ACTION_HANDLERS:
         raise ValueError(f"durable action handler {key!r} is already registered")
     _DURABLE_ACTION_HANDLERS[key] = (prepare, execute)
+    if diagnose_unknown is not None:
+        _DURABLE_ACTION_DIAGNOSTICS[key] = diagnose_unknown
 
 
 def _register_cron_resume_builtin(
     *,
     prepare: DurableActionPreparer,
     execute: DurableActionHandler,
+    diagnose_unknown: DurableActionDiagnosticHandler | None = None,
 ) -> None:
     """Register or refresh only Hermes' fixed cron.resume implementation."""
     expected = (
@@ -334,7 +371,25 @@ def _register_cron_resume_builtin(
         != expected
     ):
         raise ValueError(f"durable action handler {key!r} is already registered")
+    if diagnose_unknown is not None:
+        expected_diagnostic = ("cron.jobs", "diagnose_durable_cron_resume")
+        supplied_diagnostic = (
+            getattr(diagnose_unknown, "__module__", None),
+            getattr(diagnose_unknown, "__qualname__", None),
+        )
+        current_diagnostic = _DURABLE_ACTION_DIAGNOSTICS.get(key)
+        if supplied_diagnostic != expected_diagnostic or (
+            current_diagnostic is not None
+            and (
+                getattr(current_diagnostic, "__module__", None),
+                getattr(current_diagnostic, "__qualname__", None),
+            )
+            != expected_diagnostic
+        ):
+            raise ValueError(f"durable action diagnostic {key!r} is already registered")
     _DURABLE_ACTION_HANDLERS[key] = (prepare, execute)
+    if diagnose_unknown is not None:
+        _DURABLE_ACTION_DIAGNOSTICS[key] = diagnose_unknown
 
 
 def lookup_durable_action_preparer(
@@ -359,6 +414,17 @@ def lookup_durable_action_handler(
         return None
     registered = _DURABLE_ACTION_HANDLERS.get((action_type, action_version))
     return registered[1] if registered is not None else None
+
+
+def lookup_durable_action_diagnostic(
+    action_type: str,
+    action_version: int,
+) -> DurableActionDiagnosticHandler | None:
+    try:
+        _validate_action_identity(action_type, action_version)
+    except (TypeError, ValueError):
+        return None
+    return _DURABLE_ACTION_DIAGNOSTICS.get((action_type, action_version))
 
 
 class DurableActionStore:
@@ -745,6 +811,8 @@ class DurableActionStore:
 
 __all__ = [
     "DurableActionCreateResult",
+    "DurableActionDiagnostic",
+    "DurableActionDiagnosticHandler",
     "DurableActionClaim",
     "DurableActionNotificationStatus",
     "DurableActionNotificationClaim",
@@ -764,6 +832,7 @@ __all__ = [
     "encode_durable_action_payload",
     "encode_durable_action_result",
     "lookup_durable_action_handler",
+    "lookup_durable_action_diagnostic",
     "lookup_durable_action_preparer",
     "register_durable_action_handler",
 ]
@@ -776,4 +845,5 @@ from cron import jobs as _cron_jobs  # noqa: E402,F401
 _register_cron_resume_builtin(
     prepare=_cron_jobs.prepare_durable_cron_resume,
     execute=_cron_jobs.execute_durable_cron_resume,
+    diagnose_unknown=_cron_jobs.diagnose_durable_cron_resume,
 )

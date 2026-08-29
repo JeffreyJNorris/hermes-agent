@@ -13,7 +13,12 @@ from pathlib import Path
 from enum import Enum
 from typing import Generic, TypeVar
 
-from gateway.durable_actions import DurableActionStatus
+from gateway.durable_actions import (
+    DurableActionDiagnostic,
+    DurableActionExecutionContext,
+    DurableActionStatus,
+    lookup_durable_action_diagnostic,
+)
 from gateway.durable_requests import DurableRequestStatus, DurableWakeStatus
 from hermes_state_common import reconcile_durable_action_schema
 
@@ -84,6 +89,7 @@ class DurableActionDetail(DurableActionSummary):
     execution_started_at: float | None
     request_status: str
     delivery_state: str
+    diagnostic: DurableActionDiagnostic | None
 
 
 T = TypeVar("T")
@@ -318,10 +324,11 @@ class DurableOperationsStore:
             next_offset=offset + limit if len(rows) > limit else None,
         )
 
-    def get_action(
+    def inspect_action(
         self,
         request_id: str,
         *,
+        diagnose: bool = False,
         now: float | None = None,
     ) -> DurableActionDetail | None:
         current_time = self._now(now)
@@ -333,6 +340,8 @@ class DurableOperationsStore:
                           ticket.execution_started_at, ticket.completed_at,
                           ticket.notification_status, ticket.outcome_reason,
                           ticket.notification_reason,
+                          ticket.payload_json, ticket.fingerprint,
+                          ticket.idempotency_key,
                           request.status AS request_status,
                           request.delivery_claimed_at,
                           reconciliation.outcome AS effective_reconciliation
@@ -347,6 +356,34 @@ class DurableOperationsStore:
         if row is None:
             return None
         summary = self._action_summary(row, current_time)
+        diagnostic = None
+        if diagnose:
+            if row["status"] != DurableActionStatus.UNKNOWN.value:
+                diagnostic = DurableActionDiagnostic("not_unknown")
+            else:
+                handler = lookup_durable_action_diagnostic(
+                    row["action_type"], int(row["action_version"])
+                )
+                if handler is None:
+                    diagnostic = DurableActionDiagnostic("handler_unavailable")
+                else:
+                    try:
+                        context = DurableActionExecutionContext(
+                            request_id=row["request_id"],
+                            action_type=row["action_type"],
+                            action_version=int(row["action_version"]),
+                            payload_json=row["payload_json"],
+                            fingerprint=row["fingerprint"],
+                            idempotency_key=row["idempotency_key"],
+                        )
+                        diagnostic = handler(context)
+                        if not isinstance(diagnostic, DurableActionDiagnostic):
+                            raise TypeError("diagnostic returned an invalid result")
+                    except Exception as exc:
+                        diagnostic = DurableActionDiagnostic(
+                            "diagnostic_failed",
+                            (("exception", type(exc).__name__),),
+                        )
         return DurableActionDetail(
             **{field: getattr(summary, field) for field in summary.__slots__},
             outcome_reason=_structural_reason(row["outcome_reason"]),
@@ -354,7 +391,16 @@ class DurableOperationsStore:
             execution_started_at=_optional_float(row["execution_started_at"]),
             request_status=row["request_status"],
             delivery_state=_delivery_state(row),
+            diagnostic=diagnostic,
         )
+
+    def get_action(
+        self,
+        request_id: str,
+        *,
+        now: float | None = None,
+    ) -> DurableActionDetail | None:
+        return self.inspect_action(request_id, now=now)
 
     def cancel_request(
         self,

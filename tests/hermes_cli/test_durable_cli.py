@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 from pathlib import Path
 
 import pytest
 
+from gateway.durable_actions import PreparedDurableAction
 from gateway.durable_requests import (
     DurableRequestOption,
     DurableRequestSpec,
@@ -43,6 +45,45 @@ def _seed_home(tmp_path: Path) -> str:
         origin_type="session",
         origin_id="origin-secret",
     )
+    return result.request.request_id
+
+
+def _seed_unknown_home(tmp_path: Path) -> str:
+    store = DurableRequestStore(tmp_path / "state.db", wall_clock=lambda: 100.0)
+    result = store.create_with_action(
+        DurableRequestSpec(
+            kind="approval",
+            title="PHASE4D-CANARY title",
+            body="PHASE4D-CANARY body",
+            options=(DurableRequestOption("approve", "yes"), DurableRequestOption("reject", "no")),
+            ttl_seconds=1_000,
+            reference="unknown-cli",
+        ),
+        action=PreparedDurableAction(
+            action_type="cron.resume",
+            action_version=1,
+            payload_json='{"job_id":"secret"}',
+            fingerprint="secret-fingerprint",
+            idempotency_key="secret-key",
+        ),
+        target=DurableRequestTarget("discord", "secret-channel"),
+        responder_mode=DurableResponderMode.ANY_AUTHORIZED,
+        expected_actor_id=None,
+        origin_type="session",
+        origin_id="secret-origin",
+        origin_session_id="secret-session",
+    )
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        db.execute(
+            "UPDATE durable_requests SET status = 'selected', resolved_at = 100 "
+            "WHERE request_id = ?",
+            (result.request.request_id,),
+        )
+        db.execute(
+            "UPDATE durable_action_tickets SET status = 'unknown', completed_at = 100, "
+            "notification_status = 'delivered' WHERE request_id = ?",
+            (result.request.request_id,),
+        )
     return result.request.request_id
 
 
@@ -189,3 +230,62 @@ def test_operator_command_is_absent_from_model_and_slash_surfaces() -> None:
     assert "durable" not in {command.name for command in COMMAND_REGISTRY}
     assert "durable" not in {name for name, _ in telegram_bot_commands()}
     assert "durable" not in slack_subcommand_map()
+
+
+def test_json_reconcile_requires_yes_without_prompt(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    request_id = _seed_unknown_home(tmp_path)
+    monkeypatch.setattr("hermes_cli.durable.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "builtins.input", lambda _: pytest.fail("must not prompt")
+    )
+    args = _parser().parse_args(
+        [
+            "durable",
+            "actions",
+            "reconcile",
+            request_id,
+            "--outcome",
+            "abandoned",
+            "--json",
+        ]
+    )
+
+    assert durable_command(args) == EXIT_INVALID
+    assert json.loads(capsys.readouterr().out)["code"] == "confirmation_required"
+
+
+def test_json_reconcile_records_local_identity_without_handler(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    request_id = _seed_unknown_home(tmp_path)
+    monkeypatch.setattr("hermes_cli.durable.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("hermes_cli.durable.getpass.getuser", lambda: "local-user")
+    monkeypatch.setattr(
+        "gateway.durable_actions.lookup_durable_action_handler",
+        lambda *_: pytest.fail("reconciliation must not look up a handler"),
+    )
+    args = _parser().parse_args(
+        [
+            "durable",
+            "actions",
+            "reconcile",
+            request_id,
+            "--outcome",
+            "confirmed_not_applied",
+            "--note",
+            "operator checked",
+            "--yes",
+            "--json",
+        ]
+    )
+
+    assert durable_command(args) == EXIT_OK
+    output = capsys.readouterr().out
+    assert json.loads(output)["code"] == "reconciled"
+    assert "PHASE4D-CANARY" not in output
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        assert db.execute(
+            "SELECT outcome, operator_identity, note FROM durable_action_reconciliations"
+        ).fetchone() == ("confirmed_not_applied", "local-user", "operator checked")

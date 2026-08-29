@@ -1019,7 +1019,7 @@ def get_ticker_last_error() -> Optional[str]:
 # Job CRUD Operations
 # =============================================================================
 
-def load_jobs() -> List[Dict[str, Any]]:
+def load_jobs(*, repair: bool = True) -> List[Dict[str, Any]]:
     """Load all jobs from storage."""
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
@@ -1053,7 +1053,7 @@ def load_jobs() -> List[Dict[str, Any]]:
     # down the whole cron subsystem.
     if isinstance(data, dict):
         jobs = data.get("jobs", [])
-        if _strict_retry and jobs:
+        if repair and _strict_retry and jobs:
             # Hit control-character corruption — rewrite with proper escaping.
             save_jobs(jobs)
             logger.warning("Auto-repaired jobs.json (had invalid control characters)")
@@ -1061,7 +1061,7 @@ def load_jobs() -> List[Dict[str, Any]]:
     if isinstance(data, list):
         # Bare array — likely saved/edited outside save_jobs(). Wrap it back
         # into the expected {"jobs": [...]} structure.
-        if data:
+        if repair and data:
             save_jobs(data)
             logger.warning("Auto-repaired jobs.json (bare list wrapped as dict)")
         return data
@@ -1929,6 +1929,64 @@ def execute_durable_cron_resume(context):
         except Exception:
             pass
     return outcome
+
+
+def diagnose_durable_cron_resume(context):
+    """Inspect an UNKNOWN cron resume without changing cron state."""
+    from gateway.durable_actions import (
+        DurableActionDiagnostic,
+        decode_durable_action_payload,
+    )
+
+    try:
+        payload = decode_durable_action_payload(context.payload_json)
+    except (TypeError, ValueError):
+        return DurableActionDiagnostic("invalid_payload")
+    if (
+        context.action_type != "cron.resume"
+        or context.action_version != 1
+        or not isinstance(payload, dict)
+        or set(payload) != {"job_id"}
+        or not isinstance(payload["job_id"], str)
+        or not payload["job_id"].strip()
+    ):
+        return DurableActionDiagnostic("invalid_payload")
+    with _jobs_lock():
+        records = load_jobs(repair=False)
+        job = next((row for row in records if row.get("id") == payload["job_id"]), None)
+        if job is None:
+            return DurableActionDiagnostic(
+                "target_missing", (("target_exists", "false"),)
+            )
+        if not _valid_durable_resume_definition(job):
+            return DurableActionDiagnostic(
+                "state_invalid",
+                (("target_exists", "true"), ("target_state", "invalid")),
+            )
+        try:
+            matches = cron_job_definition_fingerprint(job) == context.fingerprint
+        except (TypeError, ValueError, OverflowError):
+            return DurableActionDiagnostic("state_invalid")
+        state = (
+            "paused"
+            if job.get("enabled") is False and job.get("state") == "paused"
+            else "enabled"
+            if job.get("enabled") is True and job.get("state") == "scheduled"
+            else "other"
+        )
+        facts = (
+            ("target_exists", "true"),
+            ("target_state", state),
+            ("fingerprint", "matches" if matches else "differs"),
+            ("execution_evidence", "present"),
+        )
+        if not matches:
+            return DurableActionDiagnostic("state_differs", facts)
+        if state == "paused":
+            return DurableActionDiagnostic("state_matches", facts)
+        if state == "enabled":
+            return DurableActionDiagnostic("state_applied", facts)
+        return DurableActionDiagnostic("state_invalid", facts)
 
 
 def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -3037,4 +3095,5 @@ from gateway.durable_actions import _register_cron_resume_builtin
 _register_cron_resume_builtin(
     prepare=prepare_durable_cron_resume,
     execute=execute_durable_cron_resume,
+    diagnose_unknown=diagnose_durable_cron_resume,
 )
