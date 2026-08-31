@@ -6,12 +6,18 @@ from pathlib import Path
 from agent.monitoring.durable_health import build_durable_health_snapshot
 from gateway.durable_actions import PreparedDurableAction
 from gateway.durable_operations import DurableOperationsStore
+from gateway.durable_operations import (
+    _DURABLE_EVENT_COUNTS,
+    record_durable_command_response,
+    record_durable_delivery_event,
+)
 from gateway.durable_requests import (
     DurableRequestOption,
     DurableRequestSpec,
     DurableRequestStore,
     DurableRequestTarget,
     DurableResponderMode,
+    DurableResolveStatus,
 )
 
 
@@ -125,6 +131,49 @@ def test_snapshot_contains_no_high_cardinality_or_content_labels(tmp_path: Path)
         "idempotency-",
     ):
         assert canary not in rendered
+
+
+def test_snapshot_contains_bounded_command_and_delivery_counters(tmp_path: Path) -> None:
+    _DURABLE_EVENT_COUNTS.clear()
+    record_durable_command_response(DurableResolveStatus.RESOLVED)
+    record_durable_command_response(DurableResolveStatus.WRONG_CHANNEL)
+    record_durable_delivery_event("native_to_text_fallback")
+    record_durable_delivery_event("text_delivery_failed")
+    record_durable_delivery_event("text_delivery_unknown")
+
+    snapshot = build_durable_health_snapshot(db_path=seeded_db(tmp_path), now=500.0)
+
+    assert _values(snapshot, "hermes_durable_command_responses") == [
+        (1, {"result": "resolved"}),
+        (1, {"result": "wrong_channel"}),
+    ]
+    assert _values(snapshot, "hermes_durable_delivery_events") == [
+        (1, {"event": "native_to_text_fallback"}),
+        (1, {"event": "text_delivery_failed"}),
+        (1, {"event": "text_delivery_unknown"}),
+    ]
+    rendered = repr(snapshot.metrics)
+    for secret in ("drq_", "actor-", "channel-", "PHASE4D-CANARY"):
+        assert secret not in rendered
+    _DURABLE_EVENT_COUNTS.clear()
+
+
+def test_snapshot_reports_text_command_delivery_backlog_without_receipts(
+    tmp_path: Path,
+) -> None:
+    db_path = seeded_db(tmp_path)
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "UPDATE durable_requests SET delivery_mode = 'text_command' "
+            "WHERE status = 'pending_delivery'"
+        )
+
+    snapshot = build_durable_health_snapshot(db_path=db_path, now=500.0)
+
+    assert (400.0, {"queue_type": "text_command_delivery"}) in _values(
+        snapshot, "hermes_durable_oldest_backlog_seconds"
+    )
+    assert "drq_" not in repr(snapshot.metrics)
 
 
 def test_snapshot_normalizes_malformed_enum_labels(tmp_path: Path) -> None:

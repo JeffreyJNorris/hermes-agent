@@ -476,6 +476,8 @@ def _start_metric_provider(config: Dict[str, Any], sdk: Dict[str, Any]) -> Any:
         "hermes_durable_unknown_actions",
         "hermes_durable_reconciliations",
         "hermes_durable_oldest_backlog_seconds",
+        "hermes_durable_command_responses",
+        "hermes_durable_delivery_events",
     ]
 
     def callback(name: str):

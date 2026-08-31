@@ -45,12 +45,17 @@ def test_request_command_is_gateway_only_and_dispatches_while_busy():
 @pytest.mark.asyncio
 async def test_valid_request_response_uses_actual_scope(monkeypatch):
     observed = {}
+    recorded = []
 
     def resolve(**kwargs):
         observed.update(kwargs)
         return SimpleNamespace(status=DurableResolveStatus.RESOLVED)
 
     monkeypatch.setattr("gateway.durable_requests.resolve_durable_request_command", resolve)
+    monkeypatch.setattr(
+        "gateway.durable_operations.record_durable_command_response",
+        recorded.append,
+    )
 
     result = await _runner()._handle_request_command(
         _event(f"/request respond {REQUEST_ID} 2", thread_id="thread-9")
@@ -64,6 +69,7 @@ async def test_valid_request_response_uses_actual_scope(monkeypatch):
         "channel_id": "thread-9",
         "actor_id": "actor-1",
     }
+    assert recorded == [DurableResolveStatus.RESOLVED]
 
 
 @pytest.mark.asyncio

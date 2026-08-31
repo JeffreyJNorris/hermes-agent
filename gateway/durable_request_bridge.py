@@ -332,6 +332,9 @@ class DurableRequestBridge:
                 )
                 if text_request is None:
                     continue
+                from gateway.durable_operations import record_durable_delivery_event
+
+                record_durable_delivery_event("native_to_text_fallback")
                 keep_processing = await self._deliver_text_request(
                     store=store,
                     adapter=adapter,
@@ -383,12 +386,16 @@ class DurableRequestBridge:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            store.fail_delivery(
+            terminal = store.fail_delivery(
                 request_id=request.request_id,
                 claim_id=claim_id,
                 status=DurableRequestStatus.DELIVERY_UNKNOWN,
                 reason="provider_text_send_outcome_unknown",
             )
+            if terminal is not None:
+                from gateway.durable_operations import record_durable_delivery_event
+
+                record_durable_delivery_event("text_delivery_unknown")
             logger.warning(
                 "Durable request text delivery raised",
                 extra={
@@ -401,12 +408,16 @@ class DurableRequestBridge:
 
         if result.success:
             if not result.message_id:
-                store.fail_delivery(
+                terminal = store.fail_delivery(
                     request_id=request.request_id,
                     claim_id=claim_id,
                     status=DurableRequestStatus.DELIVERY_UNKNOWN,
                     reason="missing_text_message_id",
                 )
+                if terminal is not None:
+                    from gateway.durable_operations import record_durable_delivery_event
+
+                    record_durable_delivery_event("text_delivery_unknown")
                 return True
             store.bind_delivery(
                 request_id=request.request_id,
@@ -431,12 +442,23 @@ class DurableRequestBridge:
         else:
             status = DurableRequestStatus.DELIVERY_FAILED
             reason = f"provider_text_delivery_{result.error_kind or 'failed'}"
-        store.fail_delivery(
+        terminal = store.fail_delivery(
             request_id=request.request_id,
             claim_id=claim_id,
             status=status,
             reason=reason,
         )
+        if terminal is not None and status in {
+            DurableRequestStatus.DELIVERY_FAILED,
+            DurableRequestStatus.DELIVERY_UNKNOWN,
+        }:
+            from gateway.durable_operations import record_durable_delivery_event
+
+            record_durable_delivery_event(
+                "text_delivery_unknown"
+                if status is DurableRequestStatus.DELIVERY_UNKNOWN
+                else "text_delivery_failed"
+            )
         return True
 
 

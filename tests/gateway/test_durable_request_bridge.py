@@ -107,7 +107,12 @@ def _create(
 @pytest.mark.asyncio
 async def test_native_unsupported_falls_back_to_text_once(
     store: DurableRequestStore,
+    monkeypatch,
 ) -> None:
+    events = []
+    monkeypatch.setattr(
+        "gateway.durable_operations.record_durable_delivery_event", events.append
+    )
     request = _create(
         store,
         command_response_allowed=True,
@@ -128,6 +133,7 @@ async def test_native_unsupported_falls_back_to_text_once(
     assert persisted.message_id == "text-7"
     assert len(adapter.sent) == 1
     assert len(adapter.text_sent) == 1
+    assert events == ["native_to_text_fallback"]
 
 
 @pytest.mark.asyncio
@@ -169,7 +175,12 @@ async def test_ambiguous_native_failure_never_sends_text_fallback(
 @pytest.mark.asyncio
 async def test_ambiguous_text_delivery_is_not_retried_after_restart(
     store: DurableRequestStore,
+    monkeypatch,
 ) -> None:
+    events = []
+    monkeypatch.setattr(
+        "gateway.durable_operations.record_durable_delivery_event", events.append
+    )
     request = _create(
         store,
         command_response_allowed=True,
@@ -186,6 +197,32 @@ async def test_ambiguous_text_delivery_is_not_retried_after_restart(
     persisted = store.get(request_id=request.request_id)
     assert persisted.status is DurableRequestStatus.DELIVERY_UNKNOWN
     assert len(adapter.text_sent) == 1
+    assert events == ["native_to_text_fallback", "text_delivery_unknown"]
+
+
+@pytest.mark.asyncio
+async def test_definite_text_delivery_failure_is_counted_once(
+    store: DurableRequestStore,
+    monkeypatch,
+) -> None:
+    events = []
+    monkeypatch.setattr(
+        "gateway.durable_operations.record_durable_delivery_event", events.append
+    )
+    _create(
+        store,
+        command_response_allowed=True,
+        text_command_fallback_allowed=True,
+    )
+    adapter = Adapter(
+        send_result=SendResult(success=False, error_kind="unsupported"),
+        text_result=SendResult(success=False, error_kind="forbidden"),
+    )
+
+    await DurableRequestBridge().process_once({"discord": adapter})
+    await DurableRequestBridge().process_once({"discord": adapter})
+
+    assert events == ["native_to_text_fallback", "text_delivery_failed"]
 
 
 @pytest.mark.asyncio

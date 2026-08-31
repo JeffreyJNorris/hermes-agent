@@ -142,6 +142,9 @@ class GatewaySlashCommandsMixin:
             channel_id=str(source.thread_id or source.chat_id),
             actor_id=source.user_id,
         )
+        from gateway.durable_operations import record_durable_command_response
+
+        record_durable_command_response(result.status)
         messages = {
             DurableResolveStatus.RESOLVED: "Response recorded.",
             DurableResolveStatus.ALREADY_RESOLVED: "This request has already been answered.",

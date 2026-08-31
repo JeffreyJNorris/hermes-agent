@@ -121,6 +121,7 @@ def test_registered_observable_metric_names_cover_snapshot_metrics(monkeypatch):
         _M("hermes_durable_notifications"), _M("hermes_durable_stale_claims"),
         _M("hermes_durable_unknown_actions"), _M("hermes_durable_reconciliations"),
         _M("hermes_durable_oldest_backlog_seconds"),
+        _M("hermes_durable_command_responses"), _M("hermes_durable_delivery_events"),
     ]})()
     monkeypatch.setattr(gateway_health_export, "_read_gateway_snapshot", lambda config: gateway_snapshot)
     monkeypatch.setattr(gateway_health_export, "_read_cron_snapshot", lambda: cron_snapshot)

@@ -10,7 +10,9 @@ import pytest
 from gateway.durable_actions import DurableActionStatus, DurableActionStore, PreparedDurableAction
 from gateway.durable_operations import DurableOperationsStore
 from gateway.durable_requests import (
+    DurableRequestDeliveryMode,
     DurableRequestOption,
+    DurableRequestResolutionSource,
     DurableRequestSpec,
     DurableRequestStore,
     DurableRequestTarget,
@@ -115,6 +117,30 @@ def test_request_list_is_bounded_stable_and_redacted(tmp_path: Path) -> None:
         assert not hasattr(page.items[0], name)
     with pytest.raises(FrozenInstanceError):
         page.items[0].status = "cancelled"  # type: ignore[misc]
+
+
+def test_request_projection_exposes_only_structural_command_fields(tmp_path: Path) -> None:
+    store = seeded_operations_store(tmp_path)
+    with sqlite3.connect(tmp_path / "state.db") as db:
+        db.execute(
+            "UPDATE durable_requests SET delivery_mode = ?, resolution_source = ? "
+            "WHERE request_id = 'drq_newer'",
+            (
+                DurableRequestDeliveryMode.TEXT_COMMAND.value,
+                DurableRequestResolutionSource.COMMAND.value,
+            ),
+        )
+
+    summary = store.list_requests(limit=1, now=500.0).items[0]
+    detail = store.get_request("drq_newer", now=500.0)
+
+    assert summary.delivery_mode == "text_command"
+    assert summary.resolution_source == "command"
+    assert detail is not None
+    assert detail.delivery_mode == "text_command"
+    assert detail.resolution_source == "command"
+    for name in ("chat_id", "thread_id", "message_id", "expected_actor_id"):
+        assert not hasattr(detail, name)
 
 
 def test_request_list_filters_and_equal_timestamps_are_stable(tmp_path: Path) -> None:

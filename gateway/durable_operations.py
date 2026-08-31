@@ -7,10 +7,12 @@ import re
 import secrets
 import sqlite3
 import time
+from collections import Counter
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from enum import Enum
+from threading import Lock
 from typing import Generic, TypeVar
 
 from gateway.durable_actions import (
@@ -21,7 +23,11 @@ from gateway.durable_actions import (
     lookup_durable_action_diagnostic,
     lookup_durable_action_handler,
 )
-from gateway.durable_requests import DurableRequestStatus, DurableWakeStatus
+from gateway.durable_requests import (
+    DurableRequestStatus,
+    DurableResolveStatus,
+    DurableWakeStatus,
+)
 from hermes_state_common import reconcile_durable_action_schema
 
 
@@ -41,6 +47,11 @@ _ACTIONABLE_STATUSES = frozenset(
 _NOTIFICATION_STATUSES = frozenset(
     status.value for status in DurableActionNotificationStatus
 )
+_DELIVERY_EVENTS = frozenset(
+    {"native_to_text_fallback", "text_delivery_failed", "text_delivery_unknown"}
+)
+_DURABLE_EVENT_COUNTS: Counter[tuple[str, str]] = Counter()
+_DURABLE_EVENT_LOCK = Lock()
 _ACTION_AGE_SQL = """CASE
     WHEN ticket.status IN ('claimed','executing')
         THEN COALESCE(ticket.execution_claimed_at, ticket.updated_at, ticket.created_at)
@@ -72,6 +83,8 @@ class DurableRequestSummary:
     origin_type: str
     platform: str
     delivery_state: str
+    delivery_mode: str
+    resolution_source: str | None
     wake_status: str
     created_at: float
     expires_at: float
@@ -141,6 +154,20 @@ class DurableHealthResult:
     severity: str
     code: str
     counts: tuple[tuple[str, int], ...]
+
+
+def record_durable_command_response(status: DurableResolveStatus) -> None:
+    if not isinstance(status, DurableResolveStatus):
+        return
+    with _DURABLE_EVENT_LOCK:
+        _DURABLE_EVENT_COUNTS[("command_response", status.value)] += 1
+
+
+def record_durable_delivery_event(event: str) -> None:
+    if event not in _DELIVERY_EVENTS:
+        return
+    with _DURABLE_EVENT_LOCK:
+        _DURABLE_EVENT_COUNTS[("delivery", event)] += 1
 
 
 def _optional_float(value: object) -> float | None:
@@ -267,6 +294,7 @@ class DurableOperationsStore:
                 f"""SELECT request.request_id, request.kind,
                            request.status AS request_status, request.origin_type,
                            request.platform, request.delivery_claimed_at,
+                           request.delivery_mode, request.resolution_source,
                            request.wake_status, request.created_at,
                            request.expires_at, request.resolved_at
                     FROM durable_requests AS request
@@ -293,6 +321,7 @@ class DurableOperationsStore:
                 """SELECT request.request_id, request.kind,
                           request.status AS request_status, request.origin_type,
                           request.platform, request.delivery_claimed_at,
+                          request.delivery_mode, request.resolution_source,
                           request.wake_status, request.created_at,
                           request.expires_at, request.resolved_at,
                           request.terminal_reason, request.delivery_attempts,
@@ -847,6 +876,11 @@ class DurableOperationsStore:
                     "SELECT MIN(created_at) FROM durable_requests WHERE status = 'pending_delivery'",
                 ),
                 (
+                    "text_command_delivery",
+                    "SELECT MIN(created_at) FROM durable_requests "
+                    "WHERE status = 'pending_delivery' AND delivery_mode = 'text_command'",
+                ),
+                (
                     "wake",
                     "SELECT MIN(COALESCE(wake_claimed_at, resolved_at, updated_at)) "
                     "FROM durable_requests WHERE wake_status IN ('pending','claimed')",
@@ -877,6 +911,13 @@ class DurableOperationsStore:
                         _age(current_time, timestamp),
                         queue_type=queue_type,
                     )
+        with _DURABLE_EVENT_LOCK:
+            event_counts = tuple(_DURABLE_EVENT_COUNTS.items())
+        for (event_type, value), count in event_counts:
+            if event_type == "command_response":
+                add("hermes_durable_command_responses", count, result=value)
+            else:
+                add("hermes_durable_delivery_events", count, event=value)
         return tuple(metrics.values())
 
     def check_health(
@@ -964,6 +1005,12 @@ class DurableOperationsStore:
                         "WHERE status = 'pending_delivery' AND created_at <= ?",
                         (backlog_cutoff,),
                     ),
+                    "pending_text_command_requests": (
+                        "SELECT COUNT(*) FROM durable_requests "
+                        "WHERE status = 'pending_delivery' AND delivery_mode = 'text_command' "
+                        "AND created_at <= ?",
+                        (backlog_cutoff,),
+                    ),
                     "ready_actions": (
                         "SELECT COUNT(*) FROM durable_action_tickets "
                         "WHERE status = 'ready' AND updated_at <= ?",
@@ -1047,6 +1094,7 @@ class DurableOperationsStore:
 
         backlog_keys = {
             "pending_requests",
+            "pending_text_command_requests",
             "ready_actions",
             "pending_notifications",
             "stale_delivery_claims",
@@ -1258,6 +1306,8 @@ class DurableOperationsStore:
             origin_type=row["origin_type"],
             platform=row["platform"],
             delivery_state=_delivery_state(row),
+            delivery_mode=row["delivery_mode"],
+            resolution_source=row["resolution_source"],
             wake_status=row["wake_status"] or DurableWakeStatus.NOT_REQUESTED.value,
             created_at=float(row["created_at"]),
             expires_at=float(row["expires_at"]),
