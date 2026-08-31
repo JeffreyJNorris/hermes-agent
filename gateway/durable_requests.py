@@ -215,6 +215,7 @@ class DurableRequest:
     wake_reason: str | None = None
     delivery_mode: DurableRequestDeliveryMode = DurableRequestDeliveryMode.NATIVE
     command_response_allowed: bool = False
+    text_command_fallback_allowed: bool = False
     resolution_source: DurableRequestResolutionSource | None = None
 
     @property
@@ -247,6 +248,7 @@ class _ValidatedCreate:
     origin_id: str
     delivery_mode: DurableRequestDeliveryMode
     command_response_allowed: bool
+    text_command_fallback_allowed: bool
     wake_on_terminal: bool
     origin_session_id: str | None
     origin_ui_session_id: str | None
@@ -626,6 +628,7 @@ class DurableRequestStore:
         origin_type: str,
         origin_id: str,
         command_response_allowed: bool = False,
+        text_command_fallback_allowed: bool = False,
         wake_on_terminal: bool = False,
         origin_session_id: str | None = None,
         origin_ui_session_id: str | None = None,
@@ -643,6 +646,7 @@ class DurableRequestStore:
             origin_type=origin_type,
             origin_id=origin_id,
             command_response_allowed=command_response_allowed,
+            text_command_fallback_allowed=text_command_fallback_allowed,
             wake_on_terminal=wake_on_terminal,
             origin_session_id=origin_session_id,
             origin_ui_session_id=origin_ui_session_id,
@@ -692,6 +696,7 @@ class DurableRequestStore:
         origin_type: str,
         origin_id: str,
         command_response_allowed: bool = False,
+        text_command_fallback_allowed: bool = False,
         origin_session_id: str | None = None,
         origin_ui_session_id: str | None = None,
         origin_profile: str | None = None,
@@ -710,6 +715,7 @@ class DurableRequestStore:
             origin_type=origin_type,
             origin_id=origin_id,
             command_response_allowed=command_response_allowed,
+            text_command_fallback_allowed=text_command_fallback_allowed,
             wake_on_terminal=False,
             origin_session_id=origin_session_id,
             origin_ui_session_id=origin_ui_session_id,
@@ -830,6 +836,7 @@ class DurableRequestStore:
         origin_type: str,
         origin_id: str,
         command_response_allowed: bool,
+        text_command_fallback_allowed: bool,
         wake_on_terminal: bool,
         origin_session_id: str | None,
         origin_ui_session_id: str | None,
@@ -869,6 +876,10 @@ class DurableRequestStore:
             raise DurableRequestError("wake_on_terminal must be a boolean")
         if not isinstance(command_response_allowed, bool):
             raise DurableRequestError("command_response_allowed must be a boolean")
+        if not isinstance(text_command_fallback_allowed, bool):
+            raise DurableRequestError(
+                "text_command_fallback_allowed must be a boolean"
+            )
         origin_session_value = _normalize_optional_text(
             origin_session_id,
             field="origin_session_id",
@@ -910,6 +921,7 @@ class DurableRequestStore:
             origin_id=origin_id_value,
             delivery_mode=DurableRequestDeliveryMode.NATIVE,
             command_response_allowed=command_response_allowed,
+            text_command_fallback_allowed=text_command_fallback_allowed,
             wake_on_terminal=wake_on_terminal,
             origin_session_id=origin_session_value,
             origin_ui_session_id=origin_ui_session_value,
@@ -970,10 +982,11 @@ class DurableRequestStore:
                    responder_mode, expected_actor_id,
                    origin_type, origin_id, reference,
                    delivery_mode, command_response_allowed,
+                   text_command_fallback_allowed,
                    wake_requested, wake_status,
                    origin_session_id, origin_ui_session_id, origin_profile,
                    delivery_attempts, wake_attempts
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)""",
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)""",
             (
                 request_id,
                 values.spec.kind,
@@ -994,6 +1007,7 @@ class DurableRequestStore:
                 values.spec.reference,
                 values.delivery_mode.value,
                 1 if values.command_response_allowed else 0,
+                1 if values.text_command_fallback_allowed else 0,
                 1 if values.wake_on_terminal else 0,
                 DurableWakeStatus.NOT_REQUESTED.value,
                 values.origin_session_id,
@@ -1278,12 +1292,13 @@ class DurableRequestStore:
                 row["status"] != DurableRequestStatus.PENDING_DELIVERY.value
                 or row["delivery_claim"] != claim
                 or row["delivery_mode"] != DurableRequestDeliveryMode.NATIVE.value
-                or not bool(row["command_response_allowed"])
+                or not bool(row["text_command_fallback_allowed"])
             ):
                 return None
             conn.execute(
                 """UPDATE durable_requests
-                   SET delivery_mode = ?, updated_at = ?
+                   SET delivery_mode = ?, command_response_allowed = 1,
+                       updated_at = ?
                    WHERE request_id = ? AND status = ?
                      AND delivery_claim = ?""",
                 (
@@ -2387,6 +2402,9 @@ class DurableRequestStore:
             reference=row["reference"],
             delivery_mode=DurableRequestDeliveryMode(row["delivery_mode"]),
             command_response_allowed=bool(row["command_response_allowed"]),
+            text_command_fallback_allowed=bool(
+                row["text_command_fallback_allowed"]
+            ),
             resolution_source=(
                 None
                 if row["resolution_source"] is None
@@ -2493,6 +2511,7 @@ CREATE TABLE IF NOT EXISTS durable_requests (
     reference TEXT,
     delivery_mode TEXT NOT NULL DEFAULT 'native',
     command_response_allowed INTEGER NOT NULL DEFAULT 0,
+    text_command_fallback_allowed INTEGER NOT NULL DEFAULT 0,
     resolution_source TEXT,
     selected_option_id TEXT,
     resolved_by_actor_id TEXT,
@@ -2528,6 +2547,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_requests_origin_reference
 _DURABLE_COLUMN_DDL = {
     "delivery_mode": "TEXT NOT NULL DEFAULT 'native'",
     "command_response_allowed": "INTEGER NOT NULL DEFAULT 0",
+    "text_command_fallback_allowed": "INTEGER NOT NULL DEFAULT 0",
     "resolution_source": "TEXT",
     "wake_requested": "INTEGER NOT NULL DEFAULT 0",
     "wake_status": "TEXT NOT NULL DEFAULT 'not_requested'",
@@ -2705,6 +2725,7 @@ def create_durable_request(
     origin_type: str,
     origin_id: str,
     command_response_allowed: bool = False,
+    text_command_fallback_allowed: bool = False,
     wake_on_terminal: bool = False,
     origin_session_id: str | None = None,
     origin_ui_session_id: str | None = None,
@@ -2722,6 +2743,7 @@ def create_durable_request(
         origin_type=origin_type,
         origin_id=origin_id,
         command_response_allowed=command_response_allowed,
+        text_command_fallback_allowed=text_command_fallback_allowed,
         wake_on_terminal=wake_on_terminal,
         origin_session_id=origin_session_id,
         origin_ui_session_id=origin_ui_session_id,

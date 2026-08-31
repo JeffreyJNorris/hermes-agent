@@ -82,7 +82,6 @@ class DurableRequestBridge:
             await self._deliver_pending_requests(
                 store=store,
                 adapters_by_platform=adapters_by_platform,
-                allow_text_delivery_fallback=config.allow_text_delivery_fallback,
             )
         if self._wake_handler is not None:
             await self._deliver_terminal_wakes(
@@ -228,7 +227,6 @@ class DurableRequestBridge:
         *,
         store,
         adapters_by_platform: Mapping[str, Any],
-        allow_text_delivery_fallback: bool,
     ) -> None:
         for _ in range(MAX_DELIVERY_BATCH):
             claim = store.claim_next_pending(adapters_by_platform)
@@ -326,8 +324,7 @@ class DurableRequestBridge:
                 return
             if (
                 result.error_kind == "unsupported"
-                and allow_text_delivery_fallback
-                and request.command_response_allowed
+                and request.text_command_fallback_allowed
             ):
                 text_request = store.switch_claim_to_text_command(
                     request_id=request.request_id,

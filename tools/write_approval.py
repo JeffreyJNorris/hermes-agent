@@ -566,6 +566,14 @@ def create_memory_durable_approval(record: Dict[str, Any]) -> Dict[str, Any]:
             expected_actor_id=origin.expected_actor_id,
             origin_type=origin.origin_type,
             origin_id=origin.origin_id,
+            command_response_allowed=(
+                request_config.command_responses_enabled
+                and request_config.allow_on_native_delivery
+            ),
+            text_command_fallback_allowed=(
+                request_config.command_responses_enabled
+                and request_config.allow_text_delivery_fallback
+            ),
             origin_session_id=origin.origin_session_id,
             origin_ui_session_id=origin.origin_ui_session_id,
             origin_profile=origin.origin_profile,
@@ -1545,6 +1553,10 @@ def create_skill_durable_approval(record: Dict[str, Any]) -> Dict[str, Any]:
             ), action=prepared, target=request_config.target,
             responder_mode=origin.responder_mode, expected_actor_id=origin.expected_actor_id,
             origin_type=origin.origin_type, origin_id=origin.origin_id,
+            command_response_allowed=(request_config.command_responses_enabled
+                                      and request_config.allow_on_native_delivery),
+            text_command_fallback_allowed=(request_config.command_responses_enabled
+                                           and request_config.allow_text_delivery_fallback),
             origin_session_id=origin.origin_session_id, origin_ui_session_id=origin.origin_ui_session_id,
             origin_profile=origin.origin_profile, maximum_ttl_seconds=request_config.max_ttl_seconds,
             terminal_retention_seconds=request_config.terminal_retention_seconds,

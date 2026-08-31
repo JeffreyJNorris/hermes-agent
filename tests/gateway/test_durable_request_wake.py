@@ -546,6 +546,7 @@ def test_existing_phase4a_database_is_reconciled_in_place(tmp_path: Path) -> Non
         "origin_profile",
         "delivery_mode",
         "command_response_allowed",
+        "text_command_fallback_allowed",
         "resolution_source",
     }.issubset(columns)
     assert "idx_durable_requests_wake" in indexes
@@ -558,6 +559,7 @@ def test_existing_phase4a_database_is_reconciled_in_place(tmp_path: Path) -> Non
         migrated.delivery_mode is durable_requests.DurableRequestDeliveryMode.NATIVE
     )
     assert migrated.command_response_allowed is False
+    assert migrated.text_command_fallback_allowed is False
     assert migrated.resolution_source is None
 
 
@@ -621,5 +623,6 @@ def test_central_state_schema_reconciles_phase4a_database(tmp_path: Path) -> Non
     assert "origin_session_id" in columns
     assert "delivery_mode" in columns
     assert "command_response_allowed" in columns
+    assert "text_command_fallback_allowed" in columns
     assert "resolution_source" in columns
     assert "idx_durable_requests_wake" in indexes

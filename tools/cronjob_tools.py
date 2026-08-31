@@ -1280,6 +1280,14 @@ def _model_cronjob(args: Dict[str, Any], *, task_id: Optional[str] = None) -> st
                 expected_actor_id=origin.expected_actor_id,
                 origin_type=origin.origin_type,
                 origin_id=origin.origin_id,
+                command_response_allowed=(
+                    request_config.command_responses_enabled
+                    and request_config.allow_on_native_delivery
+                ),
+                text_command_fallback_allowed=(
+                    request_config.command_responses_enabled
+                    and request_config.allow_text_delivery_fallback
+                ),
                 origin_session_id=origin.origin_session_id,
                 origin_ui_session_id=origin.origin_ui_session_id,
                 origin_profile=origin.origin_profile,

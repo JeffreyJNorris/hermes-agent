@@ -129,6 +129,14 @@ def durable_request_tool(
                 expected_actor_id=origin.expected_actor_id,
                 origin_type=origin.origin_type,
                 origin_id=origin.origin_id,
+                command_response_allowed=(
+                    config.command_responses_enabled
+                    and config.allow_on_native_delivery
+                ),
+                text_command_fallback_allowed=(
+                    config.command_responses_enabled
+                    and config.allow_text_delivery_fallback
+                ),
                 wake_on_terminal=wake_requested,
                 origin_session_id=origin.origin_session_id,
                 origin_ui_session_id=origin.origin_ui_session_id,

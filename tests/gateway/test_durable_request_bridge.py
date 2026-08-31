@@ -79,6 +79,7 @@ def _create(
     *,
     wake_on_terminal: bool = False,
     command_response_allowed: bool = False,
+    text_command_fallback_allowed: bool = False,
 ):
     return store.create(
         DurableRequestSpec(
@@ -99,6 +100,7 @@ def _create(
         origin_id="job",
         wake_on_terminal=wake_on_terminal,
         command_response_allowed=command_response_allowed,
+        text_command_fallback_allowed=text_command_fallback_allowed,
     ).request
 
 
@@ -106,7 +108,11 @@ def _create(
 async def test_native_unsupported_falls_back_to_text_once(
     store: DurableRequestStore,
 ) -> None:
-    request = _create(store, command_response_allowed=True)
+    request = _create(
+        store,
+        command_response_allowed=True,
+        text_command_fallback_allowed=True,
+    )
     adapter = Adapter(
         send_result=SendResult(success=False, error_kind="unsupported"),
         text_result=SendResult(success=True, message_id="text-7"),
@@ -128,7 +134,11 @@ async def test_native_unsupported_falls_back_to_text_once(
 async def test_native_success_never_sends_text_fallback(
     store: DurableRequestStore,
 ) -> None:
-    request = _create(store, command_response_allowed=True)
+    request = _create(
+        store,
+        command_response_allowed=True,
+        text_command_fallback_allowed=True,
+    )
     adapter = Adapter(send_result=SendResult(success=True, message_id="native-7"))
 
     await DurableRequestBridge().process_once({"discord": adapter})
@@ -141,7 +151,11 @@ async def test_native_success_never_sends_text_fallback(
 async def test_ambiguous_native_failure_never_sends_text_fallback(
     store: DurableRequestStore,
 ) -> None:
-    request = _create(store, command_response_allowed=True)
+    request = _create(
+        store,
+        command_response_allowed=True,
+        text_command_fallback_allowed=True,
+    )
     adapter = Adapter(
         send_result=SendResult(success=False, error_kind="delivery_unknown")
     )
@@ -156,7 +170,11 @@ async def test_ambiguous_native_failure_never_sends_text_fallback(
 async def test_ambiguous_text_delivery_is_not_retried_after_restart(
     store: DurableRequestStore,
 ) -> None:
-    request = _create(store, command_response_allowed=True)
+    request = _create(
+        store,
+        command_response_allowed=True,
+        text_command_fallback_allowed=True,
+    )
     adapter = Adapter(
         send_result=SendResult(success=False, error_kind="unsupported"),
         text_result=SendResult(success=False, error_kind="delivery_unknown"),
@@ -174,7 +192,11 @@ async def test_ambiguous_text_delivery_is_not_retried_after_restart(
 async def test_bound_text_request_skips_native_view_restore(
     store: DurableRequestStore,
 ) -> None:
-    _create(store, command_response_allowed=True)
+    _create(
+        store,
+        command_response_allowed=True,
+        text_command_fallback_allowed=True,
+    )
     first = Adapter(send_result=SendResult(success=False, error_kind="unsupported"))
     await DurableRequestBridge().process_once({"discord": first})
 
@@ -184,6 +206,66 @@ async def test_bound_text_request_skips_native_view_restore(
     assert restarted.restored == []
     assert restarted.sent == []
     assert restarted.text_sent == []
+
+
+@pytest.mark.asyncio
+async def test_config_change_cannot_enable_fallback_for_existing_request(
+    store: DurableRequestStore,
+    monkeypatch,
+) -> None:
+    request = _create(
+        store,
+        command_response_allowed=True,
+        text_command_fallback_allowed=False,
+    )
+    monkeypatch.setattr(
+        bridge_module,
+        "load_durable_requests_config",
+        lambda: DurableRequestsConfig(
+            **{
+                **_config().__dict__,
+                "allow_text_delivery_fallback": True,
+            }
+        ),
+    )
+    adapter = Adapter(send_result=SendResult(success=False, error_kind="unsupported"))
+
+    await DurableRequestBridge().process_once({"discord": adapter})
+
+    persisted = store.get(request_id=request.request_id)
+    assert persisted.status is DurableRequestStatus.UNSUPPORTED
+    assert adapter.text_sent == []
+
+
+@pytest.mark.asyncio
+async def test_config_change_cannot_disable_persisted_fallback(
+    store: DurableRequestStore,
+    monkeypatch,
+) -> None:
+    request = _create(
+        store,
+        command_response_allowed=False,
+        text_command_fallback_allowed=True,
+    )
+    monkeypatch.setattr(
+        bridge_module,
+        "load_durable_requests_config",
+        lambda: DurableRequestsConfig(
+            **{
+                **_config().__dict__,
+                "allow_text_delivery_fallback": False,
+            }
+        ),
+    )
+    adapter = Adapter(send_result=SendResult(success=False, error_kind="unsupported"))
+
+    await DurableRequestBridge().process_once({"discord": adapter})
+
+    persisted = store.get(request_id=request.request_id)
+    assert persisted.status is DurableRequestStatus.OPEN
+    assert persisted.delivery_mode is DurableRequestDeliveryMode.TEXT_COMMAND
+    assert persisted.command_response_allowed is True
+    assert len(adapter.text_sent) == 1
 
 
 @pytest.fixture

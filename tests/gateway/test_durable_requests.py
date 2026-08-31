@@ -55,6 +55,7 @@ def _create(
     actor: str | None = "actor-1",
     origin_id: str = "session-1",
     command_response_allowed: bool = False,
+    text_command_fallback_allowed: bool = False,
 ):
     return store.create(
         _spec(reference=reference),
@@ -68,6 +69,7 @@ def _create(
         origin_type="session",
         origin_id=origin_id,
         command_response_allowed=command_response_allowed,
+        text_command_fallback_allowed=text_command_fallback_allowed,
     )
 
 
@@ -134,6 +136,7 @@ def test_create_snapshots_command_response_permission(tmp_path: Path) -> None:
         origin_type="session",
         origin_id="session-1",
         command_response_allowed=True,
+        text_command_fallback_allowed=True,
     ).request
 
     assert (
@@ -141,12 +144,14 @@ def test_create_snapshots_command_response_permission(tmp_path: Path) -> None:
         is durable_requests.DurableRequestDeliveryMode.NATIVE
     )
     assert default_request.command_response_allowed is False
+    assert default_request.text_command_fallback_allowed is False
     assert default_request.resolution_source is None
     assert (
         enabled_request.delivery_mode
         is durable_requests.DurableRequestDeliveryMode.NATIVE
     )
     assert enabled_request.command_response_allowed is True
+    assert enabled_request.text_command_fallback_allowed is True
     assert enabled_request.resolution_source is None
 
 

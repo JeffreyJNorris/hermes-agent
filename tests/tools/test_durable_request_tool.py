@@ -42,6 +42,10 @@ def configured_home(tmp_path: Path):
   max_ttl_seconds: 7200
   terminal_retention_seconds: 86400
   scheduled_responder_policy: any_authorized
+  command_responses:
+    enabled: true
+    allow_on_native_delivery: false
+    allow_text_delivery_fallback: true
 """,
         encoding="utf-8",
     )
@@ -158,6 +162,8 @@ def test_live_post_derives_target_origin_and_actor_from_trusted_context(
     assert request.origin_id == "discord:guild:user"
     assert request.responder_mode is DurableResponderMode.INITIATOR
     assert request.expected_actor_id == "42"
+    assert request.command_response_allowed is False
+    assert request.text_command_fallback_allowed is True
 
     serialized = json.dumps(payload)
     for forbidden in (

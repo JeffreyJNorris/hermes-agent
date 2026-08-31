@@ -434,6 +434,7 @@ CREATE TABLE IF NOT EXISTS durable_requests (
     reference TEXT,
     delivery_mode TEXT NOT NULL DEFAULT 'native',
     command_response_allowed INTEGER NOT NULL DEFAULT 0,
+    text_command_fallback_allowed INTEGER NOT NULL DEFAULT 0,
     resolution_source TEXT,
     selected_option_id TEXT,
     resolved_by_actor_id TEXT,
