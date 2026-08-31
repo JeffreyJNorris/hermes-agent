@@ -42,11 +42,13 @@ web dashboard.
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import logging
+import os
 import re
 import sqlite3
+import stat
 import time
 import uuid
 from pathlib import Path
@@ -73,8 +75,12 @@ _MEMORY_FINGERPRINT_VERSION = 1
 _PENDING_ID_RE = re.compile(r"^[0-9a-f]{8}$")
 _TERMINAL_MEMORY_ACTION_STATUSES = frozenset({
     "declined", "expired", "cancelled", "abandoned", "invalidated", "failed",
-    "unknown", "handler_unavailable", "succeeded", "already_applied",
+    "handler_unavailable", "succeeded", "already_applied",
 })
+
+
+class MemoryActionLookupUnavailable(RuntimeError):
+    """The durable action ledger could not be checked safely."""
 
 
 # ---------------------------------------------------------------------------
@@ -133,12 +139,64 @@ def _pending_dir(subsystem: str) -> Path:
 
 
 def _write_pending_record(record: Dict[str, Any]) -> None:
-    from utils import atomic_json_write
+    subsystem = record.get("subsystem")
+    pending_id = record.get("id")
+    if (
+        subsystem not in _SUBSYSTEMS
+        or not isinstance(pending_id, str)
+        or _PENDING_ID_RE.fullmatch(pending_id) is None
+    ):
+        raise ValueError("invalid pending record identity")
 
-    directory = _pending_dir(record["subsystem"])
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    directory.chmod(0o700)
-    atomic_json_write(directory / f"{record['id']}.json", record, mode=0o600)
+    root = get_hermes_home() / "pending"
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    root_fd = os.open(root, directory_flags)
+    try:
+        os.fchmod(root_fd, 0o700)
+        try:
+            os.mkdir(subsystem, mode=0o700, dir_fd=root_fd)
+        except FileExistsError:
+            pass
+        directory_fd = os.open(subsystem, directory_flags, dir_fd=root_fd)
+        try:
+            os.fchmod(directory_fd, 0o700)
+            filename = f"{pending_id}.json"
+            try:
+                metadata = os.stat(filename, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise OSError("pending record target is not a regular file")
+
+            temporary = f".{pending_id}_{uuid.uuid4().hex}.tmp"
+            file_flags = (
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            )
+            fd = os.open(temporary, file_flags, 0o600, dir_fd=directory_fd)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    json.dump(record, stream, indent=2)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(
+                    temporary,
+                    filename,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                )
+                os.fsync(directory_fd)
+            except Exception:
+                try:
+                    os.unlink(temporary, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
+                raise
+        finally:
+            os.close(directory_fd)
+    finally:
+        os.close(root_fd)
 
 
 def _memory_operations(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -274,7 +332,10 @@ def list_pending(
         try:
             record = json.loads(p.read_text(encoding="utf-8"))
             if subsystem == MEMORY and record.get("status", "pending") == "pending":
-                action = memory_action_receipt(record.get("id", ""))
+                try:
+                    action = memory_action_receipt(record.get("id", ""))
+                except MemoryActionLookupUnavailable:
+                    action = None
                 if action is not None and action[1] in _TERMINAL_MEMORY_ACTION_STATUSES:
                     record = {**record, "status": action[1]}
                     try:
@@ -454,17 +515,12 @@ def linked_memory_request_id(record: Dict[str, Any]) -> Optional[str]:
                    FROM durable_action_tickets
                    WHERE action_type = 'memory.apply_pending' AND action_version = 1"""
             ).fetchall()
-    except sqlite3.Error:
-        return None
+    except sqlite3.Error as exc:
+        raise MemoryActionLookupUnavailable from exc
     matches = [row[0] for row in rows if row[1:] == (
         prepared.payload_json, prepared.fingerprint, prepared.idempotency_key
     )]
     return matches[0] if len(matches) == 1 else None
-
-
-def memory_action_exists(pending_id: str) -> bool:
-    """Return whether SQLite has any memory ticket for this strict pending ID."""
-    return memory_action_receipt(pending_id) is not None
 
 
 def memory_action_receipt(pending_id: str) -> Optional[tuple[str, str]]:
@@ -484,8 +540,8 @@ def memory_action_receipt(pending_id: str) -> Optional[tuple[str, str]]:
                 """SELECT request_id, status, payload_json FROM durable_action_tickets
                    WHERE action_type = 'memory.apply_pending' AND action_version = 1"""
             ).fetchall()
-    except sqlite3.Error:
-        return None
+    except sqlite3.Error as exc:
+        raise MemoryActionLookupUnavailable from exc
     matches = []
     for request_id, status, payload_json in rows:
         try:
@@ -498,6 +554,60 @@ def memory_action_receipt(pending_id: str) -> Optional[tuple[str, str]]:
 
 def _digest_path(path: Path) -> str:
     return hashlib.sha256(path.read_bytes() if path.exists() else b"").hexdigest()
+
+
+def diagnose_durable_memory_pending(context):
+    """Inspect an UNKNOWN memory action without mutating recovery evidence."""
+    from gateway.durable_actions import (
+        DurableActionDiagnostic,
+        decode_durable_action_payload,
+    )
+    from tools.memory_tool import load_on_disk_store
+
+    try:
+        payload = decode_durable_action_payload(context.payload_json)
+    except (TypeError, ValueError):
+        return DurableActionDiagnostic("invalid_payload")
+    if (
+        context.action_type != "memory.apply_pending"
+        or context.action_version != 1
+        or not isinstance(payload, dict)
+        or set(payload) != {"pending_id"}
+        or not isinstance(payload["pending_id"], str)
+        or _PENDING_ID_RE.fullmatch(payload["pending_id"]) is None
+    ):
+        return DurableActionDiagnostic("invalid_payload")
+    record = get_pending(MEMORY, payload["pending_id"])
+    if record is None:
+        return DurableActionDiagnostic("record_missing")
+    prepared = prepare_durable_memory_pending(record)
+    if prepared is None or prepared.fingerprint != context.fingerprint:
+        return DurableActionDiagnostic("record_changed")
+    if record.get("profile_identity") != str(get_hermes_home().resolve()):
+        return DurableActionDiagnostic("profile_changed")
+    target = record.get("logical_target")
+    if (
+        target not in {"memory", "user"}
+        or record.get("target_path") != ("USER.md" if target == "user" else "MEMORY.md")
+    ):
+        return DurableActionDiagnostic("target_invalid")
+    store = load_on_disk_store()
+    path = store._path_for(target)
+    with store._file_lock(path):
+        current = _digest_path(path)
+    state = (
+        "desired"
+        if current == record.get("desired_digest")
+        else "baseline"
+        if current == record.get("baseline_digest")
+        else "changed"
+    )
+    code = {
+        "desired": "desired_present",
+        "baseline": "baseline_present",
+        "changed": "state_changed",
+    }[state]
+    return DurableActionDiagnostic(code, (("target_state", state),))
 
 
 def execute_durable_memory_pending(context):

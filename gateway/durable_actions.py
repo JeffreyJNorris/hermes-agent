@@ -854,4 +854,5 @@ register_durable_action_handler(
     1,
     prepare=_write_approval.prepare_durable_memory_pending,
     execute=_write_approval.execute_durable_memory_pending,
+    diagnose_unknown=_write_approval.diagnose_durable_memory_pending,
 )

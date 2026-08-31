@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 
@@ -25,13 +24,13 @@ def hermes_home(tmp_path, monkeypatch):
     reset_durable_request_store_cache()
 
 
-def _configure(*, allowed=True, inbox=True, memory_durable=True):
+def _configure(*, allowed=True, inbox=True):
     from hermes_cli.config import load_config, save_config
 
     config = load_config()
     config["memory"].update(
         write_approval=True,
-        durable_approval=memory_durable,
+        durable_approval=True,
         memory_char_limit=10000,
     )
     config["durable_approvals"] = {
@@ -152,7 +151,8 @@ def test_handler_applies_exact_change_once_and_detects_already_applied(hermes_ho
     assert first.status is DurableActionStatus.SUCCEEDED
     assert wa.list_pending(wa.MEMORY) == []
     assert wa.get_pending(wa.MEMORY, record["id"])["status"] == "applied"
-    store = MemoryStore(); store.load_from_disk()
+    store = MemoryStore()
+    store.load_from_disk()
     assert store.memory_entries == ["exact reviewed fact"]
 
     # A stale delivery of the same trusted context cannot duplicate the write.
@@ -457,3 +457,98 @@ def test_review_is_canonical_json_for_normalized_execution(hermes_home):
             "old_text": "",
         }],
     }
+
+
+def test_unknown_diagnostic_reports_only_structural_target_state(hermes_home):
+    from gateway.durable_actions import lookup_durable_action_diagnostic
+    from tools import write_approval as wa
+    from tools.memory_tool import MemoryStore
+
+    _configure()
+    record = _stage("diagnostic desired")
+    diagnose = lookup_durable_action_diagnostic("memory.apply_pending", 1)
+    assert diagnose is wa.diagnose_durable_memory_pending
+    assert diagnose(_context(record)).code == "baseline_present"
+
+    store = MemoryStore(); store.load_from_disk()
+    assert store.add("memory", "diagnostic desired")["success"]
+    desired = diagnose(_context(record))
+    assert desired.code == "desired_present"
+    assert desired.facts == (("target_state", "desired"),)
+
+    assert store.add("memory", "extra change")["success"]
+    assert diagnose(_context(record)).code == "state_changed"
+
+
+def test_unknown_pending_evidence_requires_explicit_reconciliation(hermes_home):
+    import sqlite3
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    _configure()
+    record = _stage("unknown evidence")
+    receipt = wa.create_memory_durable_approval(record)
+    with sqlite3.connect(hermes_home / "state.db") as conn:
+        conn.execute(
+            "UPDATE durable_action_tickets SET status = 'unknown' WHERE request_id = ?",
+            (receipt["request_id"],),
+        )
+    assert [item["id"] for item in wa.list_pending(wa.MEMORY)] == [record["id"]]
+    out = handle_pending_subcommand(wa.MEMORY, ["reject", record["id"]])
+    assert "reconciliation_required" in out
+    assert wa.get_pending(wa.MEMORY, record["id"]) is not None
+
+
+def test_database_unavailable_fails_linked_manual_commands_closed(hermes_home, monkeypatch):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.memory_tool import MemoryStore
+
+    _configure()
+    record = _stage("database unavailable")
+    wa.create_memory_durable_approval(record)
+
+    def unavailable(*_args, **_kwargs):
+        raise wa.MemoryActionLookupUnavailable
+
+    monkeypatch.setattr(wa, "linked_memory_request_id", unavailable)
+    monkeypatch.setattr(wa, "memory_action_receipt", unavailable)
+    approve = handle_pending_subcommand(
+        wa.MEMORY, ["approve", record["id"]], memory_store=MemoryStore()
+    )
+    reject = handle_pending_subcommand(wa.MEMORY, ["reject", record["id"]])
+    assert "linked_action_unavailable" in approve
+    assert "linked_action_unavailable" in reject
+    assert wa.get_pending(wa.MEMORY, record["id"]) is not None
+
+
+def test_sqlite_lookup_errors_are_not_reported_as_no_action(hermes_home, monkeypatch):
+    import sqlite3
+    from tools import write_approval as wa
+
+    _configure()
+    record = _stage("database error")
+    wa.create_memory_durable_approval(record)
+
+    def unavailable(*_args, **_kwargs):
+        raise sqlite3.OperationalError("unavailable")
+
+    monkeypatch.setattr(sqlite3, "connect", unavailable)
+    with pytest.raises(wa.MemoryActionLookupUnavailable):
+        wa.linked_memory_request_id(record)
+    with pytest.raises(wa.MemoryActionLookupUnavailable):
+        wa.memory_action_receipt(record["id"])
+
+
+def test_pending_rewrite_rejects_symlink_target(hermes_home):
+    from tools import write_approval as wa
+
+    record = _stage("symlink protected")
+    path = hermes_home / "pending" / "memory" / f"{record['id']}.json"
+    victim = hermes_home / "victim.json"
+    victim.write_text("untouched", encoding="utf-8")
+    path.unlink()
+    path.symlink_to(victim)
+    with pytest.raises(OSError):
+        wa._write_pending_record({**record, "status": "cancelled"})
+    assert victim.read_text(encoding="utf-8") == "untouched"

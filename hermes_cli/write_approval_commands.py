@@ -135,13 +135,27 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
 
     applied, authorized, failed = 0, 0, []
     for rec in targets:
-        request_id = wa.linked_memory_request_id(rec) if subsystem == wa.MEMORY else None
+        try:
+            request_id = (
+                wa.linked_memory_request_id(rec) if subsystem == wa.MEMORY else None
+            )
+            receipt = (
+                wa.memory_action_receipt(rec.get("id", ""))
+                if subsystem == wa.MEMORY
+                else None
+            )
+        except wa.MemoryActionLookupUnavailable:
+            failed.append(f"{rec['id']}: linked_action_unavailable")
+            continue
+        if receipt is not None and receipt[1] == "unknown":
+            failed.append(f"{rec['id']}: reconciliation_required")
+            continue
         if (
             subsystem == wa.MEMORY
             and not request_id
             and (
                 rec.get("durable_request_id") is not None
-                or wa.memory_action_exists(rec.get("id", ""))
+                or receipt is not None
             )
         ):
             failed.append(f"{rec['id']}: linked_action_invalid")
@@ -202,9 +216,24 @@ def _reject(subsystem: str, rest: List[str]) -> str:
         return f"No pending {subsystem} write with id '{target}'."
     rejected, failed = 0, []
     for record in records:
-        request_id = wa.linked_memory_request_id(record) if subsystem == wa.MEMORY else None
+        try:
+            request_id = (
+                wa.linked_memory_request_id(record)
+                if subsystem == wa.MEMORY
+                else None
+            )
+            receipt = (
+                wa.memory_action_receipt(record.get("id", ""))
+                if subsystem == wa.MEMORY
+                else None
+            )
+        except wa.MemoryActionLookupUnavailable:
+            failed.append(f"{record['id']}: linked_action_unavailable")
+            continue
+        if receipt is not None and receipt[1] == "unknown":
+            failed.append(f"{record['id']}: reconciliation_required")
+            continue
         if not request_id and subsystem == wa.MEMORY:
-            receipt = wa.memory_action_receipt(record.get("id", ""))
             request_id = receipt[0] if receipt else None
             if not request_id and record.get("durable_request_id") is not None:
                 failed.append(f"{record['id']}: linked_action_unavailable")

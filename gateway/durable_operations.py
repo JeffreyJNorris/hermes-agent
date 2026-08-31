@@ -462,7 +462,6 @@ class DurableOperationsStore:
                 conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute(
                     """SELECT request.status AS request_status,
-                              request.expires_at,
                               ticket.status AS action_status,
                               ticket.execution_claim
                        FROM durable_requests AS request
