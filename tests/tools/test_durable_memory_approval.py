@@ -408,7 +408,7 @@ def test_tampered_linked_reject_cancels_authoritative_ticket(hermes_home):
     assert wa.get_pending(wa.MEMORY, record["id"]) is None
 
 
-def test_retry_after_cancel_returns_stable_manual_outcome(hermes_home):
+def test_retry_after_cancel_returns_stable_terminal_receipt(hermes_home):
     from gateway.durable_operations import DurableOperationsStore
     from tools import write_approval as wa
 
@@ -421,8 +421,10 @@ def test_retry_after_cancel_returns_stable_manual_outcome(hermes_home):
     retry = _stage("cancel then retry")
     assert retry["id"] == first["id"]
     assert wa.create_memory_durable_approval(retry) == {
-        "status": "pending_manual_review",
-        "reason": "durable_cancelled",
+        "status": "cancelled",
+        "pending_id": first["id"],
+        "request_id": receipt["request_id"],
+        "action_id": receipt["request_id"],
     }
 
 

@@ -417,9 +417,15 @@ def create_memory_durable_approval(record: Dict[str, Any]) -> Dict[str, Any]:
     except (OSError, sqlite3.Error):
         return {"status": "pending_manual_review", "reason": "inbox_unavailable"}
     if result.ticket.status.value != "waiting_for_decision":
+        try:
+            _write_pending_record({**record, "status": result.ticket.status.value})
+        except OSError:
+            pass
         return {
-            "status": "pending_manual_review",
-            "reason": f"durable_{result.ticket.status.value}",
+            "status": result.ticket.status.value,
+            "pending_id": record["id"],
+            "request_id": result.request.request_id,
+            "action_id": result.request.request_id,
         }
     linked = {**record, "durable_request_id": result.request.request_id,
               "durable_action_id": result.request.request_id}
