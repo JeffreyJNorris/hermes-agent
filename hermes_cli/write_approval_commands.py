@@ -39,10 +39,11 @@ def _fmt_pending_list(subsystem: str) -> str:
         origin = r.get("origin", "foreground")
         tag = " [auto]" if origin == "background_review" else ""
         linked = ""
-        if subsystem == wa.MEMORY:
+        if subsystem in {wa.MEMORY, wa.SKILLS}:
             try:
-                request_id = wa.linked_memory_request_id(r)
-            except wa.MemoryActionLookupUnavailable:
+                request_id = (wa.linked_memory_request_id(r) if subsystem == wa.MEMORY
+                              else wa.linked_skill_request_id(r))
+            except (wa.MemoryActionLookupUnavailable, wa.SkillActionLookupUnavailable):
                 request_id = None
                 linked = " [status unavailable]"
             if request_id:
@@ -140,15 +141,11 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
     applied, authorized, failed = 0, 0, []
     for rec in targets:
         try:
-            request_id = (
-                wa.linked_memory_request_id(rec) if subsystem == wa.MEMORY else None
-            )
-            receipt = (
-                wa.memory_action_receipt(rec.get("id", ""))
-                if subsystem == wa.MEMORY
-                else None
-            )
-        except wa.MemoryActionLookupUnavailable:
+            request_id = (wa.linked_memory_request_id(rec) if subsystem == wa.MEMORY
+                          else wa.linked_skill_request_id(rec))
+            receipt = (wa.memory_action_receipt(rec.get("id", "")) if subsystem == wa.MEMORY
+                       else wa.skill_action_receipt(rec.get("id", "")))
+        except (wa.MemoryActionLookupUnavailable, wa.SkillActionLookupUnavailable):
             failed.append(f"{rec['id']}: linked_action_unavailable")
             continue
         if receipt is not None and receipt[1] == "unknown" and receipt[2] is None:
@@ -159,8 +156,7 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
             failed.append(f"{rec['id']}: reconciled_{receipt[2]}")
             continue
         if (
-            subsystem == wa.MEMORY
-            and not request_id
+            not request_id
             and (
                 rec.get("durable_request_id") is not None
                 or receipt is not None
@@ -204,6 +200,9 @@ def _apply_one(subsystem: str, rec, memory_store):
             result = apply_memory_pending(payload, memory_store)
             return bool(result.get("success")), result.get("error", "")
         else:
+            if rec.get("manifest_version") == 1:
+                outcome = wa.execute_manual_skill_pending(rec)
+                return outcome.status.value in {"succeeded", "already_applied"}, outcome.reason or ""
             from tools.skill_manager_tool import apply_skill_pending
             result = json.loads(apply_skill_pending(payload))
             return bool(result.get("success")), result.get("error", "")
@@ -225,17 +224,11 @@ def _reject(subsystem: str, rest: List[str]) -> str:
     rejected, failed = 0, []
     for record in records:
         try:
-            request_id = (
-                wa.linked_memory_request_id(record)
-                if subsystem == wa.MEMORY
-                else None
-            )
-            receipt = (
-                wa.memory_action_receipt(record.get("id", ""))
-                if subsystem == wa.MEMORY
-                else None
-            )
-        except wa.MemoryActionLookupUnavailable:
+            request_id = (wa.linked_memory_request_id(record) if subsystem == wa.MEMORY
+                          else wa.linked_skill_request_id(record))
+            receipt = (wa.memory_action_receipt(record.get("id", "")) if subsystem == wa.MEMORY
+                       else wa.skill_action_receipt(record.get("id", "")))
+        except (wa.MemoryActionLookupUnavailable, wa.SkillActionLookupUnavailable):
             failed.append(f"{record['id']}: linked_action_unavailable")
             continue
         if receipt is not None and receipt[1] == "unknown" and receipt[2] is None:
@@ -245,7 +238,7 @@ def _reject(subsystem: str, rest: List[str]) -> str:
             if wa.discard_pending(subsystem, record["id"]):
                 rejected += 1
             continue
-        if not request_id and subsystem == wa.MEMORY:
+        if not request_id:
             request_id = receipt[0] if receipt else None
             if not request_id and record.get("durable_request_id") is not None:
                 failed.append(f"{record['id']}: linked_action_unavailable")

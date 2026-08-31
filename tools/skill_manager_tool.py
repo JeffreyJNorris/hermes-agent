@@ -1387,6 +1387,24 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     }
 
 
+# Every concrete writer, including dashboard/manual callers that intentionally
+# bypass the approval gate, shares the durable handler's cross-process lock.
+def _locked_writer(function):
+    def locked(*args, **kwargs):
+        from tools.write_approval import skill_write_lock
+        with skill_write_lock():
+            return function(*args, **kwargs)
+    return locked
+
+
+_create_skill = _locked_writer(_create_skill)
+_edit_skill = _locked_writer(_edit_skill)
+_patch_skill = _locked_writer(_patch_skill)
+_delete_skill = _locked_writer(_delete_skill)
+_write_file = _locked_writer(_write_file)
+_remove_file = _locked_writer(_remove_file)
+
+
 # =============================================================================
 # Main entry point
 # =============================================================================
@@ -1419,6 +1437,22 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
         return None
     if decision.blocked:
         return tool_error(decision.message, success=False)
+    existing = _find_skill(name)
+    if existing:
+        try:
+            from agent.skill_utils import is_external_skill_path, is_org_mirror_path
+            from tools import skill_usage
+            protected = (
+                is_external_skill_path(existing["path"])
+                or is_org_mirror_path(existing["path"], _skills_dir())
+                or skill_usage.is_protected_builtin(name)
+                or skill_usage.is_bundled(name)
+                or skill_usage.is_hub_installed(name)
+            )
+        except Exception:
+            protected = True
+        if protected:
+            return tool_error("Skill approval cannot target protected or non-personal skills.", success=False)
 
     # stage — record the full skill_manage kwargs so approval can replay it.
     payload = {"action": action, "name": name}
@@ -1430,7 +1464,15 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
         old_string=payload_kwargs.get("old_string") or "",
         new_string=payload_kwargs.get("new_string") or "",
     )
-    record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
+    if wa.durable_approval_enabled(wa.SKILLS):
+        record = wa.stage_skill_write(payload, summary=gist, origin=wa.current_origin())
+        if record.get("status") == "rejected":
+            return tool_error(f"Durable skill approval rejected: {record.get('reason')}", success=False)
+        if record.get("manifest_version") == 1:
+            receipt = wa.create_skill_durable_approval(record)
+            return json.dumps({"success": True, "staged": True, "gist": gist, **receipt}, ensure_ascii=False)
+    else:
+        record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
          "gist": gist, "message": decision.message},
@@ -1510,6 +1552,32 @@ def _maybe_debounced_sync_push(skill_name: str) -> None:
         _sync_push_timer.start()
 
 
+def finalize_skill_mutation(action: str, name: str, result: Dict[str, Any]) -> None:
+    """Run the shared cache, provenance, telemetry, and sync finalizers."""
+    if not result.get("success"):
+        return
+    try:
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+    except Exception:
+        pass
+    try:
+        from tools.skill_usage import bump_patch, forget, mark_agent_created
+        from tools.skill_provenance import is_background_review
+        if action == "create" and is_background_review():
+            mark_agent_created(name)
+        elif action in {"patch", "edit", "write_file", "remove_file"}:
+            bump_patch(name)
+        elif action == "delete" and not result.get("_archived"):
+            forget(name)
+    except Exception:
+        pass
+    try:
+        _maybe_debounced_sync_push(name)
+    except Exception:
+        pass
+
+
 def skill_manage(
     action: str,
     name: str,
@@ -1579,46 +1647,7 @@ def skill_manage(
     else:
         result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
 
-    if result.get("success"):
-        try:
-            from agent.prompt_builder import clear_skills_system_prompt_cache
-            clear_skills_system_prompt_cache(clear_snapshot=True)
-        except Exception:
-            pass
-        # Curator telemetry: bump patch_count on edit/patch/write_file (the actions
-        # that mutate an existing skill's guidance), drop the record on delete.
-        # Only mark a skill as agent-created when the background self-improvement
-        # review fork creates it — foreground `skill_manage(create)` calls are
-        # user-directed, and those skills belong to the user (the curator must
-        # not touch them). Best-effort; telemetry failures never break the tool.
-        try:
-            from tools.skill_usage import bump_patch, forget, mark_agent_created
-            from tools.skill_provenance import is_background_review
-            if action == "create":
-                if is_background_review():
-                    mark_agent_created(name)
-            elif action in {"patch", "edit", "write_file", "remove_file"}:
-                bump_patch(name)
-            elif action == "delete":
-                # A recoverable curator archive (routed through archive_skill)
-                # keeps its usage record as STATE_ARCHIVED so `hermes curator
-                # status`/`restore` still see it. Only a hard delete forgets.
-                if not result.get("_archived"):
-                    forget(name)
-        except Exception:
-            pass
-
-        # Sync push hook (debounced, best-effort). Fires only AFTER the
-        # write gate passed (staged/unapproved writes never reach here -- the
-        # gate returns early above), so we never push un-reviewed content.
-        # Inert unless the access gate is open (the user is a Nous admin on the
-        # token), a sync base URL is configured, and the skill is opted into
-        # sync. Debounced so a burst of edits collapses to one push. Never
-        # raises -- an agent write must never block on sync (M1-C invariant).
-        try:
-            _maybe_debounced_sync_push(name)
-        except Exception:
-            pass
+    finalize_skill_mutation(action, name, result)
 
     return json.dumps(result, ensure_ascii=False)
 

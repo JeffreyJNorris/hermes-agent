@@ -856,3 +856,11 @@ register_durable_action_handler(
     execute=_write_approval.execute_durable_memory_pending,
     diagnose_unknown=_write_approval.diagnose_durable_memory_pending,
 )
+
+register_durable_action_handler(
+    "skill.apply_pending",
+    1,
+    prepare=_write_approval.prepare_durable_skill_pending,
+    execute=_write_approval.execute_durable_skill_pending,
+    diagnose_unknown=_write_approval.diagnose_durable_skill_pending,
+)
