@@ -14636,6 +14636,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "restart": self._handle_restart_command,
                 "approve": self._handle_approve_command,
                 "deny": self._handle_deny_command,
+                "request": self._handle_request_command,
                 "agents": self._handle_agents_command,
                 "background": self._handle_background_command,
                 "kanban": self._handle_kanban_command,
@@ -15835,6 +15836,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "deny":
             return await self._handle_deny_command(event)
+
+        if canonical == "request":
+            return await self._handle_request_command(event)
 
         if canonical == "update":
             return await self._handle_update_command(event)
