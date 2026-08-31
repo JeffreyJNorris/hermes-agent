@@ -71,6 +71,10 @@ DURABLE_CONFIG_KEY = "durable_approval"
 _MEMORY_RECORD_VERSION = 2
 _MEMORY_FINGERPRINT_VERSION = 1
 _PENDING_ID_RE = re.compile(r"^[0-9a-f]{8}$")
+_TERMINAL_MEMORY_ACTION_STATUSES = frozenset({
+    "declined", "expired", "cancelled", "abandoned", "invalidated", "failed",
+    "unknown", "handler_unavailable", "succeeded", "already_applied",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +152,18 @@ def _memory_operations(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     }]
 
 
+def _normalize_memory_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    target = payload.get("target", "memory")
+    operations = [{
+        "action": operation.get("action"),
+        "content": str(operation.get("content") or "").strip(),
+        "old_text": str(operation.get("old_text") or "").strip(),
+    } for operation in _memory_operations(payload)]
+    if payload.get("action") == "batch":
+        return {"action": "batch", "target": target, "operations": operations}
+    return {"target": target, **operations[0]}
+
+
 def _memory_record_fields(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     from tools.memory_tool import ENTRY_DELIMITER, load_on_disk_store
 
@@ -211,6 +227,8 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
     logs and still returns a record (the write is simply lost, which is the
     safe failure for an approval gate — nothing is silently committed).
     """
+    if subsystem == MEMORY:
+        payload = _normalize_memory_payload(payload)
     fields = _memory_record_fields(payload) if subsystem == MEMORY else None
     if fields is not None:
         identity = json.dumps(
@@ -242,7 +260,11 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
     return record
 
 
-def list_pending(subsystem: str) -> List[Dict[str, Any]]:
+def list_pending(
+    subsystem: str,
+    *,
+    include_terminal: bool = False,
+) -> List[Dict[str, Any]]:
     """Return all pending records for ``subsystem``, oldest first."""
     d = _pending_dir(subsystem)
     if not d.exists():
@@ -251,7 +273,16 @@ def list_pending(subsystem: str) -> List[Dict[str, Any]]:
     for p in d.glob("*.json"):
         try:
             record = json.loads(p.read_text(encoding="utf-8"))
-            if record.get("status", "pending") == "pending":
+            if subsystem == MEMORY and record.get("status", "pending") == "pending":
+                action = memory_action_receipt(record.get("id", ""))
+                if action is not None and action[1] in _TERMINAL_MEMORY_ACTION_STATUSES:
+                    record = {**record, "status": action[1]}
+                    try:
+                        _write_pending_record(record)
+                    except OSError:
+                        pass
+            status = record.get("status", "pending")
+            if status == "pending" or (include_terminal and status != "applied"):
                 records.append(record)
         except Exception:
             logger.warning("Skipping unreadable pending record: %s", p)
@@ -311,18 +342,15 @@ def prepare_durable_memory_pending(record: Dict[str, Any]):
 
 
 def _memory_review(record: Dict[str, Any]) -> str:
-    payload = record["payload"]
-    target = payload.get("target", "memory")
-    lines = [f"Target: {target}"]
-    for operation in _memory_operations(payload):
-        action = operation.get("action")
-        if action == "replace":
-            lines.extend(("Replace:", str(operation.get("old_text") or ""), "With:", str(operation.get("content") or "")))
-        elif action == "remove":
-            lines.extend(("Remove:", str(operation.get("old_text") or "")))
-        else:
-            lines.extend(("Add:", str(operation.get("content") or "")))
-    return "\n".join(lines)
+    return json.dumps(
+        {
+            "operations": _memory_operations(record["payload"]),
+            "target": record["logical_target"],
+        },
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    )
 
 
 def create_memory_durable_approval(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -386,6 +414,13 @@ def create_memory_durable_approval(record: Dict[str, Any]) -> Dict[str, Any]:
         )
     except (DurableRequestError, DurableRequestLimitError, ValueError):
         return {"status": "pending_manual_review", "reason": "review_too_large"}
+    except (OSError, sqlite3.Error):
+        return {"status": "pending_manual_review", "reason": "inbox_unavailable"}
+    if result.ticket.status.value != "waiting_for_decision":
+        return {
+            "status": "pending_manual_review",
+            "reason": f"durable_{result.ticket.status.value}",
+        }
     linked = {**record, "durable_request_id": result.request.request_id,
               "durable_action_id": result.request.request_id}
     try:
@@ -406,12 +441,15 @@ def linked_memory_request_id(record: Dict[str, Any]) -> Optional[str]:
     db_path = get_hermes_home() / "state.db"
     if prepared is None or not db_path.exists():
         return None
-    with sqlite3.connect(db_path) as conn:
-        rows = conn.execute(
-            """SELECT request_id, payload_json, fingerprint, idempotency_key
-               FROM durable_action_tickets
-               WHERE action_type = 'memory.apply_pending' AND action_version = 1"""
-        ).fetchall()
+    try:
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute(
+                """SELECT request_id, payload_json, fingerprint, idempotency_key
+                   FROM durable_action_tickets
+                   WHERE action_type = 'memory.apply_pending' AND action_version = 1"""
+            ).fetchall()
+    except sqlite3.Error:
+        return None
     matches = [row[0] for row in rows if row[1:] == (
         prepared.payload_json, prepared.fingerprint, prepared.idempotency_key
     )]
@@ -420,25 +458,36 @@ def linked_memory_request_id(record: Dict[str, Any]) -> Optional[str]:
 
 def memory_action_exists(pending_id: str) -> bool:
     """Return whether SQLite has any memory ticket for this strict pending ID."""
+    return memory_action_receipt(pending_id) is not None
+
+
+def memory_action_receipt(pending_id: str) -> Optional[tuple[str, str]]:
+    """Return the unique authoritative request ID and structural status."""
     from gateway.durable_actions import decode_durable_action_payload
 
     if _PENDING_ID_RE.fullmatch(pending_id or "") is None:
-        return False
+        return None
     db_path = get_hermes_home() / "state.db"
     if not db_path.exists():
-        return False
-    with sqlite3.connect(db_path) as conn:
-        rows = conn.execute(
-            """SELECT payload_json FROM durable_action_tickets
-               WHERE action_type = 'memory.apply_pending' AND action_version = 1"""
-        ).fetchall()
-    for (payload_json,) in rows:
+        return None
+    try:
+        with sqlite3.connect(db_path) as conn:
+            # ponytail: bounded scan avoids a schema migration; add a subject
+            # index only if pending-action volume makes this measurable.
+            rows = conn.execute(
+                """SELECT request_id, status, payload_json FROM durable_action_tickets
+                   WHERE action_type = 'memory.apply_pending' AND action_version = 1"""
+            ).fetchall()
+    except sqlite3.Error:
+        return None
+    matches = []
+    for request_id, status, payload_json in rows:
         try:
             if decode_durable_action_payload(payload_json) == {"pending_id": pending_id}:
-                return True
+                matches.append((request_id, status))
         except (TypeError, ValueError):
             continue
-    return False
+    return matches[0] if len(matches) == 1 else None
 
 
 def _digest_path(path: Path) -> str:

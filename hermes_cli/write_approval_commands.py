@@ -139,7 +139,10 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
         if (
             subsystem == wa.MEMORY
             and not request_id
-            and wa.memory_action_exists(rec.get("id", ""))
+            and (
+                rec.get("durable_request_id") is not None
+                or wa.memory_action_exists(rec.get("id", ""))
+            )
         ):
             failed.append(f"{rec['id']}: linked_action_invalid")
             continue
@@ -190,19 +193,27 @@ def _reject(subsystem: str, rest: List[str]) -> str:
     target, err = _resolve_one(subsystem, rest)
     if err or target is None:
         return err or f"Usage: /{subsystem} reject <id>"
-    records = wa.list_pending(subsystem)
-    if target.lower() != "all":
-        records = [record for record in records if record.get("id") == target]
+    if target.lower() == "all":
+        records = wa.list_pending(subsystem, include_terminal=True)
+    else:
+        record = wa.get_pending(subsystem, target)
+        records = [record] if record is not None else []
     if not records:
         return f"No pending {subsystem} write with id '{target}'."
     rejected, failed = 0, []
     for record in records:
         request_id = wa.linked_memory_request_id(record) if subsystem == wa.MEMORY else None
+        if not request_id and subsystem == wa.MEMORY:
+            receipt = wa.memory_action_receipt(record.get("id", ""))
+            request_id = receipt[0] if receipt else None
+            if not request_id and record.get("durable_request_id") is not None:
+                failed.append(f"{record['id']}: linked_action_unavailable")
+                continue
         if request_id:
             from gateway.durable_operations import DurableOperationsStore
             from hermes_constants import get_hermes_home
             result = DurableOperationsStore(get_hermes_home() / "state.db").cancel_request(request_id)
-            if not result.ok:
+            if not result.ok and result.code != "already_terminal":
                 failed.append(f"{record['id']}: {result.code}")
                 continue
         if wa.discard_pending(subsystem, record["id"]):

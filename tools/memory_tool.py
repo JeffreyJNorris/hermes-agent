@@ -955,11 +955,13 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
         summary=f"{summary}: {detail[:120]}",
         origin=wa.current_origin(),
     )
-    receipt = (
-        wa.create_memory_durable_approval(record)
-        if wa.durable_approval_enabled(wa.MEMORY)
-        else {"status": "pending_manual_review", "reason": "durable_disabled"}
-    )
+    if not wa.durable_approval_enabled(wa.MEMORY):
+        return json.dumps(
+            {"success": True, "staged": True, "pending_id": record["id"],
+             "message": decision.message},
+            ensure_ascii=False,
+        )
+    receipt = wa.create_memory_durable_approval(record)
     return json.dumps({"success": True, "staged": True, "pending_id": record["id"], **receipt}, ensure_ascii=False)
 
 
@@ -1003,11 +1005,13 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
         summary=f"{summary}: {detail[:120]}",
         origin=wa.current_origin(),
     )
-    receipt = (
-        wa.create_memory_durable_approval(record)
-        if wa.durable_approval_enabled(wa.MEMORY)
-        else {"status": "pending_manual_review", "reason": "durable_disabled"}
-    )
+    if not wa.durable_approval_enabled(wa.MEMORY):
+        return json.dumps(
+            {"success": True, "staged": True, "pending_id": record["id"],
+             "message": decision.message},
+            ensure_ascii=False,
+        )
+    receipt = wa.create_memory_durable_approval(record)
     return json.dumps({"success": True, "staged": True, "pending_id": record["id"], **receipt}, ensure_ascii=False)
 
 

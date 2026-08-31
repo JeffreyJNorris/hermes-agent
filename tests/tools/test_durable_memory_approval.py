@@ -215,8 +215,7 @@ def test_memory_tool_preserves_immediate_manual_and_durable_matrix(hermes_home):
     config["memory"].update(write_approval=True, durable_approval=False)
     save_config(config)
     manual = json.loads(memory_tool("add", "user", "manual", store=store))
-    assert manual["status"] == "pending_manual_review"
-    assert manual["reason"] == "durable_disabled"
+    assert "review with /memory pending" in manual["message"]
 
     _configure()
     durable = json.loads(memory_tool("add", "user", "durable canary", store=store))
@@ -235,7 +234,7 @@ def test_review_body_is_complete_and_not_truncated(hermes_home):
     content = "first line\nlast line"
     result = wa.create_memory_durable_approval(_stage(content))
     request = get_durable_request_store().get(request_id=result["request_id"])
-    assert content in request.body
+    assert json.loads(request.body)["operations"][0]["content"] == content
     assert "..." not in request.body
 
 
@@ -362,3 +361,97 @@ def test_manual_authorization_expires_overdue_request(hermes_home):
     )
     assert result.code == "expired"
     assert result.action_status == DurableActionStatus.EXPIRED.value
+
+
+@pytest.mark.parametrize("terminal", ["declined", "expired", "cancelled", "invalidated", "failed"])
+def test_pending_list_reconciles_terminal_action_state(hermes_home, terminal):
+    import sqlite3
+    from tools import write_approval as wa
+
+    _configure()
+    record = _stage(f"terminal {terminal}")
+    receipt = wa.create_memory_durable_approval(record)
+    with sqlite3.connect(hermes_home / "state.db") as conn:
+        conn.execute(
+            "UPDATE durable_action_tickets SET status = ? WHERE request_id = ?",
+            (terminal, receipt["request_id"]),
+        )
+    assert wa.list_pending(wa.MEMORY) == []
+    assert wa.get_pending(wa.MEMORY, record["id"])["status"] == terminal
+
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    assert "Rejected 1" in handle_pending_subcommand(
+        wa.MEMORY, ["reject", record["id"]]
+    )
+    assert wa.get_pending(wa.MEMORY, record["id"]) is None
+
+
+def test_tampered_linked_reject_cancels_authoritative_ticket(hermes_home):
+    from gateway.durable_actions import DurableActionStatus
+    from gateway.durable_operations import DurableOperationsStore
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from utils import atomic_json_write
+
+    _configure()
+    record = _stage("reject original")
+    receipt = wa.create_memory_durable_approval(record)
+    path = hermes_home / "pending" / "memory" / f"{record['id']}.json"
+    tampered = wa.get_pending(wa.MEMORY, record["id"])
+    tampered["payload"]["content"] = "reject tampered"
+    atomic_json_write(path, tampered, mode=0o600)
+    out = handle_pending_subcommand(wa.MEMORY, ["reject", record["id"]])
+    assert "Rejected 1" in out
+    assert DurableOperationsStore(hermes_home / "state.db").get_action(
+        receipt["request_id"]
+    ).status == DurableActionStatus.CANCELLED.value
+    assert wa.get_pending(wa.MEMORY, record["id"]) is None
+
+
+def test_retry_after_cancel_returns_stable_manual_outcome(hermes_home):
+    from gateway.durable_operations import DurableOperationsStore
+    from tools import write_approval as wa
+
+    _configure()
+    first = _stage("cancel then retry")
+    receipt = wa.create_memory_durable_approval(first)
+    assert DurableOperationsStore(hermes_home / "state.db").cancel_request(
+        receipt["request_id"]
+    ).ok
+    retry = _stage("cancel then retry")
+    assert retry["id"] == first["id"]
+    assert wa.create_memory_durable_approval(retry) == {
+        "status": "pending_manual_review",
+        "reason": "durable_cancelled",
+    }
+
+
+def test_durable_disabled_keeps_exact_legacy_staged_response(hermes_home):
+    from hermes_cli.config import load_config, save_config
+    from tools.memory_tool import MemoryStore, memory_tool
+
+    config = load_config()
+    config["memory"].update(write_approval=True, durable_approval=False)
+    save_config(config)
+    store = MemoryStore(); store.load_from_disk()
+    result = json.loads(memory_tool("add", "memory", "legacy response", store=store))
+    assert set(result) == {"success", "staged", "pending_id", "message"}
+    assert "review with /memory pending" in result["message"]
+
+
+def test_review_is_canonical_json_for_normalized_execution(hermes_home):
+    from gateway.durable_requests import get_durable_request_store
+    from tools import write_approval as wa
+
+    _configure()
+    record = _stage("  Add:\nWith:\n exact value  ")
+    receipt = wa.create_memory_durable_approval(record)
+    request = get_durable_request_store().get(request_id=receipt["request_id"])
+    assert json.loads(request.body) == {
+        "target": "memory",
+        "operations": [{
+            "action": "add",
+            "content": "Add:\nWith:\n exact value",
+            "old_text": "",
+        }],
+    }
