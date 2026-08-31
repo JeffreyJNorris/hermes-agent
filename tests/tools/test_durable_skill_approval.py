@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from gateway.durable_actions import (
     DurableActionExecutionContext,
     DurableActionStatus,
@@ -173,7 +175,7 @@ def test_delete_moves_whole_skill_to_journaled_quarantine(tmp_path, monkeypatch)
     journal = json.loads((tmp_path / "skills" / ".transactions" / record["id"] / "journal.json").read_text())
     assert journal["state"] == "COMMITTED"
     assert (Path(journal["quarantine_relative_path"]) / "SKILL.md").name == "SKILL.md"
-    assert not (tmp_path / "pending" / "skills" / record["id"]).exists()
+    assert (tmp_path / "pending" / "skills" / record["id"]).exists()
 
 
 def test_handler_is_statically_registered():
@@ -282,3 +284,59 @@ def test_delete_fault_after_executing_is_unknown_with_journal_evidence(tmp_path,
     assert diagnostic.code == "journal_evidence"
     assert ("journal_state", "executing") in diagnostic.facts
     assert skill.exists()
+
+
+@pytest.mark.parametrize("fault", [
+    "prepared", "executing", "renamed", "source_fsynced",
+    "quarantine_fsynced", "committed",
+])
+def test_delete_every_journal_boundary_becomes_unknown_without_replay(tmp_path, monkeypatch, fault):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    skill = tmp_path / "skills" / "demo"; skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(VALID)
+    record = wa.stage_skill_write({"action": "delete", "name": "demo", "absorbed_into": ""}, summary="delete", origin="foreground")
+    context = _context(record)
+    monkeypatch.setattr(wa, "_skill_journal_fault", lambda point: (_ for _ in ()).throw(OSError(point)) if point == fault else None)
+    assert wa.execute_durable_skill_pending(context).status is DurableActionStatus.UNKNOWN
+    before = skill.exists()
+    assert wa.execute_durable_skill_pending(context).status in {DurableActionStatus.UNKNOWN, DurableActionStatus.ALREADY_APPLIED}
+    assert skill.exists() == before
+
+
+def test_committed_cleanup_is_bounded_and_unknown_is_retained(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    root = tmp_path / "skills"
+    for pending_id, state in (("a" * 8, "COMMITTED"), ("b" * 8, "UNKNOWN")):
+        txn = root / ".transactions" / pending_id; quarantine = root / ".quarantine" / pending_id
+        txn.mkdir(parents=True); quarantine.mkdir(parents=True)
+        (quarantine / "SKILL.md").write_text(VALID)
+        (txn / "journal.json").write_text(json.dumps({"journal_version": 1, "state": state, "operation_progress": 1}))
+    monkeypatch.setattr(wa, "skill_action_receipt", lambda pid: ("req", "succeeded", None) if pid == "a" * 8 else ("req", "unknown", None))
+    assert wa.cleanup_terminal_skill_evidence(limit=1) == 1
+    assert not (root / ".quarantine" / ("a" * 8)).exists()
+    assert json.loads((root / ".transactions" / ("a" * 8) / "journal.json").read_text())["state"] == "CLEANED"
+    assert (root / ".quarantine" / ("b" * 8)).exists()
+
+
+def test_terminal_rejection_cleans_staged_bytes_but_unknown_retains_them(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    rejected = wa.stage_skill_write({"action": "create", "name": "rejected", "content": VALID.replace("name: demo", "name: rejected")}, summary="x", origin="foreground")
+    unknown = wa.stage_skill_write({"action": "create", "name": "unknown", "content": VALID.replace("name: demo", "name: unknown")}, summary="x", origin="foreground")
+    monkeypatch.setattr(wa, "skill_action_receipt", lambda pid: ("req", "declined", None) if pid == rejected["id"] else ("req", "unknown", None))
+    wa.list_pending(wa.SKILLS)
+    assert not (tmp_path / "pending" / "skills" / rejected["id"]).exists()
+    assert (tmp_path / "pending" / "skills" / unknown["id"]).exists()
+
+
+def test_security_scan_and_protected_provenance_reject_without_staging(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    skill = tmp_path / "skills" / "demo"; skill.mkdir(parents=True); (skill / "SKILL.md").write_text(VALID)
+    monkeypatch.setattr("tools.skill_manager_tool._guard_agent_created_enabled", lambda: True)
+    monkeypatch.setattr("tools.skill_manager_tool._security_scan_skill", lambda path: "blocked")
+    rejected = wa.stage_skill_write({"action": "edit", "name": "demo", "content": VALID.replace("Do it.", "unsafe")}, summary="x", origin="foreground")
+    assert rejected == {"status": "rejected", "reason": "security_scan_rejected"}
+    assert not list((tmp_path / "pending" / "skills").glob("*.json"))
+    monkeypatch.setattr("tools.skill_manager_tool._guard_agent_created_enabled", lambda: False)
+    monkeypatch.setattr("tools.skill_usage.is_bundled", lambda name: True)
+    protected = wa.stage_skill_write({"action": "edit", "name": "demo", "content": VALID}, summary="x", origin="foreground")
+    assert protected == {"status": "rejected", "reason": "protected_target"}
