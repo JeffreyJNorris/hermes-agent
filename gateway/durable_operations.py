@@ -50,6 +50,7 @@ _NOTIFICATION_STATUSES = frozenset(
 _DELIVERY_EVENTS = frozenset(
     {"native_to_text_fallback", "text_delivery_failed", "text_delivery_unknown"}
 )
+_MAX_EVENT_INCREMENT = 1_000_000
 _DURABLE_EVENT_COUNTS: Counter[tuple[str, str]] = Counter()
 _DURABLE_EVENT_LOCK = Lock()
 _ACTION_AGE_SQL = """CASE
@@ -163,11 +164,15 @@ def record_durable_command_response(status: DurableResolveStatus) -> None:
         _DURABLE_EVENT_COUNTS[("command_response", status.value)] += 1
 
 
-def record_durable_delivery_event(event: str) -> None:
-    if event not in _DELIVERY_EVENTS:
+def record_durable_delivery_event(event: str, *, count: int = 1) -> None:
+    if (
+        event not in _DELIVERY_EVENTS
+        or type(count) is not int
+        or not 1 <= count <= _MAX_EVENT_INCREMENT
+    ):
         return
     with _DURABLE_EVENT_LOCK:
-        _DURABLE_EVENT_COUNTS[("delivery", event)] += 1
+        _DURABLE_EVENT_COUNTS[("delivery", event)] += count
 
 
 def _optional_float(value: object) -> float | None:

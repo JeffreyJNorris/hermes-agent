@@ -3,6 +3,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from agent.monitoring.durable_health import build_durable_health_snapshot
 from gateway.durable_actions import PreparedDurableAction
 from gateway.durable_operations import DurableOperationsStore
@@ -156,6 +158,15 @@ def test_snapshot_contains_bounded_command_and_delivery_counters(tmp_path: Path)
     for secret in ("drq_", "actor-", "channel-", "PHASE4D-CANARY"):
         assert secret not in rendered
     _DURABLE_EVENT_COUNTS.clear()
+
+
+@pytest.mark.parametrize("count", [0, -1, True, 1.5, 1_000_001])
+def test_delivery_counter_rejects_invalid_counts(count: object) -> None:
+    _DURABLE_EVENT_COUNTS.clear()
+
+    record_durable_delivery_event("text_delivery_unknown", count=count)  # type: ignore[arg-type]
+
+    assert _DURABLE_EVENT_COUNTS == {}
 
 
 def test_snapshot_reports_text_command_delivery_backlog_without_receipts(

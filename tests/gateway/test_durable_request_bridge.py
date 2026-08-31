@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -223,6 +224,41 @@ async def test_definite_text_delivery_failure_is_counted_once(
     await DurableRequestBridge().process_once({"discord": adapter})
 
     assert events == ["native_to_text_fallback", "text_delivery_failed"]
+
+
+@pytest.mark.asyncio
+async def test_stale_text_delivery_claim_is_recovered_and_counted_once(
+    store: DurableRequestStore,
+    monkeypatch,
+) -> None:
+    events = []
+    monkeypatch.setattr(
+        "gateway.durable_operations.record_durable_delivery_event",
+        lambda event, count=1: events.extend([event] * count),
+    )
+    request = _create(
+        store,
+        command_response_allowed=True,
+        text_command_fallback_allowed=True,
+    )
+    claim = store.claim_next_pending(["discord"])
+    assert claim is not None
+    store.switch_claim_to_text_command(
+        request_id=request.request_id,
+        claim_id=claim.claim_id,
+    )
+    with sqlite3.connect(store._db_path) as db:
+        db.execute(
+            "UPDATE durable_requests SET delivery_claimed_at = 0 WHERE request_id = ?",
+            (request.request_id,),
+        )
+
+    bridge = DurableRequestBridge()
+    await bridge.process_once({"discord": Adapter()})
+    await bridge.process_once({"discord": Adapter()})
+
+    assert store.get(request_id=request.request_id).status is DurableRequestStatus.DELIVERY_UNKNOWN
+    assert events == ["text_delivery_unknown"]
 
 
 @pytest.mark.asyncio

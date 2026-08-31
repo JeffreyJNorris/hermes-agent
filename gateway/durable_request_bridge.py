@@ -67,6 +67,16 @@ class DurableRequestBridge:
         platforms = tuple(adapters_by_platform)
 
         store.expire_due()
+        text_unknown = store.recover_stale_delivery_claims(
+            stale_after_seconds=DELIVERY_CLAIM_STALE_SECONDS,
+            delivery_mode=DurableRequestDeliveryMode.TEXT_COMMAND,
+        )
+        if text_unknown:
+            from gateway.durable_operations import record_durable_delivery_event
+
+            record_durable_delivery_event(
+                "text_delivery_unknown", count=text_unknown
+            )
         store.recover_stale_delivery_claims(
             stale_after_seconds=DELIVERY_CLAIM_STALE_SECONDS
         )

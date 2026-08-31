@@ -9,6 +9,7 @@ import pytest
 import gateway.durable_requests as durable_requests
 from gateway.durable_requests import (
     DEFAULT_DURABLE_TERMINAL_RETENTION_SECONDS,
+    DurableRequestDeliveryMode,
     DurableRequestError,
     DurableRequestOption,
     DurableRequestSpec,
@@ -560,6 +561,38 @@ def test_stale_delivery_claim_becomes_unknown_and_is_not_requeued(tmp_path: Path
     assert persisted is not None
     assert persisted.status is DurableRequestStatus.DELIVERY_UNKNOWN
     assert store.claim_next_pending(["discord"]) is None
+
+
+def test_stale_delivery_recovery_can_filter_mode_without_changing_default(
+    tmp_path: Path,
+) -> None:
+    clock = Clock()
+    store = _store(tmp_path, clock)
+    text = _create(
+        store,
+        reference="text",
+        command_response_allowed=True,
+        text_command_fallback_allowed=True,
+    ).request
+    text_claim = store.claim_next_pending(["discord"])
+    assert text_claim is not None
+    store.switch_claim_to_text_command(
+        request_id=text_claim.request.request_id,
+        claim_id=text_claim.claim_id,
+    )
+    native = _create(store, reference="native").request
+    native_claim = store.claim_next_pending(["discord"])
+    assert native_claim is not None
+    clock.value += 6
+
+    assert store.recover_stale_delivery_claims(
+        stale_after_seconds=5,
+        delivery_mode=DurableRequestDeliveryMode.TEXT_COMMAND,
+    ) == 1
+    assert store.get(request_id=text.request_id).status is DurableRequestStatus.DELIVERY_UNKNOWN
+    assert store.get(request_id=native.request_id).status is DurableRequestStatus.PENDING_DELIVERY
+    assert store.recover_stale_delivery_claims(stale_after_seconds=5) == 1
+    assert store.get(request_id=native.request_id).status is DurableRequestStatus.DELIVERY_UNKNOWN
 
 
 def test_cancel_is_origin_scoped_and_terminal(tmp_path: Path) -> None:

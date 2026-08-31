@@ -1487,25 +1487,34 @@ class DurableRequestStore:
         self,
         *,
         stale_after_seconds: float = DELIVERY_CLAIM_STALE_SECONDS,
+        delivery_mode: DurableRequestDeliveryMode | None = None,
     ) -> int:
         if stale_after_seconds <= 0:
             raise DurableRequestError("stale_after_seconds must be positive")
+        if delivery_mode is not None and not isinstance(
+            delivery_mode, DurableRequestDeliveryMode
+        ):
+            raise DurableRequestError("invalid delivery mode")
         now = float(self._wall_clock())
         cutoff = now - float(stale_after_seconds)
+        mode_clause = "" if delivery_mode is None else " AND delivery_mode = ?"
+        mode_params: tuple[object, ...] = (
+            () if delivery_mode is None else (delivery_mode.value,)
+        )
         with self._lock, self._transaction(immediate=True) as conn:
             self._expire_due_locked(conn, now)
             request_ids = [
                 row["request_id"]
                 for row in conn.execute(
-                    """SELECT request_id FROM durable_requests
+                    f"""SELECT request_id FROM durable_requests
                        WHERE status = ? AND delivery_claim IS NOT NULL
                          AND delivery_claimed_at IS NOT NULL
-                         AND delivery_claimed_at <= ?""",
-                    (DurableRequestStatus.PENDING_DELIVERY.value, cutoff),
+                         AND delivery_claimed_at <= ?{mode_clause}""",
+                    (DurableRequestStatus.PENDING_DELIVERY.value, cutoff, *mode_params),
                 )
             ]
             updated = conn.execute(
-                """UPDATE durable_requests
+                f"""UPDATE durable_requests
                    SET status = ?, terminal_reason = ?, resolved_at = ?,
                        updated_at = ?, delivery_claim = NULL,
                        delivery_claimed_at = NULL,
@@ -1517,7 +1526,7 @@ class DurableRequestStore:
                        wake_reason = NULL
                    WHERE status = ? AND delivery_claim IS NOT NULL
                      AND delivery_claimed_at IS NOT NULL
-                     AND delivery_claimed_at <= ?""",
+                     AND delivery_claimed_at <= ?{mode_clause}""",
                 (
                     DurableRequestStatus.DELIVERY_UNKNOWN.value,
                     "provider_send_outcome_unknown",
@@ -1527,6 +1536,7 @@ class DurableRequestStore:
                     DurableWakeStatus.PENDING.value,
                     DurableRequestStatus.PENDING_DELIVERY.value,
                     cutoff,
+                    *mode_params,
                 ),
             ).rowcount
             for request_id in request_ids:
