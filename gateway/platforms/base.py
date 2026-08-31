@@ -5710,10 +5710,16 @@ class BasePlatformAdapter(ABC):
                 # Other bypass commands (/approve, /deny, /status,
                 # /background, /restart) just need direct dispatch — they
                 # don't cancel the running task.
-                logger.debug(
-                    "[%s] Command '/%s' bypassing active-session guard for %s",
-                    self.name, cmd, session_key,
-                )
+                if cmd == "request":
+                    logger.debug(
+                        "[%s] Command '/request' bypassing active-session guard",
+                        self.name,
+                    )
+                else:
+                    logger.debug(
+                        "[%s] Command '/%s' bypassing active-session guard for %s",
+                        self.name, cmd, session_key,
+                    )
                 try:
                     _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
                     response = await self._message_handler(event)
