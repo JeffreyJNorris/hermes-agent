@@ -3829,6 +3829,20 @@ class BasePlatformAdapter(ABC):
             error_kind="unsupported",
         )
 
+    async def send_durable_request_text(
+        self,
+        chat_id: str,
+        request: "DurableRequest",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Deliver one complete command-driven durable request message."""
+
+        return SendResult(
+            success=False,
+            error="Durable request text delivery is not supported",
+            error_kind="unsupported",
+        )
+
     async def restore_durable_request(
         self,
         request: "DurableRequest",

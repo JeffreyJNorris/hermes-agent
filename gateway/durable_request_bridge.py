@@ -14,6 +14,7 @@ from gateway.durable_requests import (
     MAX_WAKE_BATCH,
     WAKE_CLAIM_STALE_SECONDS,
     DurableRequest,
+    DurableRequestDeliveryMode,
     DurableRequestStatus,
     DurableWakeClaim,
     get_durable_request_store,
@@ -81,6 +82,7 @@ class DurableRequestBridge:
             await self._deliver_pending_requests(
                 store=store,
                 adapters_by_platform=adapters_by_platform,
+                allow_text_delivery_fallback=config.allow_text_delivery_fallback,
             )
         if self._wake_handler is not None:
             await self._deliver_terminal_wakes(
@@ -149,6 +151,8 @@ class DurableRequestBridge:
         bound_requests = store.list_bound_requests(adapters_by_platform)
         live_keys: set[tuple[int, str, str]] = set()
         for request in bound_requests:
+            if request.delivery_mode is DurableRequestDeliveryMode.TEXT_COMMAND:
+                continue
             adapter = adapters_by_platform.get(request.target.platform)
             if adapter is None or request.message_id is None:
                 continue
@@ -224,6 +228,7 @@ class DurableRequestBridge:
         *,
         store,
         adapters_by_platform: Mapping[str, Any],
+        allow_text_delivery_fallback: bool,
     ) -> None:
         for _ in range(MAX_DELIVERY_BATCH):
             claim = store.claim_next_pending(adapters_by_platform)
@@ -239,6 +244,17 @@ class DurableRequestBridge:
                     claim_id=claim.claim_id,
                 )
                 return
+
+            if request.delivery_mode is DurableRequestDeliveryMode.TEXT_COMMAND:
+                keep_processing = await self._deliver_text_request(
+                    store=store,
+                    adapter=adapter,
+                    request=request,
+                    claim_id=claim.claim_id,
+                )
+                if not keep_processing:
+                    return
+                continue
 
             send = getattr(adapter, "send_durable_request", None)
             if send is None:
@@ -308,6 +324,26 @@ class DurableRequestBridge:
                     claim_id=claim.claim_id,
                 )
                 return
+            if (
+                result.error_kind == "unsupported"
+                and allow_text_delivery_fallback
+                and request.command_response_allowed
+            ):
+                text_request = store.switch_claim_to_text_command(
+                    request_id=request.request_id,
+                    claim_id=claim.claim_id,
+                )
+                if text_request is None:
+                    continue
+                keep_processing = await self._deliver_text_request(
+                    store=store,
+                    adapter=adapter,
+                    request=text_request,
+                    claim_id=claim.claim_id,
+                )
+                if not keep_processing:
+                    return
+                continue
             if result.error_kind == "unsupported":
                 terminal_status = DurableRequestStatus.UNSUPPORTED
                 reason = "adapter_unsupported"
@@ -323,6 +359,88 @@ class DurableRequestBridge:
                 status=terminal_status,
                 reason=reason,
             )
+
+    async def _deliver_text_request(
+        self,
+        *,
+        store,
+        adapter: Any,
+        request: DurableRequest,
+        claim_id: str,
+    ) -> bool:
+        send = getattr(adapter, "send_durable_request_text", None)
+        if send is None:
+            store.fail_delivery(
+                request_id=request.request_id,
+                claim_id=claim_id,
+                status=DurableRequestStatus.UNSUPPORTED,
+                reason="adapter_text_unsupported",
+            )
+            return True
+        try:
+            result = await send(
+                chat_id=request.target.chat_id,
+                request=request,
+                metadata={"thread_id": request.target.thread_id},
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            store.fail_delivery(
+                request_id=request.request_id,
+                claim_id=claim_id,
+                status=DurableRequestStatus.DELIVERY_UNKNOWN,
+                reason="provider_text_send_outcome_unknown",
+            )
+            logger.warning(
+                "Durable request text delivery raised",
+                extra={
+                    "request_id": request.request_id,
+                    "platform": request.target.platform,
+                    "exception_class": type(exc).__name__,
+                },
+            )
+            return True
+
+        if result.success:
+            if not result.message_id:
+                store.fail_delivery(
+                    request_id=request.request_id,
+                    claim_id=claim_id,
+                    status=DurableRequestStatus.DELIVERY_UNKNOWN,
+                    reason="missing_text_message_id",
+                )
+                return True
+            store.bind_delivery(
+                request_id=request.request_id,
+                claim_id=claim_id,
+                platform=request.target.platform,
+                message_id=str(result.message_id),
+            )
+            return True
+
+        if result.error_kind in {"transient", "rate_limited"}:
+            store.release_delivery_claim(
+                request_id=request.request_id,
+                claim_id=claim_id,
+            )
+            return False
+        if result.error_kind == "unsupported":
+            status = DurableRequestStatus.UNSUPPORTED
+            reason = "adapter_text_unsupported"
+        elif result.error_kind == "delivery_unknown":
+            status = DurableRequestStatus.DELIVERY_UNKNOWN
+            reason = "provider_text_send_outcome_unknown"
+        else:
+            status = DurableRequestStatus.DELIVERY_FAILED
+            reason = f"provider_text_delivery_{result.error_kind or 'failed'}"
+        store.fail_delivery(
+            request_id=request.request_id,
+            claim_id=claim_id,
+            status=status,
+            reason=reason,
+        )
+        return True
 
 
 def _adapters_by_platform(adapters: Mapping[Any, Any]) -> dict[str, Any]:

@@ -14,6 +14,8 @@ from gateway.durable_requests import (
     DurableResponderMode,
     DurableResolveResult,
     DurableResolveStatus,
+    render_durable_request_content,
+    render_durable_request_text_command_content,
 )
 
 
@@ -180,6 +182,37 @@ def _request(*, message_id: str | None = None) -> DurableRequest:
     )
 
 
+def test_native_alternative_is_visible_only_when_command_response_allowed() -> None:
+    request = _request()
+
+    assert "/request respond" not in render_durable_request_content(request)
+    content = render_durable_request_content(
+        replace(request, command_response_allowed=True)
+    )
+
+    assert (
+        f"Alternative: /request respond {request.request_id} <number>" in content
+    )
+
+
+def test_text_command_render_includes_full_receipt_and_every_option() -> None:
+    request = replace(_request(), command_response_allowed=True)
+
+    content = render_durable_request_text_command_content(request)
+
+    assert content == (
+        "**Approve release**\n\n"
+        "Should the reviewed release continue?\n\n"
+        f"Request: {request.request_id}\n\n"
+        "Choose one option:\n"
+        "1. Approve\n"
+        "2. Reject\n\n"
+        "Respond in this channel with:\n"
+        f"/request respond {request.request_id} <number>"
+    )
+    assert "canonical-" not in content
+
+
 class _Message:
     def __init__(self, message_id=99):
         self.id = message_id
@@ -265,6 +298,53 @@ async def test_send_uses_substantive_content_mentions_off_and_opaque_slots(
         "2",
     ]
     assert all("canonical-" not in button.custom_id for button in view.children)
+
+
+@pytest.mark.asyncio
+async def test_send_text_uses_one_unsplit_message_mentions_off_and_exact_id(
+    discord_adapter_module,
+) -> None:
+    module = discord_adapter_module
+    channel = _Channel()
+    adapter = object.__new__(module.DiscordAdapter)
+    adapter._client = _Client(channel)
+    adapter.MAX_MESSAGE_LENGTH = 2000
+    request = replace(_request(), command_response_allowed=True)
+
+    result = await adapter.send_durable_request_text(
+        chat_id="10",
+        request=request,
+        metadata={"thread_id": "11"},
+    )
+
+    assert result.success is True
+    assert result.message_id == "99"
+    assert len(channel.sent) == 1
+    assert channel.sent[0] == {
+        "content": render_durable_request_text_command_content(request),
+        "allowed_mentions": _FakeAllowedMentions.sentinel,
+    }
+
+
+@pytest.mark.asyncio
+async def test_send_text_rejects_complete_render_over_transport_limit(
+    discord_adapter_module,
+) -> None:
+    module = discord_adapter_module
+    channel = _Channel()
+    adapter = object.__new__(module.DiscordAdapter)
+    adapter._client = _Client(channel)
+    adapter.MAX_MESSAGE_LENGTH = 20
+
+    result = await adapter.send_durable_request_text(
+        chat_id="10",
+        request=replace(_request(), command_response_allowed=True),
+        metadata={"thread_id": "11"},
+    )
+
+    assert result.success is False
+    assert result.error_kind == "too_long"
+    assert channel.sent == []
 
 
 @pytest.mark.asyncio

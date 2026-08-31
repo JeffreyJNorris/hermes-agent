@@ -183,6 +183,7 @@ from gateway.durable_requests import (
     get_durable_request_store,
     make_durable_component_id,
     render_durable_request_content,
+    render_durable_request_text_command_content,
 )
 
 
@@ -7408,6 +7409,77 @@ class DiscordAdapter(BasePlatformAdapter):
                 error="Discord durable request restoration failed",
                 error_kind=kind,
             )
+
+    async def send_durable_request_text(
+        self,
+        chat_id: str,
+        request: DurableRequest,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send one complete command-driven durable request message."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(
+                success=False,
+                error="Not connected",
+                error_kind="transient",
+            )
+        if not isinstance(request, DurableRequest) or not request.command_response_allowed:
+            return SendResult(
+                success=False,
+                error="Invalid durable text request",
+                error_kind="bad_format",
+            )
+
+        content = render_durable_request_text_command_content(request)
+        if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
+            return SendResult(
+                success=False,
+                error="Durable text request exceeds Discord message limit",
+                error_kind="too_long",
+            )
+        target_id = (
+            metadata.get("thread_id")
+            if metadata and metadata.get("thread_id")
+            else chat_id
+        )
+        try:
+            channel = self._client.get_channel(int(target_id))
+            if channel is None:
+                channel = await self._client.fetch_channel(int(target_id))
+            if channel is None:
+                return SendResult(
+                    success=False,
+                    error="Channel not found",
+                    error_kind="not_found",
+                )
+        except Exception as exc:
+            return SendResult(
+                success=False,
+                error="Discord durable text request target lookup failed",
+                error_kind=classify_send_error(exc),
+            )
+
+        try:
+            message = await channel.send(
+                content=content,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] send_durable_request_text failed (%s)",
+                self.name,
+                type(exc).__name__,
+                extra={
+                    "request_id": request.request_id,
+                    "exception_class": type(exc).__name__,
+                },
+            )
+            return SendResult(
+                success=False,
+                error="Discord durable text request delivery outcome is unknown",
+                error_kind="delivery_unknown",
+            )
+        return SendResult(success=True, message_id=str(message.id))
 
     async def send_clarify(
         self,

@@ -377,6 +377,39 @@ def render_durable_request_content(request: DurableRequest | DurableRequestSpec)
         f"{index}. {option.label}"
         for index, option in enumerate(request.options, start=1)
     )
+    if isinstance(request, DurableRequest) and request.command_response_allowed:
+        lines.extend(
+            (
+                "",
+                f"Alternative: /request respond {request.request_id} <number>",
+            )
+        )
+    return "\n".join(lines)
+
+
+def render_durable_request_text_command_content(request: DurableRequest) -> str:
+    """Render a complete command-driven durable request without option IDs."""
+
+    lines = [
+        f"**{request.title}**",
+        "",
+        request.body,
+        "",
+        f"Request: {request.request_id}",
+        "",
+        "Choose one option:",
+    ]
+    lines.extend(
+        f"{index}. {option.label}"
+        for index, option in enumerate(request.options, start=1)
+    )
+    lines.extend(
+        (
+            "",
+            "Respond in this channel with:",
+            f"/request respond {request.request_id} <number>",
+        )
+    )
     return "\n".join(lines)
 
 
@@ -1216,6 +1249,57 @@ class DurableRequestStore:
                 ),
             ).rowcount
             return updated == 1
+
+    def switch_claim_to_text_command(
+        self,
+        *,
+        request_id: str,
+        claim_id: str,
+    ) -> DurableRequest | None:
+        """Change an actively claimed native delivery to command text."""
+
+        rid = _validate_request_id(request_id)
+        claim = _require_text(
+            claim_id,
+            field="claim_id",
+            maximum=256,
+            single_line=True,
+        )
+        now = float(self._wall_clock())
+        with self._lock, self._transaction(immediate=True) as conn:
+            row = conn.execute(
+                "SELECT * FROM durable_requests WHERE request_id = ?",
+                (rid,),
+            ).fetchone()
+            if row is None:
+                return None
+            row = self._expire_row_if_due_locked(conn, row, now)
+            if (
+                row["status"] != DurableRequestStatus.PENDING_DELIVERY.value
+                or row["delivery_claim"] != claim
+                or row["delivery_mode"] != DurableRequestDeliveryMode.NATIVE.value
+                or not bool(row["command_response_allowed"])
+            ):
+                return None
+            conn.execute(
+                """UPDATE durable_requests
+                   SET delivery_mode = ?, updated_at = ?
+                   WHERE request_id = ? AND status = ?
+                     AND delivery_claim = ?""",
+                (
+                    DurableRequestDeliveryMode.TEXT_COMMAND.value,
+                    now,
+                    rid,
+                    DurableRequestStatus.PENDING_DELIVERY.value,
+                    claim,
+                ),
+            )
+            updated = conn.execute(
+                "SELECT * FROM durable_requests WHERE request_id = ?",
+                (rid,),
+            ).fetchone()
+            assert updated is not None
+            return self._row_to_request(updated)
 
     def bind_delivery(
         self,
@@ -2749,6 +2833,7 @@ __all__ = [
     "load_durable_requests_config",
     "make_durable_component_id",
     "render_durable_request_content",
+    "render_durable_request_text_command_content",
     "reset_durable_request_store_cache",
     "resolve_durable_request",
     "resolve_durable_request_command",

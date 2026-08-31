@@ -28,13 +28,20 @@ async def test_durable_request_methods_are_optional_and_explicitly_unsupported()
         chat_id="chat",
         request=object(),  # type: ignore[arg-type]
     )
+    text = await adapter.send_durable_request_text(
+        chat_id="chat",
+        request=object(),  # type: ignore[arg-type]
+    )
     restore = await adapter.restore_durable_request(
         request=object(),  # type: ignore[arg-type]
     )
 
     assert send.success is False
     assert send.error_kind == "unsupported"
+    assert text.success is False
+    assert text.error_kind == "unsupported"
     assert restore.success is False
     assert restore.error_kind == "unsupported"
     assert "send_durable_request" not in _StubAdapter.__abstractmethods__
+    assert "send_durable_request_text" not in _StubAdapter.__abstractmethods__
     assert "restore_durable_request" not in _StubAdapter.__abstractmethods__

@@ -11,6 +11,7 @@ from gateway.durable_request_bridge import (
     DurableWakeDisposition,
 )
 from gateway.durable_requests import (
+    DurableRequestDeliveryMode,
     DurableRequestOption,
     DurableRequestSpec,
     DurableRequestStatus,
@@ -30,11 +31,16 @@ class Adapter:
         send_result: SendResult | None = None,
         restore_result: SendResult | None = None,
         send_error: Exception | None = None,
+        text_result: SendResult | None = None,
+        text_error: Exception | None = None,
     ) -> None:
         self.send_result = send_result or SendResult(success=True, message_id="m1")
         self.restore_result = restore_result or SendResult(success=True, message_id="m1")
         self.send_error = send_error
+        self.text_result = text_result or SendResult(success=True, message_id="tm1")
+        self.text_error = text_error
         self.sent = []
+        self.text_sent = []
         self.restored = []
 
     async def send_durable_request(self, chat_id, request, metadata=None):
@@ -42,6 +48,12 @@ class Adapter:
         if self.send_error is not None:
             raise self.send_error
         return self.send_result
+
+    async def send_durable_request_text(self, chat_id, request, metadata=None):
+        self.text_sent.append((chat_id, request, metadata))
+        if self.text_error is not None:
+            raise self.text_error
+        return self.text_result
 
     async def restore_durable_request(self, request):
         self.restored.append(request)
@@ -56,6 +68,8 @@ def _config() -> DurableRequestsConfig:
         max_ttl_seconds=604800,
         terminal_retention_seconds=604800,
         scheduled_responder_mode=DurableResponderMode.ANY_AUTHORIZED,
+        command_responses_enabled=True,
+        allow_text_delivery_fallback=True,
     )
 
 
@@ -64,6 +78,7 @@ def _create(
     reference: str = "ref",
     *,
     wake_on_terminal: bool = False,
+    command_response_allowed: bool = False,
 ):
     return store.create(
         DurableRequestSpec(
@@ -83,7 +98,92 @@ def _create(
         origin_type="cron",
         origin_id="job",
         wake_on_terminal=wake_on_terminal,
+        command_response_allowed=command_response_allowed,
     ).request
+
+
+@pytest.mark.asyncio
+async def test_native_unsupported_falls_back_to_text_once(
+    store: DurableRequestStore,
+) -> None:
+    request = _create(store, command_response_allowed=True)
+    adapter = Adapter(
+        send_result=SendResult(success=False, error_kind="unsupported"),
+        text_result=SendResult(success=True, message_id="text-7"),
+    )
+
+    await DurableRequestBridge().process_once({"discord": adapter})
+    await DurableRequestBridge().process_once({"discord": adapter})
+
+    persisted = store.get(request_id=request.request_id)
+    assert persisted is not None
+    assert persisted.status is DurableRequestStatus.OPEN
+    assert persisted.delivery_mode is DurableRequestDeliveryMode.TEXT_COMMAND
+    assert persisted.message_id == "text-7"
+    assert len(adapter.sent) == 1
+    assert len(adapter.text_sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_native_success_never_sends_text_fallback(
+    store: DurableRequestStore,
+) -> None:
+    request = _create(store, command_response_allowed=True)
+    adapter = Adapter(send_result=SendResult(success=True, message_id="native-7"))
+
+    await DurableRequestBridge().process_once({"discord": adapter})
+
+    assert store.get(request_id=request.request_id).message_id == "native-7"
+    assert adapter.text_sent == []
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_native_failure_never_sends_text_fallback(
+    store: DurableRequestStore,
+) -> None:
+    request = _create(store, command_response_allowed=True)
+    adapter = Adapter(
+        send_result=SendResult(success=False, error_kind="delivery_unknown")
+    )
+
+    await DurableRequestBridge().process_once({"discord": adapter})
+
+    assert store.get(request_id=request.request_id).status is DurableRequestStatus.DELIVERY_UNKNOWN
+    assert adapter.text_sent == []
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_text_delivery_is_not_retried_after_restart(
+    store: DurableRequestStore,
+) -> None:
+    request = _create(store, command_response_allowed=True)
+    adapter = Adapter(
+        send_result=SendResult(success=False, error_kind="unsupported"),
+        text_result=SendResult(success=False, error_kind="delivery_unknown"),
+    )
+
+    await DurableRequestBridge().process_once({"discord": adapter})
+    await DurableRequestBridge().process_once({"discord": adapter})
+
+    persisted = store.get(request_id=request.request_id)
+    assert persisted.status is DurableRequestStatus.DELIVERY_UNKNOWN
+    assert len(adapter.text_sent) == 1
+
+
+@pytest.mark.asyncio
+async def test_bound_text_request_skips_native_view_restore(
+    store: DurableRequestStore,
+) -> None:
+    _create(store, command_response_allowed=True)
+    first = Adapter(send_result=SendResult(success=False, error_kind="unsupported"))
+    await DurableRequestBridge().process_once({"discord": first})
+
+    restarted = Adapter()
+    await DurableRequestBridge().process_once({"discord": restarted})
+
+    assert restarted.restored == []
+    assert restarted.sent == []
+    assert restarted.text_sent == []
 
 
 @pytest.fixture
