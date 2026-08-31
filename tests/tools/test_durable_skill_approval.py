@@ -351,11 +351,25 @@ def test_parent_swap_after_secure_open_cannot_quarantine_outside_file(tmp_path, 
 
 def test_missing_secure_dirfd_capability_uses_legacy_manual_record(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
-    monkeypatch.setattr(wa, "_secure_skill_capabilities_available", lambda: False)
+    monkeypatch.setattr(wa, "_secure_skill_capabilities_available", lambda root: False)
     record = wa.stage_skill_write({"action": "create", "name": "demo", "content": VALID}, summary="x", origin="foreground")
     assert record["status"] == "pending_manual_review"
     assert "manifest_version" not in record
     assert record["payload"]["content"] == VALID
+
+
+@pytest.mark.parametrize("error", [wa.errno.EPERM, wa.errno.EOPNOTSUPP])
+def test_secure_capability_probe_fails_closed_and_cleans_artifacts(tmp_path, monkeypatch, error):
+    root = tmp_path / "skills"; root.mkdir()
+    monkeypatch.setattr(wa, "_renameat2", lambda *args: (_ for _ in ()).throw(OSError(error, "blocked")))
+    assert wa._secure_skill_capabilities_available(root) is False
+    assert not list(root.glob(".durable-probe-*"))
+
+
+def test_secure_capability_probe_proves_actual_skill_filesystem_and_cleans(tmp_path):
+    root = tmp_path / "skills"; root.mkdir()
+    assert wa._secure_skill_capabilities_available(root) is True
+    assert not list(root.glob(".durable-probe-*"))
 
 
 @pytest.mark.parametrize("fault_point,expected_status", [

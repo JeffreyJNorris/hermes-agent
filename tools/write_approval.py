@@ -1223,14 +1223,14 @@ def _stage_skill_write_locked(
     action, name = payload.get("action"), payload.get("name")
     if action not in {"create", "edit", "patch", "write_file", "remove_file", "delete"}:
         return _skill_manual(payload, summary, origin, "unsupported_operation")
-    if not _secure_skill_capabilities_available():
-        return _skill_manual(payload, summary, origin, "secure_mutation_unavailable")
     if not isinstance(name, str) or sm._validate_name(name):
         return _skill_manual(payload, summary, origin, "invalid_target")
     root = get_hermes_home() / "skills"
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     if root.is_symlink():
         return _skill_manual(payload, summary, origin, "unsafe_root")
+    if not _secure_skill_capabilities_available(root):
+        return _skill_manual(payload, summary, origin, "secure_mutation_unavailable")
     existing = sm._find_skill(name)
     if action == "create":
         if existing:
@@ -1692,7 +1692,7 @@ def _renameat2(source_fd: int, source: str, target_fd: int, target: str, flags: 
         raise OSError(code, os.strerror(code))
 
 
-def _secure_skill_capabilities_available() -> bool:
+def _secure_skill_capabilities_available(root: Path) -> bool:
     if (os.name != "posix" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY")
             or getattr(ctypes.CDLL(None), "renameat2", None) is None):
         return False
@@ -1700,10 +1700,43 @@ def _secure_skill_capabilities_available() -> bool:
     if not all(function in os.supports_dir_fd for function in required):
         return False
     try:
-        _renameat2(-1, "", -1, "", 1)
-    except OSError as exc:
-        return exc.errno != errno.ENOSYS
-    return True
+        root_fd = _open_skill_dirfd(root, Path())
+    except OSError:
+        return False
+    prefix = f".durable-probe-{uuid.uuid4().hex}"
+    first, second = f"{prefix}-a", f"{prefix}-b"
+    proven = cleanup_ok = False
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        for name in (first, second):
+            fd = os.open(name, flags, 0o600, dir_fd=root_fd)
+            try: os.fsync(fd)
+            finally: os.close(fd)
+        try:
+            _renameat2(root_fd, first, root_fd, second, 1)
+        except OSError as exc:
+            if exc.errno != errno.EEXIST:
+                raise
+        else:
+            raise OSError("renameat2 no-replace was not enforced")
+        _renameat2(root_fd, first, root_fd, second, 2)
+        os.fsync(root_fd)
+        proven = True
+    except OSError:
+        pass
+    finally:
+        cleanup_ok = True
+        for name in (first, second):
+            try:
+                os.unlink(name, dir_fd=root_fd)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                cleanup_ok = False
+        try: os.fsync(root_fd)
+        except OSError: cleanup_ok = False
+        os.close(root_fd)
+    return proven and cleanup_ok
 
 
 def _skill_entry_snapshot(parent_fd: int, name: str) -> tuple[bool, str, Optional[str], Optional[tuple[int, int]]]:
@@ -2093,7 +2126,7 @@ def execute_durable_skill_pending(context, *, _manual: bool = False):
             return failed(DurableActionStatus.INVALIDATED, "baseline_changed")
         if operation["operation"] == "create" and target.parent.exists():
             return failed(DurableActionStatus.INVALIDATED, "target_exists")
-        if not _secure_skill_capabilities_available():
+        if not _secure_skill_capabilities_available(root):
             return failed(DurableActionStatus.INVALIDATED, "secure_mutation_unavailable")
         expected_entry = (re_exists, re_kind, re_digest, re_identity)
         try:
