@@ -32,6 +32,10 @@ durable_requests:
   max_ttl_seconds: 604800
   terminal_retention_seconds: 604800
   scheduled_responder_policy: any_authorized
+  command_responses:
+    enabled: false
+    allow_on_native_delivery: true
+    allow_text_delivery_fallback: true
 ```
 
 Current delivery support uses a Discord inbox only. The model cannot choose the platform,
@@ -44,6 +48,15 @@ the only permitted responder after the adapter's normal authorization check.
 For a scheduled request, `any_authorized` means any user accepted by the
 Discord adapter's existing user/role authorization settings. It does not mean
 anyone who can see the channel.
+
+Explicit request commands are disabled by default. When `enabled` is true,
+new requests snapshot whether command responses are allowed; changing the
+configuration does not widen an existing request. `allow_on_native_delivery`
+adds `/request respond <request-id> <number>` as an alternative to native
+buttons. `allow_text_delivery_fallback` permits one command-driven text
+presentation only when native delivery returns the structural `unsupported`
+result. It never falls back after a failed or ambiguous send. Historical rows
+migrate as native delivery with command responses and text fallback disabled.
 
 ## Tool contract
 
