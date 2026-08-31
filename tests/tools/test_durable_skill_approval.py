@@ -106,6 +106,27 @@ def test_review_rejects_snapshot_bytes_that_do_not_match_manifest(tmp_path, monk
     assert wa.skill_pending_diff(record) == "(durable review unavailable)"
 
 
+def test_local_diff_is_complete_when_durable_prompt_exceeds_render_cap(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    content = VALID + ("changed line\n" * 7_000)
+    record = wa.stage_skill_write({"action": "create", "name": "demo", "content": content}, summary="x", origin="foreground")
+    review = wa.skill_pending_diff(record)
+    assert len(review) > wa.MAX_DURABLE_SKILL_DIFF_CHARS
+    assert review.endswith("+changed line\n")
+    assert wa.create_skill_durable_approval(record)["reason"] == "invalid_or_oversize_review"
+
+
+@pytest.mark.parametrize("action", ["write_file", "patch"])
+def test_supporting_content_uses_existing_character_limit(tmp_path, monkeypatch, action):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    skill = tmp_path / "skills" / "demo"; (skill / "references").mkdir(parents=True)
+    (skill / "SKILL.md").write_text(VALID); (skill / "references" / "a").write_text("old")
+    payload = ({"action": action, "name": "demo", "file_path": "references/a", "file_content": "x" * 100_001}
+               if action == "write_file" else
+               {"action": action, "name": "demo", "file_path": "references/a", "old_string": "old", "new_string": "x" * 100_001})
+    assert wa.stage_skill_write(payload, summary="x", origin="foreground")["status"] == "pending_manual_review"
+
+
 def test_non_directory_parent_and_bad_pending_id_fail_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
     skill = tmp_path / "skills" / "demo"; skill.mkdir(parents=True); (skill / "SKILL.md").write_text(VALID)
@@ -293,6 +314,39 @@ def test_root_change_oversize_and_binary_baseline_fail_closed(tmp_path, monkeypa
     record = wa.stage_skill_write({"action": "create", "name": "demo", "content": VALID}, summary="x", origin="foreground")
     other = tmp_path / "other"; monkeypatch.setenv("HERMES_HOME", str(other))
     assert wa.execute_durable_skill_pending(_context(record)).status is DurableActionStatus.INVALIDATED
+
+
+def test_parent_swap_after_secure_open_cannot_write_outside_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    skill = tmp_path / "skills" / "demo"; skill.mkdir(parents=True); (skill / "SKILL.md").write_text(VALID)
+    outside = tmp_path / "outside"; outside.mkdir(); (outside / "SKILL.md").write_text("outside")
+    record = wa.stage_skill_write({"action": "edit", "name": "demo", "content": VALID.replace("Do it.", "changed")}, summary="x", origin="foreground")
+
+    def swap(point):
+        if point == "parents_opened":
+            skill.rename(tmp_path / "skills" / "moved")
+            skill.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(wa, "_skill_mutation_fault", swap)
+    assert wa.execute_durable_skill_pending(_context(record)).status is DurableActionStatus.UNKNOWN
+    assert (outside / "SKILL.md").read_text() == "outside"
+
+
+def test_parent_swap_after_secure_open_cannot_quarantine_outside_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    skill = tmp_path / "skills" / "demo"; references = skill / "references"
+    references.mkdir(parents=True); (skill / "SKILL.md").write_text(VALID); (references / "a").write_text("inside")
+    outside = tmp_path / "outside"; outside.mkdir(); (outside / "a").write_text("outside")
+    record = wa.stage_skill_write({"action": "remove_file", "name": "demo", "file_path": "references/a"}, summary="x", origin="foreground")
+
+    def swap(point):
+        if point == "parents_opened":
+            references.rename(skill / "moved-references")
+            references.symlink_to(outside, target_is_directory=True)
+
+    monkeypatch.setattr(wa, "_skill_mutation_fault", swap)
+    assert wa.execute_durable_skill_pending(_context(record)).status is DurableActionStatus.UNKNOWN
+    assert (outside / "a").read_text() == "outside"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     skill = tmp_path / "skills" / "binary"; skill.mkdir(parents=True); (skill / "SKILL.md").write_bytes(b"\xff\xfe")
     binary = wa.stage_skill_write({"action": "patch", "name": "binary", "old_string": "x", "new_string": "y"}, summary="x", origin="foreground")
@@ -337,7 +391,7 @@ def test_remove_fault_after_executing_is_unknown_with_journal_evidence(tmp_path,
     real_replace = wa.os.replace
 
     def fail_target(source, destination, *args, **kwargs):
-        if Path(source) == target:
+        if Path(source) in {target, Path(target.name)}:
             raise OSError("fault")
         return real_replace(source, destination, *args, **kwargs)
 
@@ -401,6 +455,27 @@ def test_reconciliation_cleans_only_matching_remove_evidence(tmp_path, monkeypat
     monkeypatch.setattr(wa, "skill_action_receipt", lambda pid: ("req", "unknown", reconciliation))
     assert wa.cleanup_terminal_skill_evidence() == cleaned
     assert (tmp_path / "skills" / ".transactions" / record["id"]).exists() is (not cleaned)
+    if cleaned:
+        assert wa.get_pending(wa.SKILLS, record["id"]) is None
+        assert not wa.list_pending(wa.SKILLS, include_terminal=True)
+
+
+def test_staging_exception_cleanup_does_not_remove_concurrent_pending_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    concurrent = tmp_path / "pending" / "skills" / "concur01"
+    real_write = wa._write_pending_record
+
+    def fail(record):
+        if record.get("manifest_version") == 1:
+            concurrent.mkdir()
+            raise OSError("fault")
+        return real_write(record)
+
+    monkeypatch.setattr(wa, "_write_pending_record", fail)
+    with pytest.raises(OSError):
+        wa.stage_skill_write({"action": "create", "name": "demo", "content": VALID}, summary="x", origin="foreground")
+    assert concurrent.is_dir()
+    assert list((tmp_path / "pending" / "skills").iterdir()) == [concurrent]
 
 
 def test_terminal_rejection_cleans_staged_bytes_but_unknown_retains_them(tmp_path, monkeypatch):

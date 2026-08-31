@@ -1195,8 +1195,6 @@ def _skill_relative_path(payload: Dict[str, Any], skill_dir: Path) -> Optional[P
         if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
             return None
         return skill_dir.relative_to(get_hermes_home() / "skills") / path
-    if action == "delete":
-        return skill_dir.relative_to(get_hermes_home() / "skills")
     return None
 
 
@@ -1209,7 +1207,10 @@ def _skill_rejected(reason: str) -> Dict[str, Any]:
     return {"status": "rejected", "reason": reason}
 
 
-def _stage_skill_write_locked(payload: Dict[str, Any], *, summary: str, origin: str) -> Dict[str, Any]:
+def _stage_skill_write_locked(
+    payload: Dict[str, Any], *, summary: str, origin: str,
+    pending_id: Optional[str] = None, created: Optional[List[Path]] = None,
+) -> Dict[str, Any]:
     """Stage exact skill bytes; unsupported shapes remain legacy-manual."""
     from tools import skill_manager_tool as sm
 
@@ -1218,8 +1219,6 @@ def _stage_skill_write_locked(payload: Dict[str, Any], *, summary: str, origin: 
         return _skill_manual(payload, summary, origin, "unsupported_operation")
     if not isinstance(name, str) or sm._validate_name(name):
         return _skill_manual(payload, summary, origin, "invalid_target")
-    if action == "delete":
-        return _skill_manual(payload, summary, origin, "unsupported_operation")
     root = get_hermes_home() / "skills"
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     if root.is_symlink():
@@ -1251,9 +1250,9 @@ def _stage_skill_write_locked(payload: Dict[str, Any], *, summary: str, origin: 
         except Exception:
             return _skill_rejected("provenance_unavailable")
     if action == "delete":
-        pinned = sm._pinned_guard(name)
-        if pinned or sm._org_mirror_write_guard(name, skill_dir, "delete"):
+        if sm._pinned_guard(name) or sm._org_mirror_write_guard(name, skill_dir, "delete"):
             return _skill_rejected("protected_target")
+        return _skill_manual(payload, summary, origin, "unsupported_operation")
     if action == "create" and skill_dir.exists():
         return _skill_rejected("target_exists")
     relative = _skill_relative_path(payload, skill_dir)
@@ -1294,8 +1293,6 @@ def _stage_skill_write_locked(payload: Dict[str, Any], *, summary: str, origin: 
         desired = content.encode("utf-8")
     elif action == "remove_file" and kind != "file":
         return _skill_manual(payload, summary, origin, "target_missing")
-    elif action == "delete" and kind != "directory":
-        return _skill_manual(payload, summary, origin, "target_missing")
     if desired is not None and len(desired) > MAX_DURABLE_SKILL_FILE_BYTES:
         return _skill_manual(payload, summary, origin, "review_too_large")
     if desired is not None and relative.name == "SKILL.md":
@@ -1303,7 +1300,14 @@ def _stage_skill_write_locked(payload: Dict[str, Any], *, summary: str, origin: 
         except UnicodeDecodeError: return _skill_manual(payload, summary, origin, "non_text")
         if sm._validate_frontmatter(text, new_skill=action == "create") or sm._validate_content_size(text):
             return _skill_manual(payload, summary, origin, "invalid_content")
-    pending_id = uuid.uuid4().hex[:8]
+    elif desired is not None:
+        try:
+            supporting_text = desired.decode("utf-8")
+        except UnicodeDecodeError:
+            return _skill_manual(payload, summary, origin, "non_text")
+        if sm._validate_content_size(supporting_text, label=relative.as_posix()):
+            return _skill_manual(payload, summary, origin, "invalid_content")
+    pending_id = pending_id or uuid.uuid4().hex[:8]
     directory = _skill_pending_path(pending_id)
     for private_root in (get_hermes_home() / "pending", _pending_dir(SKILLS)):
         private_root.mkdir(exist_ok=True, mode=0o700)
@@ -1312,6 +1316,8 @@ def _stage_skill_write_locked(payload: Dict[str, Any], *, summary: str, origin: 
             raise OSError("unsafe pending directory")
         if os.name == "posix": private_root.chmod(0o700)
     directory.mkdir(mode=0o700)
+    if created is not None:
+        created.append(directory)
     staged_dir = directory / "staged"
     baseline_dir = directory / "baseline"
     staged_dir.mkdir(mode=0o700)
@@ -1332,7 +1338,7 @@ def _stage_skill_write_locked(payload: Dict[str, Any], *, summary: str, origin: 
         fd = os.open(baseline_dir / "0", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as stream:
             stream.write(baseline_bytes or b""); stream.flush(); os.fsync(stream.fileno())
-    if action != "delete" and sm._guard_agent_created_enabled():
+    if sm._guard_agent_created_enabled():
         review_skill = directory / "review" / name
         try:
             if existing:
@@ -1378,13 +1384,17 @@ def stage_skill_write(payload: Dict[str, Any], *, summary: str, origin: str) -> 
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     cleanup_terminal_skill_evidence()
     pending = _pending_dir(SKILLS)
-    before = set(pending.iterdir()) if pending.is_dir() and not pending.is_symlink() else set()
+    pending_id = uuid.uuid4().hex[:8]
+    created: List[Path] = []
     try:
         with _skill_write_lock(root):
-            return _stage_skill_write_locked(payload, summary=summary, origin=origin)
+            return _stage_skill_write_locked(
+                payload, summary=summary, origin=origin,
+                pending_id=pending_id, created=created,
+            )
     except Exception:
         if pending.is_dir() and not pending.is_symlink():
-            for path in set(pending.iterdir()) - before:
+            for path in created:
                 if path.is_dir() and not path.is_symlink():
                     shutil.rmtree(path)
             _fsync_dir(pending)
@@ -1450,7 +1460,7 @@ def execute_manual_skill_pending(record: Dict[str, Any]):
     return execute_durable_skill_pending(context, _manual=True)
 
 
-def _durable_skill_review(record: Dict[str, Any]) -> Optional[str]:
+def _durable_skill_review(record: Dict[str, Any], *, max_chars: Optional[int] = None) -> Optional[str]:
     operation = record["operations"][0]
     relative = operation["relative_path"]
     before = b""
@@ -1473,7 +1483,7 @@ def _durable_skill_review(record: Dict[str, Any]) -> Optional[str]:
         old.splitlines(keepends=True), new.splitlines(keepends=True),
         fromfile=f"a/{relative}" if before else "/dev/null",
         tofile=f"b/{relative}" if after else "/dev/null"))
-    return rendered if len(rendered) <= MAX_DURABLE_SKILL_DIFF_CHARS else None
+    return rendered if max_chars is None or len(rendered) <= max_chars else None
 
 
 def create_skill_durable_approval(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -1500,7 +1510,8 @@ def create_skill_durable_approval(record: Dict[str, Any]) -> Dict[str, Any]:
                 status = "awaiting_approval"
             return {"status": status, "pending_id": pending_id,
                     "request_id": request_id, "action_id": request_id}
-    review = _durable_skill_review(stored) if stored and prepared else None
+    review = (_durable_skill_review(stored, max_chars=MAX_DURABLE_SKILL_DIFF_CHARS)
+              if stored and prepared else None)
     if prepared is None or review is None:
         return manual("invalid_or_oversize_review")
     try:
@@ -1615,18 +1626,109 @@ def skill_write_lock():
     return _skill_write_lock(root)
 
 
-def _atomic_skill_write(target: Path, data: bytes) -> None:
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(dir=target.parent, prefix=".skill-", suffix=".tmp")
-    path = Path(temporary)
+def _open_skill_dirfd(root: Path, relative: Path, *, create: bool = False) -> int:
+    """Open a verified directory chain without following symlinks."""
+    if os.name != "posix":
+        raise OSError("secure directory-relative mutation unavailable")
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    current = os.open(root, flags)
     try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(data); stream.flush(); os.fsync(stream.fileno())
-        os.replace(path, target)
-        _fsync_dir(target.parent)
-        if os.name == "posix": target.chmod(0o600)
+        opened = os.fstat(current)
+        named = root.lstat()
+        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+            raise OSError("skill root identity changed")
+        for part in relative.parts:
+            if part in {"", "."}:
+                continue
+            try:
+                child = os.open(part, flags, dir_fd=current)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, 0o700, dir_fd=current)
+                os.fsync(current)
+                child = os.open(part, flags, dir_fd=current)
+            os.close(current)
+            current = child
+        return current
     except BaseException:
-        path.unlink(missing_ok=True); raise
+        os.close(current)
+        raise
+
+
+def _dirfd_matches_path(fd: int, path: Path) -> bool:
+    try:
+        opened = os.fstat(fd)
+        named = path.lstat()
+    except OSError:
+        return False
+    return stat.S_ISDIR(named.st_mode) and (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino)
+
+
+def _atomic_skill_write_at(parent_fd: int, name: str, data: bytes) -> None:
+    temporary = f".skill-{uuid.uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(temporary, flags, 0o600, dir_fd=parent_fd)
+    try:
+        with os.fdopen(fd, "wb", closefd=False) as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except BaseException:
+        try:
+            os.unlink(temporary, dir_fd=parent_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(fd)
+
+
+def _secure_skill_write(
+    root: Path, relative: Path, data: bytes, *, create_parents: bool, mutation_fault: bool = True,
+) -> None:
+    parent_fd = _open_skill_dirfd(root, relative.parent, create=create_parents)
+    try:
+        if mutation_fault:
+            _skill_mutation_fault("parents_opened")
+        _atomic_skill_write_at(parent_fd, relative.name, data)
+        if not _dirfd_matches_path(parent_fd, root / relative.parent):
+            raise OSError("target parent identity changed")
+    finally:
+        os.close(parent_fd)
+
+
+def _secure_skill_create(root: Path, relative: Path, data: bytes, pending_id: str) -> None:
+    skill_relative = relative.parent
+    parent_fd = _open_skill_dirfd(root, skill_relative.parent, create=True)
+    temporary = f".{skill_relative.name}-{pending_id}.tmp"
+    try:
+        _skill_mutation_fault("parents_opened")
+        os.mkdir(temporary, 0o700, dir_fd=parent_fd)
+        temporary_fd = os.open(
+            temporary,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            _atomic_skill_write_at(temporary_fd, "SKILL.md", data)
+            os.fsync(temporary_fd)
+        finally:
+            os.close(temporary_fd)
+        os.rename(temporary, skill_relative.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+        if not _dirfd_matches_path(parent_fd, root / skill_relative.parent):
+            raise OSError("target parent identity changed")
+    except BaseException:
+        try:
+            os.rmdir(temporary, dir_fd=parent_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(parent_fd)
 
 
 def _fsync_dir(directory: Path) -> None:
@@ -1639,6 +1741,10 @@ def _fsync_dir(directory: Path) -> None:
 
 def _skill_journal_fault(point: str) -> None:
     """Test seam for crash-boundary coverage; production is a no-op."""
+
+
+def _skill_mutation_fault(point: str) -> None:
+    """Test seam for parent-component swap coverage; production is a no-op."""
 
 
 def cleanup_terminal_skill_evidence(*, limit: int = MAX_SKILL_JOURNAL_CLEANUPS) -> int:
@@ -1693,21 +1799,40 @@ def cleanup_terminal_skill_evidence(*, limit: int = MAX_SKILL_JOURNAL_CLEANUPS) 
                     continue
             elif not applied_evidence:
                 continue
-            if quarantine.is_dir():
-                if any(path.is_symlink() for path in quarantine.rglob("*")):
-                    continue
-                shutil.rmtree(quarantine)
-            elif quarantine.exists():
-                quarantine.unlink()
-            _fsync_dir(quarantine.parent)
+            if q_exists:
+                quarantine_parent_fd = _open_skill_dirfd(root, Path(".quarantine"))
+                try:
+                    os.unlink(txn.name, dir_fd=quarantine_parent_fd)
+                    os.fsync(quarantine_parent_fd)
+                    if not _dirfd_matches_path(quarantine_parent_fd, quarantine.parent):
+                        raise OSError("quarantine parent identity changed")
+                finally:
+                    os.close(quarantine_parent_fd)
             journal["state"] = "CLEANED"
-            _atomic_skill_write(journal_path, json.dumps(journal, sort_keys=True).encode())
-            shutil.rmtree(txn)
-            _fsync_dir(transactions)
+            _secure_skill_write(
+                root, journal_path.relative_to(root), json.dumps(journal, sort_keys=True).encode(),
+                create_parents=False, mutation_fault=False,
+            )
+            txn_fd = _open_skill_dirfd(root, Path(".transactions") / txn.name)
+            transactions_fd = _open_skill_dirfd(root, Path(".transactions"))
+            try:
+                os.unlink("journal.json", dir_fd=txn_fd)
+                os.fsync(txn_fd)
+                os.rmdir(txn.name, dir_fd=transactions_fd)
+                os.fsync(transactions_fd)
+                if not _dirfd_matches_path(transactions_fd, transactions):
+                    raise OSError("transactions parent identity changed")
+            finally:
+                os.close(txn_fd)
+                os.close(transactions_fd)
             staged = _skill_pending_path(txn.name)
             if staged.is_dir() and not staged.is_symlink():
                 shutil.rmtree(staged)
                 _fsync_dir(staged.parent)
+            manifest = _pending_dir(SKILLS) / f"{txn.name}.json"
+            if receipt[2] is not None and manifest.is_file() and not manifest.is_symlink():
+                manifest.unlink()
+                _fsync_dir(manifest.parent)
             cleaned += 1
         except OSError:
             continue
@@ -1833,42 +1958,59 @@ def execute_durable_skill_pending(context, *, _manual: bool = False):
             return failed(DurableActionStatus.INVALIDATED, "baseline_changed")
         if operation["operation"] == "create" and target.parent.exists():
             return failed(DurableActionStatus.INVALIDATED, "target_exists")
+        if os.name != "posix":
+            return failed(DurableActionStatus.INVALIDATED, "secure_mutation_unavailable")
         try:
             if operation["operation"] == "remove_file":
                 txn = root / ".transactions" / record["id"]
                 quarantine = root / ".quarantine" / record["id"]
-                for private_root in (txn.parent, quarantine.parent):
-                    private_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-                    mode = private_root.lstat().st_mode
-                    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-                        raise OSError("unsafe transaction directory")
-                    _fsync_dir(private_root.parent)
-                if quarantine.exists() or quarantine.is_symlink():
-                    raise OSError("quarantine collision")
-                txn.mkdir(exist_ok=True, mode=0o700); _fsync_dir(txn.parent)
+                txn_fd = _open_skill_dirfd(root, Path(".transactions") / record["id"], create=True)
+                os.close(txn_fd)
+                target_parent_fd = _open_skill_dirfd(root, relative.parent)
+                quarantine_parent_fd = _open_skill_dirfd(root, Path(".quarantine"), create=True)
                 journal = {"journal_version": 1, "state": "PREPARED", "operation_progress": 0,
                            "target_relative_path": relative.as_posix(),
                            "quarantine_relative_path": str(quarantine.relative_to(root))}
                 atomic = txn / "journal.json"
-                atomic_write = lambda: _atomic_skill_write(atomic, json.dumps(journal, sort_keys=True).encode())
-                if atomic.exists():
-                    return failed(DurableActionStatus.UNKNOWN, "journal_incomplete")
-                atomic_write(); _skill_journal_fault("prepared")
-                journal["state"] = "EXECUTING"; atomic_write(); _skill_journal_fault("executing")
-                os.replace(target, quarantine); journal["operation_progress"] = 1; _skill_journal_fault("renamed")
-                _fsync_dir(target.parent); _skill_journal_fault("source_fsynced")
-                _fsync_dir(quarantine.parent); _skill_journal_fault("quarantine_fsynced")
-                journal["state"] = "COMMITTED"; atomic_write(); _skill_journal_fault("committed")
+                atomic_write = lambda: _secure_skill_write(
+                    root, atomic.relative_to(root), json.dumps(journal, sort_keys=True).encode(),
+                    create_parents=False, mutation_fault=False,
+                )
+                try:
+                    try:
+                        os.stat(record["id"], dir_fd=quarantine_parent_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        raise OSError("quarantine collision")
+                    if atomic.exists():
+                        return failed(DurableActionStatus.UNKNOWN, "journal_incomplete")
+                    _skill_mutation_fault("parents_opened")
+                    atomic_write(); _skill_journal_fault("prepared")
+                    journal["state"] = "EXECUTING"; atomic_write(); _skill_journal_fault("executing")
+                    os.replace(
+                        relative.name, record["id"],
+                        src_dir_fd=target_parent_fd, dst_dir_fd=quarantine_parent_fd,
+                    )
+                    journal["operation_progress"] = 1; _skill_journal_fault("renamed")
+                    os.fsync(target_parent_fd); _skill_journal_fault("source_fsynced")
+                    os.fsync(quarantine_parent_fd); _skill_journal_fault("quarantine_fsynced")
+                    if (not _dirfd_matches_path(target_parent_fd, target.parent)
+                            or not _dirfd_matches_path(quarantine_parent_fd, quarantine.parent)):
+                        raise OSError("mutation parent identity changed")
+                    journal["state"] = "COMMITTED"; atomic_write(); _skill_journal_fault("committed")
+                finally:
+                    os.close(target_parent_fd)
+                    os.close(quarantine_parent_fd)
             else:
                 assert desired is not None
                 if operation["operation"] == "create":
-                    temporary_dir = target.parent.with_name(f".{target.parent.name}-{record['id']}.tmp")
-                    temporary_dir.mkdir(parents=True, exist_ok=False)
-                    _atomic_skill_write(temporary_dir / "SKILL.md", desired)
-                    os.replace(temporary_dir, target.parent)
-                    _fsync_dir(target.parent.parent)
+                    _secure_skill_create(root, relative, desired, record["id"])
                 else:
-                    _atomic_skill_write(target, desired)
+                    _secure_skill_write(
+                        root, relative, desired,
+                        create_parents=operation["operation"] == "write_file",
+                    )
         except Exception:
             return failed(DurableActionStatus.UNKNOWN, "mutation_unverified")
     _write_pending_record({**record, "status": "applied"})
