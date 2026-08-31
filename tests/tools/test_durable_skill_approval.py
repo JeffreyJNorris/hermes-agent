@@ -74,6 +74,36 @@ def test_patch_stages_final_bytes_and_apply_does_not_replay_patch(tmp_path, monk
     assert (skill / "SKILL.md").read_text() != updated
 
 
+def test_supporting_file_patch_targets_requested_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    skill = tmp_path / "skills" / "demo"; (skill / "references").mkdir(parents=True)
+    (skill / "SKILL.md").write_text(VALID); (skill / "references" / "a.md").write_text("old\n")
+    record = wa.stage_skill_write({"action": "patch", "name": "demo", "file_path": "references/a.md", "old_string": "old", "new_string": "new"}, summary="patch", origin="foreground")
+    assert record["operations"][0]["relative_path"] == "demo/references/a.md"
+    assert wa.execute_durable_skill_pending(_context(record)).status is DurableActionStatus.SUCCEEDED
+    assert (skill / "references" / "a.md").read_text() == "new\n"
+
+
+def test_review_uses_stored_baseline_not_changed_live_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    skill = tmp_path / "skills" / "demo"; skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(VALID)
+    record = wa.stage_skill_write({"action": "edit", "name": "demo", "content": VALID.replace("Do it.", "New.")}, summary="edit", origin="foreground")
+    expected = wa.skill_pending_diff(record)
+    (skill / "SKILL.md").write_text(VALID.replace("Do it.", "Unapproved live change."))
+    assert wa.skill_pending_diff(record) == expected
+
+
+def test_non_directory_parent_and_bad_pending_id_fail_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    skill = tmp_path / "skills" / "demo"; skill.mkdir(parents=True); (skill / "SKILL.md").write_text(VALID)
+    (skill / "references").write_text("not a directory")
+    record = wa.stage_skill_write({"action": "write_file", "name": "demo", "file_path": "references/a", "file_content": "x"}, summary="x", origin="foreground")
+    assert record["status"] == "pending_manual_review"
+    bad = DurableActionExecutionContext("req", "skill.apply_pending", 1, '{"pending_id":"../x"}', "x", "x")
+    assert wa.execute_durable_skill_pending(bad).status is DurableActionStatus.FAILED
+
+
 def test_apply_single_file_once_and_detect_already_applied(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _config(monkeypatch)
@@ -140,9 +170,10 @@ def test_delete_moves_whole_skill_to_journaled_quarantine(tmp_path, monkeypatch)
 
     assert outcome.status is DurableActionStatus.SUCCEEDED
     assert not skill.exists()
-    journal = json.loads((tmp_path / "pending" / "skills" / record["id"] / "journal.json").read_text())
+    journal = json.loads((tmp_path / "skills" / ".transactions" / record["id"] / "journal.json").read_text())
     assert journal["state"] == "COMMITTED"
     assert (Path(journal["quarantine_relative_path"]) / "SKILL.md").name == "SKILL.md"
+    assert not (tmp_path / "pending" / "skills" / record["id"]).exists()
 
 
 def test_handler_is_statically_registered():

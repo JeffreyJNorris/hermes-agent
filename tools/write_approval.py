@@ -448,6 +448,10 @@ def discard_pending(subsystem: str, pending_id: str) -> bool:
     try:
         if path.exists():
             path.unlink()
+            if subsystem == SKILLS:
+                staged = _skill_pending_path(pending_id)
+                if staged.exists() and not staged.is_symlink():
+                    shutil.rmtree(staged)
             return True
     except Exception as e:  # pragma: no cover
         logger.error("Failed to discard pending %s/%s: %s", subsystem, pending_id, e)
@@ -1137,15 +1141,25 @@ def _skill_components_safe(root: Path, relative: Path, *, allow_missing=True) ->
             mode = current.lstat().st_mode
         except FileNotFoundError:
             return allow_missing
+        except (NotADirectoryError, OSError):
+            return False
         if stat.S_ISLNK(mode) or (hasattr(current, "is_junction") and current.is_junction()):
+            return False
+        if current != root / relative and not stat.S_ISDIR(mode):
             return False
     return True
 
 
 def _skill_relative_path(payload: Dict[str, Any], skill_dir: Path) -> Optional[Path]:
+    from tools import skill_manager_tool as sm
     action = payload.get("action")
-    if action in {"create", "edit", "patch"}:
+    if action in {"create", "edit"}:
         return skill_dir.relative_to(get_hermes_home() / "skills") / "SKILL.md"
+    if action == "patch":
+        raw = payload.get("file_path") or "SKILL.md"
+        if sm._validate_file_path(raw):
+            return None
+        return skill_dir.relative_to(get_hermes_home() / "skills") / Path(raw)
     if action in {"write_file", "remove_file"}:
         raw = payload.get("file_path")
         if not isinstance(raw, str) or not raw or "\\" in raw:
@@ -1162,6 +1176,10 @@ def _skill_relative_path(payload: Dict[str, Any], skill_dir: Path) -> Optional[P
 def _skill_manual(payload: Dict[str, Any], summary: str, origin: str, reason: str):
     record = stage_write(SKILLS, payload, summary=summary, origin=origin)
     return {**record, "status": "pending_manual_review", "reason": reason}
+
+
+def _skill_rejected(reason: str) -> Dict[str, Any]:
+    return {"status": "rejected", "reason": reason}
 
 
 def stage_skill_write(payload: Dict[str, Any], *, summary: str, origin: str) -> Dict[str, Any]:
@@ -1194,19 +1212,21 @@ def stage_skill_write(payload: Dict[str, Any], *, summary: str, origin: str) -> 
     except ValueError:
         return _skill_manual(payload, summary, origin, "non_personal_root")
     if not skill_rel.parts or skill_rel.parts[0] in {"_org", ".stock", ".archive"}:
-        return _skill_manual(payload, summary, origin, "protected_target")
+        return _skill_rejected("protected_target")
     if existing:
         try:
             from tools import skill_usage
             if (skill_usage.is_protected_builtin(name) or skill_usage.is_bundled(name)
                     or skill_usage.is_hub_installed(name)):
-                return _skill_manual(payload, summary, origin, "protected_target")
+                return _skill_rejected("protected_target")
         except Exception:
-            return _skill_manual(payload, summary, origin, "provenance_unavailable")
+            return _skill_rejected("provenance_unavailable")
     if action == "delete":
         pinned = sm._pinned_guard(name)
         if pinned or sm._org_mirror_write_guard(name, skill_dir, "delete"):
-            return _skill_manual(payload, summary, origin, "protected_target")
+            return _skill_rejected("protected_target")
+    if action == "create" and skill_dir.exists():
+        return _skill_rejected("target_exists")
     relative = _skill_relative_path(payload, skill_dir)
     if relative is None or not _skill_components_safe(root, relative):
         return _skill_manual(payload, summary, origin, "unsafe_path")
@@ -1250,7 +1270,9 @@ def stage_skill_write(payload: Dict[str, Any], *, summary: str, origin: str) -> 
     pending_id = uuid.uuid4().hex[:8]
     directory = _skill_pending_path(pending_id)
     staged_dir = directory / "staged"
+    baseline_dir = directory / "baseline"
     staged_dir.mkdir(parents=True, mode=0o700)
+    baseline_dir.mkdir(mode=0o700)
     if os.name == "posix":
         directory.chmod(0o700); staged_dir.chmod(0o700)
     operation = {
@@ -1263,6 +1285,10 @@ def stage_skill_write(payload: Dict[str, Any], *, summary: str, origin: str) -> 
         fd = os.open(staged_dir / "0", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as stream:
             stream.write(desired); stream.flush(); os.fsync(stream.fileno())
+    if kind == "file":
+        fd = os.open(baseline_dir / "0", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(target.read_bytes()); stream.flush(); os.fsync(stream.fileno())
     record = {
         "id": pending_id, "subsystem": SKILLS, "status": "pending", "summary": summary,
         "origin": origin, "created_at": time.time(), "manifest_version": _SKILL_MANIFEST_VERSION,
@@ -1292,11 +1318,9 @@ def _durable_skill_review(record: Dict[str, Any]) -> Optional[str]:
     operation = record["operations"][0]
     relative = operation["relative_path"]
     action = operation["operation"]
-    root = get_hermes_home() / "skills"
     before = b""
-    target = root / relative
     if operation["baseline_type"] == "file":
-        try: before = target.read_bytes()
+        try: before = (_skill_pending_path(record["id"]) / "baseline" / "0").read_bytes()
         except OSError: return None
     after = b""
     if operation["staged_digest"] is not None:
@@ -1309,6 +1333,7 @@ def _durable_skill_review(record: Dict[str, Any]) -> Optional[str]:
     if action == "delete":
         files = []
         try:
+            target = get_hermes_home() / "skills" / relative
             for path in sorted(target.rglob("*")):
                 if path.is_symlink() or not path.is_file():
                     return None
@@ -1378,7 +1403,9 @@ def create_skill_durable_approval(record: Dict[str, Any]) -> Dict[str, Any]:
               "durable_action_id": result.request.request_id}
     try: _write_pending_record(linked)
     except OSError: logger.warning("Durable skill advisory link update failed")
-    return {"status": "awaiting_approval", "pending_id": stored["id"],
+    status = result.ticket.status.value
+    return {"status": "awaiting_approval" if status == "waiting_for_decision" else status,
+            "pending_id": stored["id"],
             "request_id": result.request.request_id, "action_id": result.request.request_id}
 
 
@@ -1461,9 +1488,18 @@ def _atomic_skill_write(target: Path, data: bytes) -> None:
         with os.fdopen(fd, "wb") as stream:
             stream.write(data); stream.flush(); os.fsync(stream.fileno())
         os.replace(path, target)
+        _fsync_dir(target.parent)
         if os.name == "posix": target.chmod(0o600)
     except BaseException:
         path.unlink(missing_ok=True); raise
+
+
+def _fsync_dir(directory: Path) -> None:
+    if os.name != "posix":
+        return
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
 
 
 def execute_durable_skill_pending(context):
@@ -1474,7 +1510,8 @@ def execute_durable_skill_pending(context):
     except (TypeError, ValueError): return failed(DurableActionStatus.FAILED, "invalid_payload")
     if (context.action_type != "skill.apply_pending" or context.action_version != 1
             or not isinstance(payload, dict) or set(payload) != {"pending_id"}
-            or not isinstance(payload["pending_id"], str)):
+            or not isinstance(payload["pending_id"], str)
+            or _PENDING_ID_RE.fullmatch(payload["pending_id"]) is None):
         return failed(DurableActionStatus.FAILED, "invalid_payload")
     config = load_config() or {}; skills = config.get("skills", {}); policy = config.get("durable_approvals", {})
     allowed = policy.get("allowed_actions") if isinstance(policy, dict) else None
@@ -1504,6 +1541,9 @@ def execute_durable_skill_pending(context):
     staged = _skill_pending_path(record["id"]) / "staged" / "0"
     desired = None
     if operation["staged_digest"] is not None:
+        _, current_kind, current_digest = _skill_lstat(target)
+        if current_kind == "file" and current_digest == operation["staged_digest"]:
+            return failed(DurableActionStatus.ALREADY_APPLIED, "desired_present")
         try:
             if not stat.S_ISREG(staged.lstat().st_mode):
                 return failed(DurableActionStatus.INVALIDATED, "staged_changed")
@@ -1523,10 +1563,18 @@ def execute_durable_skill_pending(context):
                 or digest != operation["baseline_digest"]):
             return failed(DurableActionStatus.INVALIDATED, "baseline_changed")
         try:
-            if operation["operation"] == "delete":
+            if operation["operation"] in {"delete", "remove_file"}:
                 txn = root / ".transactions" / record["id"]
                 quarantine = root / ".quarantine" / record["id"]
-                txn.mkdir(parents=True, exist_ok=True); quarantine.parent.mkdir(parents=True, exist_ok=True)
+                for private_root in (txn.parent, quarantine.parent):
+                    private_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    mode = private_root.lstat().st_mode
+                    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+                        raise OSError("unsafe transaction directory")
+                    _fsync_dir(private_root.parent)
+                if quarantine.exists() or quarantine.is_symlink():
+                    raise OSError("quarantine collision")
+                txn.mkdir(exist_ok=True, mode=0o700); _fsync_dir(txn.parent)
                 journal = {"journal_version": 1, "state": "PREPARED", "operation_progress": 0,
                            "target_relative_path": relative.as_posix(),
                            "quarantine_relative_path": str(quarantine.relative_to(root))}
@@ -1534,13 +1582,8 @@ def execute_durable_skill_pending(context):
                 atomic_write = lambda: _atomic_skill_write(atomic, json.dumps(journal, sort_keys=True).encode())
                 atomic_write(); journal["state"] = "EXECUTING"; atomic_write()
                 os.replace(target, quarantine); journal["operation_progress"] = 1
+                _fsync_dir(target.parent); _fsync_dir(quarantine.parent)
                 journal["state"] = "COMMITTED"; atomic_write()
-                # Advisory copy keeps established pending inspection simple.
-                _atomic_skill_write(_skill_pending_path(record["id"]) / "journal.json", json.dumps(journal, sort_keys=True).encode())
-            elif operation["operation"] == "remove_file":
-                quarantine = root / ".quarantine" / record["id"]
-                quarantine.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(target, quarantine)
             else:
                 assert desired is not None
                 if operation["operation"] == "create":
@@ -1548,11 +1591,15 @@ def execute_durable_skill_pending(context):
                     temporary_dir.mkdir(parents=True, exist_ok=False)
                     _atomic_skill_write(temporary_dir / "SKILL.md", desired)
                     os.replace(temporary_dir, target.parent)
+                    _fsync_dir(target.parent.parent)
                 else:
                     _atomic_skill_write(target, desired)
         except Exception:
             return failed(DurableActionStatus.UNKNOWN, "mutation_unverified")
     _write_pending_record({**record, "status": "applied"})
+    staged_directory = _skill_pending_path(record["id"])
+    if staged_directory.exists() and not staged_directory.is_symlink():
+        shutil.rmtree(staged_directory)
     try:
         from agent.prompt_builder import clear_skills_system_prompt_cache
         clear_skills_system_prompt_cache(clear_snapshot=True)

@@ -1450,6 +1450,8 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
     )
     if wa.durable_approval_enabled(wa.SKILLS):
         record = wa.stage_skill_write(payload, summary=gist, origin=wa.current_origin())
+        if record.get("status") == "rejected":
+            return tool_error(f"Durable skill approval rejected: {record.get('reason')}", success=False)
         if record.get("manifest_version") == 1:
             receipt = wa.create_skill_durable_approval(record)
             return json.dumps({"success": True, "staged": True, "gist": gist, **receipt}, ensure_ascii=False)
