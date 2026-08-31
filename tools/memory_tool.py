@@ -25,6 +25,7 @@ Design:
 
 import json
 import logging
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -161,6 +162,7 @@ class MemoryStore:
     # terminal "save skipped" result so a fragile replace/add can't loop the
     # turn to budget exhaustion and suppress the user's reply (issue #42405).
     _MAX_CONSOLIDATION_FAILURES_PER_TURN = 3
+    _held_file_locks = threading.local()
 
     def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
         self.memory_entries: List[str] = []
@@ -286,6 +288,12 @@ class MemoryStore:
         lock_path = path.with_suffix(path.suffix + ".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
 
+        held = getattr(MemoryStore._held_file_locks, "paths", set())
+        key = str(lock_path.resolve())
+        if key in held:
+            yield
+            return
+
         if fcntl is None and msvcrt is None:
             yield
             return
@@ -297,8 +305,10 @@ class MemoryStore:
             else:
                 fd.seek(0)
                 msvcrt.locking(fd.fileno(), msvcrt.LK_LOCK, 1)
+            MemoryStore._held_file_locks.paths = held | {key}
             yield
         finally:
+            MemoryStore._held_file_locks.paths = held
             if fcntl:
                 try:
                     fcntl.flock(fd, fcntl.LOCK_UN)
@@ -592,81 +602,68 @@ class MemoryStore:
             if bak:
                 return _drift_error(self._path_for(target), bak)
 
-            # Work on a copy; only commit if the whole batch validates.
-            working: List[str] = list(self._entries_for(target))
-            limit = self._char_limit(target)
-
-            for i, op in enumerate(operations):
-                op = op or {}
-                act = op.get("action")
-                content = (op.get("content") or "").strip()
-                old_text = (op.get("old_text") or "").strip()
-                pos = f"Operation {i + 1} ({act or 'unknown'})"
-
-                if act == "add":
-                    if not content:
-                        return self._batch_error(target, f"{pos}: content is required.")
-                    if content in working:
-                        continue  # idempotent -- skip duplicate, don't fail the batch
-                    working.append(content)
-
-                elif act == "replace":
-                    if not old_text:
-                        return self._batch_error(target, f"{pos}: old_text is required.")
-                    if not content:
-                        return self._batch_error(
-                            target,
-                            f"{pos}: content is required (use action='remove' to delete).",
-                        )
-                    matches = [j for j, e in enumerate(working) if old_text in e]
-                    if not matches:
-                        return self._batch_error(target, f"{pos}: no entry matched '{old_text}'.")
-                    if len({working[j] for j in matches}) > 1:
-                        return self._batch_error(
-                            target,
-                            f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
-                        )
-                    working[matches[0]] = content
-
-                elif act == "remove":
-                    if not old_text:
-                        return self._batch_error(target, f"{pos}: old_text is required.")
-                    matches = [j for j, e in enumerate(working) if old_text in e]
-                    if not matches:
-                        return self._batch_error(target, f"{pos}: no entry matched '{old_text}'.")
-                    if len({working[j] for j in matches}) > 1:
-                        return self._batch_error(
-                            target,
-                            f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
-                        )
-                    working.pop(matches[0])
-
-                else:
-                    return self._batch_error(
-                        target,
-                        f"{pos}: unknown action. Use add, replace, or remove.",
-                    )
-
-            # Budget check against the FINAL state only.
-            new_total = len(ENTRY_DELIMITER.join(working)) if working else 0
-            if new_total > limit:
-                current = self._char_count(target)
-                return self._consolidation_failure({
-                    "success": False,
-                    "error": (
-                        f"After applying all {len(operations)} operations, memory would be at "
-                        f"{new_total:,}/{limit:,} chars -- over the limit. Remove or shorten more "
-                        f"entries in the same batch (see current_entries below), then retry."
-                    ),
-                    "current_entries": self._entries_for(target),
-                    "usage": f"{current:,}/{limit:,}",
-                })
+            working, error = self._plan_batch(target, operations)
+            if error is not None:
+                return error
 
             # Commit.
             self._set_entries(target, working)
             self.save_to_disk(target)
 
         return self._success_response(target, f"Applied {len(operations)} operation(s).")
+
+    def _plan_batch(self, target: str, operations: List[Dict[str, Any]]):
+        """Return the exact final entries for ``apply_batch`` without writing."""
+        working: List[str] = list(self._entries_for(target))
+        for i, op in enumerate(operations):
+            op = op or {}
+            act = op.get("action")
+            content = (op.get("content") or "").strip()
+            old_text = (op.get("old_text") or "").strip()
+            pos = f"Operation {i + 1} ({act or 'unknown'})"
+            if act == "add":
+                if not content:
+                    return None, self._batch_error(target, f"{pos}: content is required.")
+                if content not in working:
+                    working.append(content)
+            elif act in {"replace", "remove"}:
+                if not old_text:
+                    return None, self._batch_error(target, f"{pos}: old_text is required.")
+                if act == "replace" and not content:
+                    return None, self._batch_error(
+                        target, f"{pos}: content is required (use action='remove' to delete)."
+                    )
+                matches = [j for j, entry in enumerate(working) if old_text in entry]
+                if not matches:
+                    return None, self._batch_error(target, f"{pos}: no entry matched '{old_text}'.")
+                if len({working[j] for j in matches}) > 1:
+                    return None, self._batch_error(
+                        target, f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific."
+                    )
+                if act == "replace":
+                    working[matches[0]] = content
+                else:
+                    working.pop(matches[0])
+            else:
+                return None, self._batch_error(
+                    target, f"{pos}: unknown action. Use add, replace, or remove."
+                )
+
+        new_total = len(ENTRY_DELIMITER.join(working)) if working else 0
+        limit = self._char_limit(target)
+        if new_total > limit:
+            current = self._char_count(target)
+            return None, self._consolidation_failure({
+                "success": False,
+                "error": (
+                    f"After applying all {len(operations)} operations, memory would be at "
+                    f"{new_total:,}/{limit:,} chars -- over the limit. Remove or shorten more "
+                    f"entries in the same batch (see current_entries below), then retry."
+                ),
+                "current_entries": self._entries_for(target),
+                "usage": f"{current:,}/{limit:,}",
+            })
+        return working, None
 
     def _batch_error(self, target: str, message: str) -> Dict[str, Any]:
         """Build a batch-abort error that reports live (uncommitted) state."""
@@ -958,11 +955,14 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
         summary=f"{summary}: {detail[:120]}",
         origin=wa.current_origin(),
     )
-    return json.dumps(
-        {"success": True, "staged": True, "pending_id": record["id"],
-         "message": decision.message},
-        ensure_ascii=False,
-    )
+    if not wa.durable_approval_enabled(wa.MEMORY):
+        return json.dumps(
+            {"success": True, "staged": True, "pending_id": record["id"],
+             "message": decision.message},
+            ensure_ascii=False,
+        )
+    receipt = wa.create_memory_durable_approval(record)
+    return json.dumps({"success": True, "staged": True, "pending_id": record["id"], **receipt}, ensure_ascii=False)
 
 
 def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Optional[str]:
@@ -1005,11 +1005,14 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
         summary=f"{summary}: {detail[:120]}",
         origin=wa.current_origin(),
     )
-    return json.dumps(
-        {"success": True, "staged": True, "pending_id": record["id"],
-         "message": decision.message},
-        ensure_ascii=False,
-    )
+    if not wa.durable_approval_enabled(wa.MEMORY):
+        return json.dumps(
+            {"success": True, "staged": True, "pending_id": record["id"],
+             "message": decision.message},
+            ensure_ascii=False,
+        )
+    receipt = wa.create_memory_durable_approval(record)
+    return json.dumps({"success": True, "staged": True, "pending_id": record["id"], **receipt}, ensure_ascii=False)
 
 
 def _missing_old_text_error(store: "MemoryStore", target: str, action: str) -> str:
@@ -1234,7 +1237,3 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
-
-
-

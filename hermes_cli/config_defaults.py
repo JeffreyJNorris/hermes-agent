@@ -1652,6 +1652,7 @@ DEFAULT_CONFIG = {
         #                     /memory reject <id>.
         # To disable memory entirely, use memory_enabled: false instead.
         "write_approval": False,
+        "durable_approval": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # External memory provider plugin (empty = built-in only).

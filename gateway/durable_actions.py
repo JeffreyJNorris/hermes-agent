@@ -841,9 +841,18 @@ __all__ = [
 # Eager fixed-handler bootstrap. This is deliberately after every registry type
 # and function so importing either module first is circular-safe.
 from cron import jobs as _cron_jobs  # noqa: E402,F401
+from tools import write_approval as _write_approval  # noqa: E402,F401
 
 _register_cron_resume_builtin(
     prepare=_cron_jobs.prepare_durable_cron_resume,
     execute=_cron_jobs.execute_durable_cron_resume,
     diagnose_unknown=_cron_jobs.diagnose_durable_cron_resume,
+)
+
+register_durable_action_handler(
+    "memory.apply_pending",
+    1,
+    prepare=_write_approval.prepare_durable_memory_pending,
+    execute=_write_approval.execute_durable_memory_pending,
+    diagnose_unknown=_write_approval.diagnose_durable_memory_pending,
 )

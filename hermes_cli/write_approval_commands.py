@@ -38,7 +38,22 @@ def _fmt_pending_list(subsystem: str) -> str:
     for r in records:
         origin = r.get("origin", "foreground")
         tag = " [auto]" if origin == "background_review" else ""
-        lines.append(f"  {r['id']}{tag}  {r.get('summary', '')}")
+        linked = ""
+        if subsystem == wa.MEMORY:
+            try:
+                request_id = wa.linked_memory_request_id(r)
+            except wa.MemoryActionLookupUnavailable:
+                request_id = None
+                linked = " [status unavailable]"
+            if request_id:
+                try:
+                    from gateway.durable_operations import DurableOperationsStore
+                    from hermes_constants import get_hermes_home
+                    action = DurableOperationsStore(get_hermes_home() / "state.db").get_action(request_id)
+                    linked = f" [{action.status}]" if action else ""
+                except Exception:
+                    pass
+        lines.append(f"  {r['id']}{tag}{linked}  {r.get('summary', '')}")
     where = "/{s} approve <id>".format(s=subsystem)
     lines.append("")
     lines.append(f"Apply: {where}   Reject: /{subsystem} reject <id>")
@@ -122,8 +137,46 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
             return f"No pending {subsystem} write with id '{target}'."
         targets = [rec]
 
-    applied, failed = 0, []
+    applied, authorized, failed = 0, 0, []
     for rec in targets:
+        try:
+            request_id = (
+                wa.linked_memory_request_id(rec) if subsystem == wa.MEMORY else None
+            )
+            receipt = (
+                wa.memory_action_receipt(rec.get("id", ""))
+                if subsystem == wa.MEMORY
+                else None
+            )
+        except wa.MemoryActionLookupUnavailable:
+            failed.append(f"{rec['id']}: linked_action_unavailable")
+            continue
+        if receipt is not None and receipt[1] == "unknown" and receipt[2] is None:
+            failed.append(f"{rec['id']}: reconciliation_required")
+            continue
+        if receipt is not None and receipt[2] is not None:
+            wa.discard_pending(subsystem, rec["id"])
+            failed.append(f"{rec['id']}: reconciled_{receipt[2]}")
+            continue
+        if (
+            subsystem == wa.MEMORY
+            and not request_id
+            and (
+                rec.get("durable_request_id") is not None
+                or receipt is not None
+            )
+        ):
+            failed.append(f"{rec['id']}: linked_action_invalid")
+            continue
+        if request_id:
+            from gateway.durable_operations import DurableOperationsStore
+            from hermes_constants import get_hermes_home
+            result = DurableOperationsStore(get_hermes_home() / "state.db").authorize_action(request_id)
+            if result.ok:
+                authorized += 1
+            else:
+                failed.append(f"{rec['id']}: {result.code}")
+            continue
         ok, msg = _apply_one(subsystem, rec, memory_store)
         if ok:
             wa.discard_pending(subsystem, rec["id"])
@@ -131,7 +184,10 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
         else:
             failed.append(f"{rec['id']}: {msg}")
 
-    out = [f"Approved {applied} {subsystem} write(s)."]
+    out = []
+    if authorized:
+        out.append(f"Authorized {authorized} linked {subsystem} write(s).")
+    out.append(f"Approved {applied} {subsystem} write(s).")
     if failed:
         out.append("Failed:")
         out.extend(f"  {f}" for f in failed)
@@ -160,14 +216,53 @@ def _reject(subsystem: str, rest: List[str]) -> str:
     if err or target is None:
         return err or f"Usage: /{subsystem} reject <id>"
     if target.lower() == "all":
-        n = 0
-        for rec in wa.list_pending(subsystem):
-            if wa.discard_pending(subsystem, rec["id"]):
-                n += 1
-        return f"Rejected {n} pending {subsystem} write(s)."
-    if wa.discard_pending(subsystem, target):
-        return f"Rejected pending {subsystem} write '{target}'."
-    return f"No pending {subsystem} write with id '{target}'."
+        records = wa.list_pending(subsystem, include_terminal=True)
+    else:
+        record = wa.get_pending(subsystem, target)
+        records = [record] if record is not None else []
+    if not records:
+        return f"No pending {subsystem} write with id '{target}'."
+    rejected, failed = 0, []
+    for record in records:
+        try:
+            request_id = (
+                wa.linked_memory_request_id(record)
+                if subsystem == wa.MEMORY
+                else None
+            )
+            receipt = (
+                wa.memory_action_receipt(record.get("id", ""))
+                if subsystem == wa.MEMORY
+                else None
+            )
+        except wa.MemoryActionLookupUnavailable:
+            failed.append(f"{record['id']}: linked_action_unavailable")
+            continue
+        if receipt is not None and receipt[1] == "unknown" and receipt[2] is None:
+            failed.append(f"{record['id']}: reconciliation_required")
+            continue
+        if receipt is not None and receipt[2] is not None:
+            if wa.discard_pending(subsystem, record["id"]):
+                rejected += 1
+            continue
+        if not request_id and subsystem == wa.MEMORY:
+            request_id = receipt[0] if receipt else None
+            if not request_id and record.get("durable_request_id") is not None:
+                failed.append(f"{record['id']}: linked_action_unavailable")
+                continue
+        if request_id:
+            from gateway.durable_operations import DurableOperationsStore
+            from hermes_constants import get_hermes_home
+            result = DurableOperationsStore(get_hermes_home() / "state.db").cancel_request(request_id)
+            if not result.ok and result.code != "already_terminal":
+                failed.append(f"{record['id']}: {result.code}")
+                continue
+        if wa.discard_pending(subsystem, record["id"]):
+            rejected += 1
+    out = [f"Rejected {rejected} pending {subsystem} write(s)."]
+    if failed:
+        out.extend(["Failed:", *(f"  {item}" for item in failed)])
+    return "\n".join(out)
 
 
 def _diff(rest: List[str]) -> str:

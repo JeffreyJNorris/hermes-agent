@@ -487,6 +487,107 @@ class DurableOperationsStore:
                 conn.rollback()
                 raise
 
+    def authorize_action(
+        self,
+        request_id: str,
+        *,
+        now: float | None = None,
+    ) -> DurableOperatorResult:
+        """Authorize a waiting action from the trusted local operator rail."""
+        current_time = self._now(now)
+        with closing(self._write_connection()) as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    """SELECT request.status AS request_status,
+                              request.expires_at,
+                              ticket.status AS action_status,
+                              ticket.execution_claim
+                       FROM durable_action_tickets AS ticket
+                       JOIN durable_requests AS request
+                         ON request.request_id = ticket.request_id
+                       WHERE ticket.request_id = ?""",
+                    (request_id,),
+                ).fetchone()
+                if row is None:
+                    conn.commit()
+                    return DurableOperatorResult(False, "not_found", request_id)
+                action_status = row["action_status"]
+                if (
+                    float(row["expires_at"]) <= current_time
+                    and action_status == DurableActionStatus.WAITING_FOR_DECISION.value
+                ):
+                    conn.execute(
+                        """UPDATE durable_requests
+                           SET status = 'expired', terminal_reason = 'deadline_elapsed',
+                               resolved_at = ?, updated_at = ?, delivery_claim = NULL,
+                               delivery_claimed_at = NULL
+                           WHERE request_id = ?""",
+                        (current_time, current_time, request_id),
+                    )
+                    conn.execute(
+                        """UPDATE durable_action_tickets
+                           SET status = 'expired', outcome_reason = 'deadline_elapsed',
+                               completed_at = ?, notification_status = 'pending',
+                               updated_at = ? WHERE request_id = ?""",
+                        (current_time, current_time, request_id),
+                    )
+                    conn.commit()
+                    return DurableOperatorResult(
+                        False, "expired", request_id,
+                        request_status=DurableRequestStatus.EXPIRED.value,
+                        action_status=DurableActionStatus.EXPIRED.value,
+                    )
+                if action_status in {
+                    DurableActionStatus.CLAIMED.value,
+                    DurableActionStatus.EXECUTING.value,
+                } or row["execution_claim"] is not None:
+                    conn.commit()
+                    return DurableOperatorResult(
+                        False, "execution_in_progress", request_id,
+                        request_status=row["request_status"], action_status=action_status,
+                    )
+                if action_status == DurableActionStatus.READY.value:
+                    conn.commit()
+                    return DurableOperatorResult(
+                        True, "already_authorized", request_id,
+                        request_status=row["request_status"], action_status=action_status,
+                    )
+                if action_status != DurableActionStatus.WAITING_FOR_DECISION.value:
+                    conn.commit()
+                    return DurableOperatorResult(
+                        False, "already_terminal", request_id,
+                        request_status=row["request_status"], action_status=action_status,
+                    )
+                request_changed = conn.execute(
+                    """UPDATE durable_requests
+                       SET status = 'selected', selected_option_id = 'approve',
+                           resolved_by_actor_id = 'operator:manual',
+                           terminal_reason = NULL, resolved_at = ?, updated_at = ?,
+                           delivery_claim = NULL, delivery_claimed_at = NULL
+                       WHERE request_id = ? AND status IN ('pending_delivery', 'open')""",
+                    (current_time, current_time, request_id),
+                ).rowcount
+                action_changed = conn.execute(
+                    """UPDATE durable_action_tickets
+                       SET status = 'ready', outcome_reason = NULL,
+                           completed_at = NULL, updated_at = ?
+                       WHERE request_id = ? AND status = 'waiting_for_decision'""",
+                    (current_time, request_id),
+                ).rowcount
+                if request_changed != 1 or action_changed != 1:
+                    conn.rollback()
+                    return DurableOperatorResult(False, "concurrent_update", request_id)
+                conn.commit()
+                return DurableOperatorResult(
+                    True, "authorized", request_id,
+                    request_status=DurableRequestStatus.SELECTED.value,
+                    action_status=DurableActionStatus.READY.value,
+                )
+            except Exception:
+                conn.rollback()
+                raise
+
     def reconcile_action(
         self,
         request_id: str,
