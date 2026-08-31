@@ -347,6 +347,100 @@ def test_parent_swap_after_secure_open_cannot_quarantine_outside_file(tmp_path, 
     monkeypatch.setattr(wa, "_skill_mutation_fault", swap)
     assert wa.execute_durable_skill_pending(_context(record)).status is DurableActionStatus.UNKNOWN
     assert (outside / "a").read_text() == "outside"
+
+
+def test_missing_secure_dirfd_capability_uses_legacy_manual_record(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    monkeypatch.setattr(wa, "_secure_skill_capabilities_available", lambda: False)
+    record = wa.stage_skill_write({"action": "create", "name": "demo", "content": VALID}, summary="x", origin="foreground")
+    assert record["status"] == "pending_manual_review"
+    assert "manifest_version" not in record
+    assert record["payload"]["content"] == VALID
+
+
+@pytest.mark.parametrize("fault_point,expected_status", [
+    ("parents_opened", DurableActionStatus.INVALIDATED),
+    ("entry_validated", DurableActionStatus.UNKNOWN),
+])
+def test_update_entry_cas_never_overwrites_intervening_content(tmp_path, monkeypatch, fault_point, expected_status):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    skill = tmp_path / "skills" / "demo"; skill.mkdir(parents=True); target = skill / "SKILL.md"; target.write_text(VALID)
+    record = wa.stage_skill_write({"action": "edit", "name": "demo", "content": VALID.replace("Do it.", "approved")}, summary="x", origin="foreground")
+    monkeypatch.setattr(wa, "_skill_mutation_fault", lambda point: target.write_text("intervening") if point == fault_point else None)
+    assert wa.execute_durable_skill_pending(_context(record)).status is expected_status
+    assert target.read_text() == "intervening"
+
+
+def test_create_entry_cas_is_no_replace(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    target = tmp_path / "skills" / "demo"
+    record = wa.stage_skill_write({"action": "create", "name": "demo", "content": VALID}, summary="x", origin="foreground")
+
+    def appear(point):
+        if point == "entry_validated":
+            target.mkdir(); (target / "SKILL.md").write_text("intervening")
+
+    monkeypatch.setattr(wa, "_skill_mutation_fault", appear)
+    assert wa.execute_durable_skill_pending(_context(record)).status is DurableActionStatus.INVALIDATED
+    assert (target / "SKILL.md").read_text() == "intervening"
+
+
+def test_remove_entry_cas_restores_intervening_content_and_stays_unknown(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    skill = tmp_path / "skills" / "demo"; (skill / "references").mkdir(parents=True)
+    (skill / "SKILL.md").write_text(VALID); target = skill / "references" / "a"; target.write_text("baseline")
+    record = wa.stage_skill_write({"action": "remove_file", "name": "demo", "file_path": "references/a"}, summary="x", origin="foreground")
+    monkeypatch.setattr(wa, "_skill_mutation_fault", lambda point: target.write_text("intervening") if point == "entry_validated" else None)
+    assert wa.execute_durable_skill_pending(_context(record)).status is DurableActionStatus.UNKNOWN
+    assert target.read_text() == "intervening"
+    assert not (tmp_path / "skills" / ".quarantine" / record["id"]).exists()
+
+
+def test_remove_closes_first_parent_fd_when_second_open_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    skill = tmp_path / "skills" / "demo"; (skill / "references").mkdir(parents=True)
+    (skill / "SKILL.md").write_text(VALID); (skill / "references" / "a").write_text("a")
+    record = wa.stage_skill_write({"action": "remove_file", "name": "demo", "file_path": "references/a"}, summary="x", origin="foreground")
+    real_open = wa._open_skill_dirfd; captured = []
+
+    def fail_quarantine(root, relative, **kwargs):
+        if relative == Path(".quarantine"):
+            raise OSError("fault")
+        fd = real_open(root, relative, **kwargs)
+        if relative == Path("demo/references"):
+            captured.append(fd)
+        return fd
+
+    monkeypatch.setattr(wa, "_open_skill_dirfd", fail_quarantine)
+    assert wa.execute_durable_skill_pending(_context(record)).status is DurableActionStatus.INVALIDATED
+    with pytest.raises(OSError):
+        wa.os.fstat(captured[0])
+
+
+def test_cleanup_closes_transaction_fd_when_parent_open_fails(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    skill = tmp_path / "skills" / "demo"; (skill / "references").mkdir(parents=True)
+    (skill / "SKILL.md").write_text(VALID); (skill / "references" / "a").write_text("a")
+    record = wa.stage_skill_write({"action": "remove_file", "name": "demo", "file_path": "references/a"}, summary="x", origin="foreground")
+    assert wa.execute_durable_skill_pending(_context(record)).status is DurableActionStatus.SUCCEEDED
+    monkeypatch.setattr(wa, "skill_action_receipt", lambda pending_id: ("req", "succeeded", None))
+    real_open = wa._open_skill_dirfd; captured = []; transaction_opens = 0
+
+    def fail_second_transaction_open(root, relative, **kwargs):
+        nonlocal transaction_opens
+        if relative == Path(".transactions"):
+            raise OSError("fault")
+        fd = real_open(root, relative, **kwargs)
+        if relative == Path(".transactions") / record["id"]:
+            transaction_opens += 1
+            if transaction_opens == 2:
+                captured.append(fd)
+        return fd
+
+    monkeypatch.setattr(wa, "_open_skill_dirfd", fail_second_transaction_open)
+    assert wa.cleanup_terminal_skill_evidence() == 0
+    with pytest.raises(OSError):
+        wa.os.fstat(captured[0])
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     skill = tmp_path / "skills" / "binary"; skill.mkdir(parents=True); (skill / "SKILL.md").write_bytes(b"\xff\xfe")
     binary = wa.stage_skill_write({"action": "patch", "name": "binary", "old_string": "x", "new_string": "y"}, summary="x", origin="foreground")
@@ -388,14 +482,14 @@ def test_remove_fault_after_executing_is_unknown_with_journal_evidence(tmp_path,
     (skill / "SKILL.md").write_text(VALID); target = skill / "references" / "a"; target.write_text("a")
     record = wa.stage_skill_write({"action": "remove_file", "name": "demo", "file_path": "references/a"}, summary="remove", origin="foreground")
     context = _context(record)
-    real_replace = wa.os.replace
+    real_rename = wa._renameat2
 
-    def fail_target(source, destination, *args, **kwargs):
-        if Path(source) in {target, Path(target.name)}:
+    def fail_target(source_fd, source, target_fd, destination, flags):
+        if source == target.name:
             raise OSError("fault")
-        return real_replace(source, destination, *args, **kwargs)
+        return real_rename(source_fd, source, target_fd, destination, flags)
 
-    monkeypatch.setattr(wa.os, "replace", fail_target)
+    monkeypatch.setattr(wa, "_renameat2", fail_target)
     assert wa.execute_durable_skill_pending(context).status is DurableActionStatus.UNKNOWN
     diagnostic = wa.diagnose_durable_skill_pending(context)
     assert diagnostic.code == "journal_evidence"

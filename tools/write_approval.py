@@ -44,6 +44,8 @@ from __future__ import annotations
 
 import hashlib
 import difflib
+import ctypes
+import errno
 import json
 import logging
 import os
@@ -54,7 +56,7 @@ import stat
 import tempfile
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -1142,6 +1144,10 @@ def _skill_lstat(path: Path) -> tuple[bool, str, Optional[str]]:
 
 
 def _read_regular_nofollow(path: Path) -> bytes:
+    return _read_regular_nofollow_snapshot(path)[0]
+
+
+def _read_regular_nofollow_snapshot(path: Path) -> tuple[bytes, tuple[int, int]]:
     before = path.lstat()
     if not stat.S_ISREG(before.st_mode):
         raise OSError("not a regular file")
@@ -1155,7 +1161,7 @@ def _read_regular_nofollow(path: Path) -> bytes:
             data = stream.read(MAX_DURABLE_SKILL_FILE_BYTES + 1)
             if len(data) > MAX_DURABLE_SKILL_FILE_BYTES:
                 raise OSError("file exceeds durable skill limit")
-            return data
+            return data, (opened.st_dev, opened.st_ino)
     finally:
         os.close(fd)
 
@@ -1217,6 +1223,8 @@ def _stage_skill_write_locked(
     action, name = payload.get("action"), payload.get("name")
     if action not in {"create", "edit", "patch", "write_file", "remove_file", "delete"}:
         return _skill_manual(payload, summary, origin, "unsupported_operation")
+    if not _secure_skill_capabilities_available():
+        return _skill_manual(payload, summary, origin, "secure_mutation_unavailable")
     if not isinstance(name, str) or sm._validate_name(name):
         return _skill_manual(payload, summary, origin, "invalid_target")
     root = get_hermes_home() / "skills"
@@ -1665,7 +1673,62 @@ def _dirfd_matches_path(fd: int, path: Path) -> bool:
     return stat.S_ISDIR(named.st_mode) and (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino)
 
 
-def _atomic_skill_write_at(parent_fd: int, name: str, data: bytes) -> None:
+class _SkillPreconditionError(OSError):
+    pass
+
+
+class _SkillMutationError(OSError):
+    pass
+
+
+def _renameat2(source_fd: int, source: str, target_fd: int, target: str, flags: int) -> None:
+    function = getattr(ctypes.CDLL(None, use_errno=True), "renameat2", None)
+    if function is None:
+        raise OSError(errno.ENOSYS, "renameat2 unavailable")
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    if function(source_fd, os.fsencode(source), target_fd, os.fsencode(target), flags) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+
+
+def _secure_skill_capabilities_available() -> bool:
+    if (os.name != "posix" or not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_DIRECTORY")
+            or getattr(ctypes.CDLL(None), "renameat2", None) is None):
+        return False
+    required = (os.open, os.stat, os.mkdir, os.unlink, os.rmdir, os.rename)
+    if not all(function in os.supports_dir_fd for function in required):
+        return False
+    try:
+        _renameat2(-1, "", -1, "", 1)
+    except OSError as exc:
+        return exc.errno != errno.ENOSYS
+    return True
+
+
+def _skill_entry_snapshot(parent_fd: int, name: str) -> tuple[bool, str, Optional[str], Optional[tuple[int, int]]]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        return False, "missing", None, None
+    try:
+        metadata = os.fstat(fd)
+        identity = (metadata.st_dev, metadata.st_ino)
+        if stat.S_ISDIR(metadata.st_mode):
+            return True, "directory", None, identity
+        if not stat.S_ISREG(metadata.st_mode):
+            return True, "other", None, identity
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            data = stream.read(MAX_DURABLE_SKILL_FILE_BYTES + 1)
+        if len(data) > MAX_DURABLE_SKILL_FILE_BYTES:
+            return True, "other", None, identity
+        return True, "file", _skill_digest(data), identity
+    finally:
+        os.close(fd)
+
+
+def _write_skill_temp(parent_fd: int, data: bytes) -> str:
     temporary = f".skill-{uuid.uuid4().hex}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(temporary, flags, 0o600, dir_fd=parent_fd)
@@ -1674,28 +1737,71 @@ def _atomic_skill_write_at(parent_fd: int, name: str, data: bytes) -> None:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-        os.fsync(parent_fd)
+        return temporary
     except BaseException:
-        try:
-            os.unlink(temporary, dir_fd=parent_fd)
-        except OSError:
-            pass
+        try: os.unlink(temporary, dir_fd=parent_fd)
+        except OSError: pass
         raise
     finally:
         os.close(fd)
 
 
+def _atomic_skill_write_at(parent_fd: int, name: str, data: bytes) -> None:
+    temporary = _write_skill_temp(parent_fd, data)
+    try:
+        os.rename(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    except BaseException:
+        try: os.unlink(temporary, dir_fd=parent_fd)
+        except OSError: pass
+        raise
+
+
 def _secure_skill_write(
-    root: Path, relative: Path, data: bytes, *, create_parents: bool, mutation_fault: bool = True,
+    root: Path, relative: Path, data: bytes, *, create_parents: bool,
+    expected: Optional[tuple[bool, str, Optional[str], Optional[tuple[int, int]]]] = None,
+    mutation_fault: bool = True,
 ) -> None:
     parent_fd = _open_skill_dirfd(root, relative.parent, create=create_parents)
     try:
         if mutation_fault:
             _skill_mutation_fault("parents_opened")
-        _atomic_skill_write_at(parent_fd, relative.name, data)
+        if expected is None:
+            _atomic_skill_write_at(parent_fd, relative.name, data)
+        else:
+            try:
+                observed = _skill_entry_snapshot(parent_fd, relative.name)
+            except OSError as exc:
+                raise _SkillPreconditionError("target entry unsafe") from exc
+            if observed != expected:
+                raise _SkillPreconditionError("target entry changed")
+            temporary = _write_skill_temp(parent_fd, data)
+            exchanged = False
+            try:
+                _skill_mutation_fault("entry_validated")
+                if expected[0]:
+                    _renameat2(parent_fd, temporary, parent_fd, relative.name, 2)
+                    exchanged = True
+                    if _skill_entry_snapshot(parent_fd, temporary) != expected:
+                        _renameat2(parent_fd, temporary, parent_fd, relative.name, 2)
+                        exchanged = False
+                        raise _SkillMutationError("target changed during exchange")
+                    os.unlink(temporary, dir_fd=parent_fd)
+                else:
+                    try:
+                        _renameat2(parent_fd, temporary, parent_fd, relative.name, 1)
+                    except OSError as exc:
+                        if exc.errno == errno.EEXIST:
+                            raise _SkillPreconditionError("target appeared") from exc
+                        raise
+                os.fsync(parent_fd)
+            except BaseException:
+                if not exchanged:
+                    try: os.unlink(temporary, dir_fd=parent_fd)
+                    except OSError: pass
+                raise
         if not _dirfd_matches_path(parent_fd, root / relative.parent):
-            raise OSError("target parent identity changed")
+            raise _SkillMutationError("target parent identity changed")
     finally:
         os.close(parent_fd)
 
@@ -1706,6 +1812,12 @@ def _secure_skill_create(root: Path, relative: Path, data: bytes, pending_id: st
     temporary = f".{skill_relative.name}-{pending_id}.tmp"
     try:
         _skill_mutation_fault("parents_opened")
+        try:
+            target_exists = _skill_entry_snapshot(parent_fd, skill_relative.name)[0]
+        except OSError as exc:
+            raise _SkillPreconditionError("target entry unsafe") from exc
+        if target_exists:
+            raise _SkillPreconditionError("target appeared")
         os.mkdir(temporary, 0o700, dir_fd=parent_fd)
         temporary_fd = os.open(
             temporary,
@@ -1717,13 +1829,30 @@ def _secure_skill_create(root: Path, relative: Path, data: bytes, pending_id: st
             os.fsync(temporary_fd)
         finally:
             os.close(temporary_fd)
-        os.rename(temporary, skill_relative.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        _skill_mutation_fault("entry_validated")
+        try:
+            _renameat2(parent_fd, temporary, parent_fd, skill_relative.name, 1)
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                raise _SkillPreconditionError("target appeared") from exc
+            raise
         os.fsync(parent_fd)
         if not _dirfd_matches_path(parent_fd, root / skill_relative.parent):
-            raise OSError("target parent identity changed")
+            raise _SkillMutationError("target parent identity changed")
     except BaseException:
         try:
+            temporary_fd = os.open(
+                temporary,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+            try:
+                os.unlink("SKILL.md", dir_fd=temporary_fd)
+                os.fsync(temporary_fd)
+            finally:
+                os.close(temporary_fd)
             os.rmdir(temporary, dir_fd=parent_fd)
+            os.fsync(parent_fd)
         except OSError:
             pass
         raise
@@ -1813,18 +1942,17 @@ def cleanup_terminal_skill_evidence(*, limit: int = MAX_SKILL_JOURNAL_CLEANUPS) 
                 root, journal_path.relative_to(root), json.dumps(journal, sort_keys=True).encode(),
                 create_parents=False, mutation_fault=False,
             )
-            txn_fd = _open_skill_dirfd(root, Path(".transactions") / txn.name)
-            transactions_fd = _open_skill_dirfd(root, Path(".transactions"))
-            try:
+            with ExitStack() as stack:
+                txn_fd = _open_skill_dirfd(root, Path(".transactions") / txn.name)
+                stack.callback(os.close, txn_fd)
+                transactions_fd = _open_skill_dirfd(root, Path(".transactions"))
+                stack.callback(os.close, transactions_fd)
                 os.unlink("journal.json", dir_fd=txn_fd)
                 os.fsync(txn_fd)
                 os.rmdir(txn.name, dir_fd=transactions_fd)
                 os.fsync(transactions_fd)
                 if not _dirfd_matches_path(transactions_fd, transactions):
                     raise OSError("transactions parent identity changed")
-            finally:
-                os.close(txn_fd)
-                os.close(transactions_fd)
             staged = _skill_pending_path(txn.name)
             if staged.is_dir() and not staged.is_symlink():
                 shutil.rmtree(staged)
@@ -1953,21 +2081,39 @@ def execute_durable_skill_pending(context, *, _manual: bool = False):
             finally:
                 shutil.rmtree(review_root, ignore_errors=True)
         re_exists, re_kind, re_digest = _skill_lstat(target)
+        re_identity = None
+        if re_kind == "file":
+            try:
+                re_bytes, re_identity = _read_regular_nofollow_snapshot(target)
+            except OSError:
+                return failed(DurableActionStatus.INVALIDATED, "baseline_changed")
+            re_digest = _skill_digest(re_bytes)
         if (re_exists != operation["baseline_exists"] or re_kind != operation["baseline_type"]
                 or re_digest != operation["baseline_digest"]):
             return failed(DurableActionStatus.INVALIDATED, "baseline_changed")
         if operation["operation"] == "create" and target.parent.exists():
             return failed(DurableActionStatus.INVALIDATED, "target_exists")
-        if os.name != "posix":
+        if not _secure_skill_capabilities_available():
             return failed(DurableActionStatus.INVALIDATED, "secure_mutation_unavailable")
+        expected_entry = (re_exists, re_kind, re_digest, re_identity)
         try:
             if operation["operation"] == "remove_file":
                 txn = root / ".transactions" / record["id"]
                 quarantine = root / ".quarantine" / record["id"]
-                txn_fd = _open_skill_dirfd(root, Path(".transactions") / record["id"], create=True)
+                try:
+                    txn_fd = _open_skill_dirfd(root, Path(".transactions") / record["id"], create=True)
+                except OSError as exc:
+                    raise _SkillPreconditionError("transaction parent unavailable") from exc
                 os.close(txn_fd)
-                target_parent_fd = _open_skill_dirfd(root, relative.parent)
-                quarantine_parent_fd = _open_skill_dirfd(root, Path(".quarantine"), create=True)
+                stack = ExitStack()
+                try:
+                    target_parent_fd = _open_skill_dirfd(root, relative.parent)
+                    stack.callback(os.close, target_parent_fd)
+                    quarantine_parent_fd = _open_skill_dirfd(root, Path(".quarantine"), create=True)
+                    stack.callback(os.close, quarantine_parent_fd)
+                except OSError as exc:
+                    stack.close()
+                    raise _SkillPreconditionError("secure parent unavailable") from exc
                 journal = {"journal_version": 1, "state": "PREPARED", "operation_progress": 0,
                            "target_relative_path": relative.as_posix(),
                            "quarantine_relative_path": str(quarantine.relative_to(root))}
@@ -1986,13 +2132,28 @@ def execute_durable_skill_pending(context, *, _manual: bool = False):
                     if atomic.exists():
                         return failed(DurableActionStatus.UNKNOWN, "journal_incomplete")
                     _skill_mutation_fault("parents_opened")
+                    try:
+                        observed_entry = _skill_entry_snapshot(target_parent_fd, relative.name)
+                    except OSError as exc:
+                        raise _SkillPreconditionError("target entry unsafe") from exc
+                    if observed_entry != expected_entry:
+                        raise _SkillPreconditionError("target entry changed")
                     atomic_write(); _skill_journal_fault("prepared")
                     journal["state"] = "EXECUTING"; atomic_write(); _skill_journal_fault("executing")
-                    os.replace(
-                        relative.name, record["id"],
-                        src_dir_fd=target_parent_fd, dst_dir_fd=quarantine_parent_fd,
-                    )
+                    _skill_mutation_fault("entry_validated")
+                    try:
+                        _renameat2(target_parent_fd, relative.name, quarantine_parent_fd, record["id"], 1)
+                    except OSError as exc:
+                        if exc.errno == errno.EEXIST:
+                            raise _SkillMutationError("quarantine appeared after journal start") from exc
+                        raise
                     journal["operation_progress"] = 1; _skill_journal_fault("renamed")
+                    if _skill_entry_snapshot(quarantine_parent_fd, record["id"]) != expected_entry:
+                        try:
+                            _renameat2(quarantine_parent_fd, record["id"], target_parent_fd, relative.name, 1)
+                        except OSError:
+                            pass
+                        raise _SkillMutationError("moved target identity changed")
                     os.fsync(target_parent_fd); _skill_journal_fault("source_fsynced")
                     os.fsync(quarantine_parent_fd); _skill_journal_fault("quarantine_fsynced")
                     if (not _dirfd_matches_path(target_parent_fd, target.parent)
@@ -2000,8 +2161,7 @@ def execute_durable_skill_pending(context, *, _manual: bool = False):
                         raise OSError("mutation parent identity changed")
                     journal["state"] = "COMMITTED"; atomic_write(); _skill_journal_fault("committed")
                 finally:
-                    os.close(target_parent_fd)
-                    os.close(quarantine_parent_fd)
+                    stack.close()
             else:
                 assert desired is not None
                 if operation["operation"] == "create":
@@ -2010,7 +2170,10 @@ def execute_durable_skill_pending(context, *, _manual: bool = False):
                     _secure_skill_write(
                         root, relative, desired,
                         create_parents=operation["operation"] == "write_file",
+                        expected=expected_entry,
                     )
+        except _SkillPreconditionError:
+            return failed(DurableActionStatus.INVALIDATED, "target_changed")
         except Exception:
             return failed(DurableActionStatus.UNKNOWN, "mutation_unverified")
     _write_pending_record({**record, "status": "applied"})
