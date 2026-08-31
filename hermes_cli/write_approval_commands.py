@@ -40,7 +40,11 @@ def _fmt_pending_list(subsystem: str) -> str:
         tag = " [auto]" if origin == "background_review" else ""
         linked = ""
         if subsystem == wa.MEMORY:
-            request_id = wa.linked_memory_request_id(r)
+            try:
+                request_id = wa.linked_memory_request_id(r)
+            except wa.MemoryActionLookupUnavailable:
+                request_id = None
+                linked = " [status unavailable]"
             if request_id:
                 try:
                     from gateway.durable_operations import DurableOperationsStore
@@ -147,8 +151,12 @@ def _approve(subsystem: str, rest: List[str], memory_store) -> str:
         except wa.MemoryActionLookupUnavailable:
             failed.append(f"{rec['id']}: linked_action_unavailable")
             continue
-        if receipt is not None and receipt[1] == "unknown":
+        if receipt is not None and receipt[1] == "unknown" and receipt[2] is None:
             failed.append(f"{rec['id']}: reconciliation_required")
+            continue
+        if receipt is not None and receipt[2] is not None:
+            wa.discard_pending(subsystem, rec["id"])
+            failed.append(f"{rec['id']}: reconciled_{receipt[2]}")
             continue
         if (
             subsystem == wa.MEMORY
@@ -230,8 +238,12 @@ def _reject(subsystem: str, rest: List[str]) -> str:
         except wa.MemoryActionLookupUnavailable:
             failed.append(f"{record['id']}: linked_action_unavailable")
             continue
-        if receipt is not None and receipt[1] == "unknown":
+        if receipt is not None and receipt[1] == "unknown" and receipt[2] is None:
             failed.append(f"{record['id']}: reconciliation_required")
+            continue
+        if receipt is not None and receipt[2] is not None:
+            if wa.discard_pending(subsystem, record["id"]):
+                rejected += 1
             continue
         if not request_id and subsystem == wa.MEMORY:
             request_id = receipt[0] if receipt else None

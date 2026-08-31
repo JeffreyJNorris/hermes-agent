@@ -49,6 +49,7 @@ import os
 import re
 import sqlite3
 import stat
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -138,6 +139,18 @@ def _pending_dir(subsystem: str) -> Path:
     return get_hermes_home() / "pending" / subsystem
 
 
+def _secure_dir_fd_supported() -> bool:
+    required = (os.open, os.stat, os.unlink, os.mkdir)
+    supports_dir_fd = getattr(os, "supports_dir_fd", ())
+    return (
+        os.name == "posix"
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and hasattr(os, "fchmod")
+        and all(function in supports_dir_fd for function in required)
+    )
+
+
 def _write_pending_record(record: Dict[str, Any]) -> None:
     subsystem = record.get("subsystem")
     pending_id = record.get("id")
@@ -150,7 +163,11 @@ def _write_pending_record(record: Dict[str, Any]) -> None:
 
     root = get_hermes_home() / "pending"
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    if not _secure_dir_fd_supported():
+        _write_pending_record_portable(root, subsystem, pending_id, record)
+        return
+
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     root_fd = os.open(root, directory_flags)
     try:
         os.fchmod(root_fd, 0o700)
@@ -171,9 +188,7 @@ def _write_pending_record(record: Dict[str, Any]) -> None:
                     raise OSError("pending record target is not a regular file")
 
             temporary = f".{pending_id}_{uuid.uuid4().hex}.tmp"
-            file_flags = (
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-            )
+            file_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
             fd = os.open(temporary, file_flags, 0o600, dir_fd=directory_fd)
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -197,6 +212,52 @@ def _write_pending_record(record: Dict[str, Any]) -> None:
             os.close(directory_fd)
     finally:
         os.close(root_fd)
+
+
+def _write_pending_record_portable(
+    root: Path,
+    subsystem: str,
+    pending_id: str,
+    record: Dict[str, Any],
+) -> None:
+    """Best available atomic replacement where directory FDs are unsupported."""
+    directory = root / subsystem
+    root_metadata = root.lstat()
+    if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+        raise OSError("pending directory is not a regular directory")
+    directory.mkdir(exist_ok=True, mode=0o700)
+    metadata = directory.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise OSError("pending directory is not a regular directory")
+    if directory.resolve().parent != root.resolve():
+        raise OSError("pending directory escaped its root")
+    if os.name == "posix":
+        root.chmod(0o700)
+        directory.chmod(0o700)
+    path = directory / f"{pending_id}.json"
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if not stat.S_ISREG(metadata.st_mode):
+            raise OSError("pending record target is not a regular file")
+
+    fd, temporary = tempfile.mkstemp(
+        dir=str(directory), prefix=f".{pending_id}_", suffix=".tmp"
+    )
+    temporary_path = Path(temporary)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(record, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def _memory_operations(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -281,9 +342,8 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
             entry text itself.
         origin: ``foreground`` or ``background_review`` — recorded for audit.
 
-    Returns a dict with ``id`` and metadata. Best-effort: on disk failure it
-    logs and still returns a record (the write is simply lost, which is the
-    safe failure for an approval gate — nothing is silently committed).
+    Returns a dict with ``id`` and metadata. Persistence failures are raised so
+    callers cannot claim that a write was staged when no review record exists.
     """
     if subsystem == MEMORY:
         payload = _normalize_memory_payload(payload)
@@ -311,10 +371,7 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
     if fields is not None:
         record.update(fields)
         record["subject_fingerprint"] = memory_pending_fingerprint(record)
-    try:
-        _write_pending_record(record)
-    except Exception as e:  # pragma: no cover - disk failure path
-        logger.error("Failed to stage pending %s write: %s", subsystem, e, exc_info=True)
+    _write_pending_record(record)
     return record
 
 
@@ -336,8 +393,14 @@ def list_pending(
                     action = memory_action_receipt(record.get("id", ""))
                 except MemoryActionLookupUnavailable:
                     action = None
-                if action is not None and action[1] in _TERMINAL_MEMORY_ACTION_STATUSES:
-                    record = {**record, "status": action[1]}
+                reconciled = action is not None and action[2] is not None
+                if action is not None and (
+                    action[1] in _TERMINAL_MEMORY_ACTION_STATUSES or reconciled
+                ):
+                    status = (
+                        f"reconciled_{action[2]}" if reconciled else action[1]
+                    )
+                    record = {**record, "status": status}
                     try:
                         _write_pending_record(record)
                     except OSError:
@@ -510,6 +573,8 @@ def linked_memory_request_id(record: Dict[str, Any]) -> Optional[str]:
         return None
     try:
         with sqlite3.connect(db_path) as conn:
+            if not _sqlite_table_exists(conn, "durable_action_tickets"):
+                return None
             rows = conn.execute(
                 """SELECT request_id, payload_json, fingerprint, idempotency_key
                    FROM durable_action_tickets
@@ -523,8 +588,16 @@ def linked_memory_request_id(record: Dict[str, Any]) -> Optional[str]:
     return matches[0] if len(matches) == 1 else None
 
 
-def memory_action_receipt(pending_id: str) -> Optional[tuple[str, str]]:
-    """Return the unique authoritative request ID and structural status."""
+def _sqlite_table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone() is not None
+
+
+def memory_action_receipt(
+    pending_id: str,
+) -> Optional[tuple[str, str, Optional[str]]]:
+    """Return the authoritative request, status, and effective reconciliation."""
     from gateway.durable_actions import decode_durable_action_payload
 
     if _PENDING_ID_RE.fullmatch(pending_id or "") is None:
@@ -534,19 +607,34 @@ def memory_action_receipt(pending_id: str) -> Optional[tuple[str, str]]:
         return None
     try:
         with sqlite3.connect(db_path) as conn:
+            if not _sqlite_table_exists(conn, "durable_action_tickets"):
+                return None
             # ponytail: bounded scan avoids a schema migration; add a subject
             # index only if pending-action volume makes this measurable.
-            rows = conn.execute(
-                """SELECT request_id, status, payload_json FROM durable_action_tickets
-                   WHERE action_type = 'memory.apply_pending' AND action_version = 1"""
-            ).fetchall()
+            if _sqlite_table_exists(conn, "durable_action_reconciliations"):
+                rows = conn.execute(
+                    """SELECT ticket.request_id, ticket.status, ticket.payload_json,
+                              reconciliation.outcome
+                       FROM durable_action_tickets AS ticket
+                       LEFT JOIN durable_action_reconciliations AS reconciliation
+                         ON reconciliation.request_id = ticket.request_id
+                       WHERE ticket.action_type = 'memory.apply_pending'
+                         AND ticket.action_version = 1"""
+                ).fetchall()
+            else:
+                rows = [(*row, None) for row in conn.execute(
+                    """SELECT request_id, status, payload_json
+                       FROM durable_action_tickets
+                       WHERE action_type = 'memory.apply_pending'
+                         AND action_version = 1"""
+                ).fetchall()]
     except sqlite3.Error as exc:
         raise MemoryActionLookupUnavailable from exc
     matches = []
-    for request_id, status, payload_json in rows:
+    for request_id, status, payload_json, reconciliation in rows:
         try:
             if decode_durable_action_payload(payload_json) == {"pending_id": pending_id}:
-                matches.append((request_id, status))
+                matches.append((request_id, status, reconciliation))
         except (TypeError, ValueError):
             continue
     return matches[0] if len(matches) == 1 else None

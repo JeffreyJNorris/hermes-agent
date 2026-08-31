@@ -552,3 +552,109 @@ def test_pending_rewrite_rejects_symlink_target(hermes_home):
     with pytest.raises(OSError):
         wa._write_pending_record({**record, "status": "cancelled"})
     assert victim.read_text(encoding="utf-8") == "untouched"
+
+
+def test_pending_writer_uses_portable_fallback_when_posix_capability_is_unavailable(
+    hermes_home, monkeypatch
+):
+    from tools import write_approval as wa
+
+    monkeypatch.delattr(wa.os, "fchmod")
+    record = _stage("portable persistence")
+    assert wa.get_pending(wa.MEMORY, record["id"])["payload"]["content"] == (
+        "portable persistence"
+    )
+
+
+def test_stage_write_does_not_claim_success_when_persistence_fails(
+    hermes_home, monkeypatch
+):
+    from tools import write_approval as wa
+
+    def fail(_record):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(wa, "_write_pending_record", fail)
+    with pytest.raises(OSError):
+        _stage("not persisted")
+
+
+def test_pending_status_reports_link_lookup_unavailable(hermes_home, monkeypatch):
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+
+    record = _stage("bounded status")
+    monkeypatch.setattr(wa, "list_pending", lambda *_args, **_kwargs: [record])
+
+    def unavailable(_record):
+        raise wa.MemoryActionLookupUnavailable
+
+    monkeypatch.setattr(wa, "linked_memory_request_id", unavailable)
+    output = handle_pending_subcommand(wa.MEMORY, ["pending"])
+    assert "status unavailable" in output
+    assert record["id"] in output
+
+
+def test_existing_database_without_durable_tables_uses_legacy_manual_path(
+    hermes_home
+):
+    import sqlite3
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.memory_tool import MemoryStore
+
+    sqlite3.connect(hermes_home / "state.db").close()
+    record = _stage("legacy database")
+    assert wa.linked_memory_request_id(record) is None
+    assert wa.memory_action_receipt(record["id"]) is None
+    store = MemoryStore()
+    store.load_from_disk()
+    output = handle_pending_subcommand(
+        wa.MEMORY, ["approve", record["id"]], memory_store=store
+    )
+    assert "Approved 1" in output
+    assert store.memory_entries == ["legacy database"]
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["confirmed_applied", "confirmed_not_applied", "abandoned", "superseded"],
+)
+def test_reconciled_unknown_can_be_cleaned_without_applying_memory(
+    hermes_home, outcome
+):
+    import sqlite3
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    from tools import write_approval as wa
+    from tools.memory_tool import MemoryStore
+
+    _configure()
+    record = _stage(f"reconciled {outcome}")
+    receipt = wa.create_memory_durable_approval(record)
+    with sqlite3.connect(hermes_home / "state.db") as conn:
+        conn.execute(
+            "UPDATE durable_action_tickets SET status = 'unknown' WHERE request_id = ?",
+            (receipt["request_id"],),
+        )
+        conn.execute(
+            """INSERT INTO durable_action_reconciliations (
+                   reconciliation_id, request_id, outcome, operator_identity,
+                   note, superseded_by_request_id, created_at
+               ) VALUES (?, ?, ?, ?, NULL, ?, 1)""",
+            (
+                f"drc_{outcome}",
+                receipt["request_id"],
+                outcome,
+                "test-operator",
+                "drq_successor" if outcome == "superseded" else None,
+            ),
+        )
+    assert wa.list_pending(wa.MEMORY) == []
+    stored = wa.get_pending(wa.MEMORY, record["id"])
+    assert stored["status"] == f"reconciled_{outcome}"
+    output = handle_pending_subcommand(wa.MEMORY, ["reject", record["id"]])
+    assert "reconciliation_required" not in output
+    assert wa.get_pending(wa.MEMORY, record["id"]) is None
+    store = MemoryStore()
+    store.load_from_disk()
+    assert store.memory_entries == []
