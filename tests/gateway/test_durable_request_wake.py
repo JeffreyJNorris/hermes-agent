@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import gateway.durable_requests as durable_requests
 from gateway.durable_requests import (
     DurableRequestError,
     DurableRequestOption,
@@ -451,6 +452,30 @@ def test_existing_phase4a_database_is_reconciled_in_place(tmp_path: Path) -> Non
             );
             """
         )
+        conn.execute(
+            """INSERT INTO durable_requests (
+                   request_id, kind, title, body, options_json, status,
+                   created_at, updated_at, expires_at, platform, chat_id,
+                   responder_mode, origin_type, origin_id
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "drq_abcdefghijklmnopqrstuvwxyz",
+                "test",
+                "Title",
+                "Body",
+                '[{"id":"a","label":"A","style":"secondary"},'
+                '{"id":"b","label":"B","style":"secondary"}]',
+                "pending_delivery",
+                1.0,
+                1.0,
+                2.0,
+                "discord",
+                "chat",
+                "any_authorized",
+                "session",
+                "session-1",
+            ),
+        )
         conn.commit()
     finally:
         conn.close()
@@ -479,8 +504,21 @@ def test_existing_phase4a_database_is_reconciled_in_place(tmp_path: Path) -> Non
         "origin_session_id",
         "origin_ui_session_id",
         "origin_profile",
+        "delivery_mode",
+        "command_response_allowed",
+        "resolution_source",
     }.issubset(columns)
     assert "idx_durable_requests_wake" in indexes
+
+    migrated = DurableRequestStore(db_path).get(
+        request_id="drq_abcdefghijklmnopqrstuvwxyz"
+    )
+    assert migrated is not None
+    assert (
+        migrated.delivery_mode is durable_requests.DurableRequestDeliveryMode.NATIVE
+    )
+    assert migrated.command_response_allowed is False
+    assert migrated.resolution_source is None
 
 
 def test_central_state_schema_reconciles_phase4a_database(tmp_path: Path) -> None:
@@ -541,4 +579,7 @@ def test_central_state_schema_reconciles_phase4a_database(tmp_path: Path) -> Non
 
     assert "wake_status" in columns
     assert "origin_session_id" in columns
+    assert "delivery_mode" in columns
+    assert "command_response_allowed" in columns
+    assert "resolution_source" in columns
     assert "idx_durable_requests_wake" in indexes

@@ -80,6 +80,16 @@ class DurableRequestStatus(str, Enum):
     DELIVERY_UNKNOWN = "delivery_unknown"
 
 
+class DurableRequestDeliveryMode(str, Enum):
+    NATIVE = "native"
+    TEXT_COMMAND = "text_command"
+
+
+class DurableRequestResolutionSource(str, Enum):
+    NATIVE = "native"
+    COMMAND = "command"
+
+
 class DurableResponderMode(str, Enum):
     INITIATOR = "initiator"
     ANY_AUTHORIZED = "any_authorized"
@@ -200,6 +210,9 @@ class DurableRequest:
     wake_claimed_at: float | None = None
     wake_delivered_at: float | None = None
     wake_reason: str | None = None
+    delivery_mode: DurableRequestDeliveryMode = DurableRequestDeliveryMode.NATIVE
+    command_response_allowed: bool = False
+    resolution_source: DurableRequestResolutionSource | None = None
 
     @property
     def delivery_channel_id(self) -> str:
@@ -229,6 +242,8 @@ class _ValidatedCreate:
     actor: str | None
     origin_type: str
     origin_id: str
+    delivery_mode: DurableRequestDeliveryMode
+    command_response_allowed: bool
     wake_on_terminal: bool
     origin_session_id: str | None
     origin_ui_session_id: str | None
@@ -270,6 +285,9 @@ class DurableRequestsConfig:
     terminal_retention_seconds: float
     scheduled_responder_mode: DurableResponderMode
     reason: str | None = None
+    command_responses_enabled: bool = False
+    allow_on_native_delivery: bool = True
+    allow_text_delivery_fallback: bool = True
 
     @property
     def available(self) -> bool:
@@ -549,7 +567,7 @@ class DurableRequestStore:
                         "PRAGMA table_info(durable_requests)"
                     ).fetchall()
                 }
-                for column, ddl in _DURABLE_WAKE_COLUMN_DDL.items():
+                for column, ddl in _DURABLE_COLUMN_DDL.items():
                     if column not in existing_columns:
                         conn.execute(
                             f"ALTER TABLE durable_requests ADD COLUMN {column} {ddl}"
@@ -571,6 +589,7 @@ class DurableRequestStore:
         expected_actor_id: str | None,
         origin_type: str,
         origin_id: str,
+        command_response_allowed: bool = False,
         wake_on_terminal: bool = False,
         origin_session_id: str | None = None,
         origin_ui_session_id: str | None = None,
@@ -587,6 +606,7 @@ class DurableRequestStore:
             expected_actor_id=expected_actor_id,
             origin_type=origin_type,
             origin_id=origin_id,
+            command_response_allowed=command_response_allowed,
             wake_on_terminal=wake_on_terminal,
             origin_session_id=origin_session_id,
             origin_ui_session_id=origin_ui_session_id,
@@ -635,6 +655,7 @@ class DurableRequestStore:
         expected_actor_id: str | None,
         origin_type: str,
         origin_id: str,
+        command_response_allowed: bool = False,
         origin_session_id: str | None = None,
         origin_ui_session_id: str | None = None,
         origin_profile: str | None = None,
@@ -652,6 +673,7 @@ class DurableRequestStore:
             expected_actor_id=expected_actor_id,
             origin_type=origin_type,
             origin_id=origin_id,
+            command_response_allowed=command_response_allowed,
             wake_on_terminal=False,
             origin_session_id=origin_session_id,
             origin_ui_session_id=origin_ui_session_id,
@@ -771,6 +793,7 @@ class DurableRequestStore:
         expected_actor_id: str | None,
         origin_type: str,
         origin_id: str,
+        command_response_allowed: bool,
         wake_on_terminal: bool,
         origin_session_id: str | None,
         origin_ui_session_id: str | None,
@@ -808,6 +831,8 @@ class DurableRequestStore:
         )
         if not isinstance(wake_on_terminal, bool):
             raise DurableRequestError("wake_on_terminal must be a boolean")
+        if not isinstance(command_response_allowed, bool):
+            raise DurableRequestError("command_response_allowed must be a boolean")
         origin_session_value = _normalize_optional_text(
             origin_session_id,
             field="origin_session_id",
@@ -847,6 +872,8 @@ class DurableRequestStore:
             actor=actor,
             origin_type=origin_type_value,
             origin_id=origin_id_value,
+            delivery_mode=DurableRequestDeliveryMode.NATIVE,
+            command_response_allowed=command_response_allowed,
             wake_on_terminal=wake_on_terminal,
             origin_session_id=origin_session_value,
             origin_ui_session_id=origin_ui_session_value,
@@ -906,10 +933,11 @@ class DurableRequestStore:
                    platform, chat_id, thread_id,
                    responder_mode, expected_actor_id,
                    origin_type, origin_id, reference,
+                   delivery_mode, command_response_allowed,
                    wake_requested, wake_status,
                    origin_session_id, origin_ui_session_id, origin_profile,
                    delivery_attempts, wake_attempts
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)""",
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)""",
             (
                 request_id,
                 values.spec.kind,
@@ -928,6 +956,8 @@ class DurableRequestStore:
                 values.origin_type,
                 values.origin_id,
                 values.spec.reference,
+                values.delivery_mode.value,
+                1 if values.command_response_allowed else 0,
                 1 if values.wake_on_terminal else 0,
                 DurableWakeStatus.NOT_REQUESTED.value,
                 values.origin_session_id,
@@ -2198,6 +2228,13 @@ class DurableRequestStore:
             origin_type=row["origin_type"],
             origin_id=row["origin_id"],
             reference=row["reference"],
+            delivery_mode=DurableRequestDeliveryMode(row["delivery_mode"]),
+            command_response_allowed=bool(row["command_response_allowed"]),
+            resolution_source=(
+                None
+                if row["resolution_source"] is None
+                else DurableRequestResolutionSource(row["resolution_source"])
+            ),
             wake_requested=bool(row["wake_requested"]),
             wake_status=DurableWakeStatus(row["wake_status"]),
             origin_session_id=row["origin_session_id"],
@@ -2297,6 +2334,9 @@ CREATE TABLE IF NOT EXISTS durable_requests (
     origin_type TEXT NOT NULL,
     origin_id TEXT NOT NULL,
     reference TEXT,
+    delivery_mode TEXT NOT NULL DEFAULT 'native',
+    command_response_allowed INTEGER NOT NULL DEFAULT 0,
+    resolution_source TEXT,
     selected_option_id TEXT,
     resolved_by_actor_id TEXT,
     resolved_at REAL,
@@ -2328,7 +2368,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_requests_origin_reference
 """
 
 
-_DURABLE_WAKE_COLUMN_DDL = {
+_DURABLE_COLUMN_DDL = {
+    "delivery_mode": "TEXT NOT NULL DEFAULT 'native'",
+    "command_response_allowed": "INTEGER NOT NULL DEFAULT 0",
+    "resolution_source": "TEXT",
     "wake_requested": "INTEGER NOT NULL DEFAULT 0",
     "wake_status": "TEXT NOT NULL DEFAULT 'not_requested'",
     "wake_attempts": "INTEGER NOT NULL DEFAULT 0",
@@ -2389,6 +2432,18 @@ def load_durable_requests_config() -> DurableRequestsConfig:
     enabled = is_truthy_value(raw.get("enabled", False), default=False)
 
     try:
+        command_responses = raw.get("command_responses", {})
+        if not isinstance(command_responses, dict):
+            raise DurableRequestError("command_responses must be a mapping")
+        command_responses_enabled = is_truthy_value(
+            command_responses.get("enabled", False), default=False
+        )
+        allow_on_native_delivery = is_truthy_value(
+            command_responses.get("allow_on_native_delivery", True), default=True
+        )
+        allow_text_delivery_fallback = is_truthy_value(
+            command_responses.get("allow_text_delivery_fallback", True), default=True
+        )
         max_ttl = _validate_config_seconds(
             raw.get("max_ttl_seconds", MAX_DURABLE_REQUEST_TTL_SECONDS),
             field="max_ttl_seconds",
@@ -2459,6 +2514,9 @@ def load_durable_requests_config() -> DurableRequestsConfig:
             max_ttl_seconds=max_ttl,
             terminal_retention_seconds=retention,
             scheduled_responder_mode=responder_mode,
+            command_responses_enabled=command_responses_enabled,
+            allow_on_native_delivery=allow_on_native_delivery,
+            allow_text_delivery_fallback=allow_text_delivery_fallback,
             reason=None if enabled else "disabled",
         )
     except (DurableRequestError, ValueError) as exc:
@@ -2489,6 +2547,7 @@ def create_durable_request(
     expected_actor_id: str | None,
     origin_type: str,
     origin_id: str,
+    command_response_allowed: bool = False,
     wake_on_terminal: bool = False,
     origin_session_id: str | None = None,
     origin_ui_session_id: str | None = None,
@@ -2505,6 +2564,7 @@ def create_durable_request(
         expected_actor_id=expected_actor_id,
         origin_type=origin_type,
         origin_id=origin_id,
+        command_response_allowed=command_response_allowed,
         wake_on_terminal=wake_on_terminal,
         origin_session_id=origin_session_id,
         origin_ui_session_id=origin_ui_session_id,
@@ -2571,9 +2631,11 @@ __all__ = [
     "DurableDeliveryClaim",
     "DurableWakeClaim",
     "DurableRequest",
+    "DurableRequestDeliveryMode",
     "DurableRequestError",
     "DurableRequestLimitError",
     "DurableRequestOption",
+    "DurableRequestResolutionSource",
     "DurableRequestSpec",
     "DurableRequestStatus",
     "DurableRequestStore",

@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import gateway.durable_requests as durable_requests
 from gateway.durable_requests import (
     DEFAULT_DURABLE_TERMINAL_RETENTION_SECONDS,
     DurableRequestError,
@@ -17,6 +18,7 @@ from gateway.durable_requests import (
     DurableResponderMode,
     DurableResolveStatus,
     PromptStyle,
+    load_durable_requests_config,
 )
 
 
@@ -92,6 +94,58 @@ def test_request_id_is_random_and_contains_no_scope_identifiers(tmp_path: Path) 
     assert first.request_id != second.request_id
     for forbidden in ("session-1", "chat-1", "thread-1", "actor-1"):
         assert forbidden not in first.request_id
+
+
+def test_command_responses_default_disabled(monkeypatch) -> None:
+    from hermes_cli import config as config_module
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    monkeypatch.setattr(config_module, "load_config_readonly", lambda: {})
+
+    loaded = load_durable_requests_config()
+
+    assert DEFAULT_CONFIG["durable_requests"]["command_responses"] == {
+        "enabled": False,
+        "allow_on_native_delivery": True,
+        "allow_text_delivery_fallback": True,
+    }
+    assert loaded.command_responses_enabled is False
+    assert loaded.allow_on_native_delivery is True
+    assert loaded.allow_text_delivery_fallback is True
+    assert (
+        durable_requests.DurableRequestDeliveryMode.TEXT_COMMAND.value
+        == "text_command"
+    )
+    assert durable_requests.DurableRequestResolutionSource.NATIVE.value == "native"
+    assert durable_requests.DurableRequestResolutionSource.COMMAND.value == "command"
+
+
+def test_create_snapshots_command_response_permission(tmp_path: Path) -> None:
+    store = _store(tmp_path, Clock())
+
+    default_request = _create(store, reference="default").request
+    enabled_request = store.create(
+        _spec(reference="enabled"),
+        target=DurableRequestTarget("discord", "chat-1", "thread-1"),
+        responder_mode=DurableResponderMode.INITIATOR,
+        expected_actor_id="actor-1",
+        origin_type="session",
+        origin_id="session-1",
+        command_response_allowed=True,
+    ).request
+
+    assert (
+        default_request.delivery_mode
+        is durable_requests.DurableRequestDeliveryMode.NATIVE
+    )
+    assert default_request.command_response_allowed is False
+    assert default_request.resolution_source is None
+    assert (
+        enabled_request.delivery_mode
+        is durable_requests.DurableRequestDeliveryMode.NATIVE
+    )
+    assert enabled_request.command_response_allowed is True
+    assert enabled_request.resolution_source is None
 
 
 def test_origin_reference_is_idempotent(tmp_path: Path) -> None:

@@ -781,6 +781,7 @@ def _create_approval(
     *,
     spec: DurableRequestSpec | None = None,
     action: durable_actions.PreparedDurableAction | None = None,
+    command_response_allowed: bool = False,
 ):
     return store.create_with_action(
         spec or _approval_spec(),
@@ -793,6 +794,7 @@ def _create_approval(
         origin_session_id="session-1",
         origin_ui_session_id="ui-session-1",
         origin_profile="work",
+        command_response_allowed=command_response_allowed,
     )
 
 
@@ -886,6 +888,14 @@ def test_create_with_action_persists_one_joined_approval_and_retains_lineage(
                JOIN durable_action_tickets AS ticket
                  ON ticket.request_id = request.request_id"""
         ).fetchone()[0] == 1
+
+
+def test_create_with_action_preserves_command_permission(tmp_path: Path) -> None:
+    store = DurableRequestStore(tmp_path / "state.db", wall_clock=lambda: 1_000.0)
+
+    result = _create_approval(store, command_response_allowed=True)
+
+    assert result.request.command_response_allowed is True
 
 
 def test_create_with_action_returns_terminal_ticket_idempotently(

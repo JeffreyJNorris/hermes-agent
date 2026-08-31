@@ -2042,6 +2042,11 @@ DEFAULT_CONFIG = {
         "max_ttl_seconds": 604800,
         "terminal_retention_seconds": 604800,
         "scheduled_responder_policy": "any_authorized",
+        "command_responses": {
+            "enabled": False,
+            "allow_on_native_delivery": True,
+            "allow_text_delivery_fallback": True,
+        },
     },
 
     # Trusted application-owned durable actions. Generic durable requests
