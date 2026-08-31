@@ -194,6 +194,57 @@ async def test_request_slash_logs_command_name_without_receipt_or_slot(adapter, 
     assert all(receipt not in message for message in messages)
     assert all("respond" not in message for message in messages)
     assert all(" 7" not in message for message in messages)
+    assert all("Jezza" not in message for message in messages)
+    assert all("42" not in message for message in messages)
+    assert all("123" not in message for message in messages)
+    assert all("456" not in message for message in messages)
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == f"/request respond {receipt} 7"
+    assert event.source.user_id == "42"
+    assert event.source.chat_id == "123"
+    assert event.raw_message.guild_id == 456
+
+
+@pytest.mark.asyncio
+async def test_unrelated_slash_keeps_existing_diagnostic_metadata(adapter, caplog):
+    interaction = SimpleNamespace(
+        channel=_FakeTextChannel(channel_id=123, name="general"),
+        channel_id=123,
+        guild_id=456,
+        user=SimpleNamespace(id=42, name="Jezza", display_name="Jezza"),
+        response=SimpleNamespace(defer=AsyncMock()),
+        edit_original_response=AsyncMock(),
+        delete_original_response=AsyncMock(),
+    )
+    adapter.handle_message = AsyncMock()
+
+    with caplog.at_level(logging.INFO):
+        await adapter._run_simple_slash(interaction, "/reset")
+
+    assert any(
+        "slash '/reset' invoked by user=Jezza id=42 channel=123 guild=456"
+        in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_rejected_request_slash_log_omits_actor_and_scope(adapter, caplog):
+    interaction = SimpleNamespace(
+        channel=_FakeTextChannel(channel_id=123, name="general"),
+        channel_id=123,
+        guild_id=456,
+        user=SimpleNamespace(id=42, name="Jezza"),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+
+    with caplog.at_level(logging.WARNING):
+        await adapter._reject_slash(
+            interaction, "/request", reason="user not in allowlist"
+        )
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert messages == ["[Discord] Unauthorized slash attempt: cmd='/request'"]
 
 
 # ------------------------------------------------------------------
@@ -627,4 +678,3 @@ def test_register_skill_command_payload_fits_discord_8kb_limit(adapter):
         f"Flat /skill command payload is ~{len(payload)} bytes — the whole "
         f"point of this design is that it stays small regardless of skill count"
     )
-

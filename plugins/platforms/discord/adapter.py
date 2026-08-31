@@ -4875,11 +4875,14 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         guild_id = getattr(interaction, "guild_id", None)
 
-        logger.warning(
-            "[Discord] Unauthorized slash attempt: user=%s id=%s channel=%s "
-            "guild=%s cmd=%r reason=%r",
-            user_name, user_id, chan_id, guild_id, command_text, reason,
-        )
+        if command_text == "/request":
+            logger.warning("[Discord] Unauthorized slash attempt: cmd=%r", command_text)
+        else:
+            logger.warning(
+                "[Discord] Unauthorized slash attempt: user=%s id=%s channel=%s "
+                "guild=%s cmd=%r reason=%r",
+                user_name, user_id, chan_id, guild_id, command_text, reason,
+            )
 
         try:
             await interaction.response.send_message(
@@ -5374,16 +5377,19 @@ class DiscordAdapter(BasePlatformAdapter):
         # them), but mobile autocomplete / keyboard shortcuts / other users
         # in the same channel are easy to miss in post-mortems.
         try:
-            _user = interaction.user
-            _chan_id = getattr(interaction.channel, "id", None) or getattr(interaction, "channel_id", None)
-            logger.info(
-                "[Discord] slash '%s' invoked by user=%s id=%s channel=%s guild=%s",
-                _logged_command,
-                getattr(_user, "name", "?"),
-                getattr(_user, "id", "?"),
-                _chan_id,
-                getattr(interaction, "guild_id", None),
-            )
+            if _command_name == "/request":
+                logger.info("[Discord] slash '%s' invoked", _logged_command)
+            else:
+                _user = interaction.user
+                _chan_id = getattr(interaction.channel, "id", None) or getattr(interaction, "channel_id", None)
+                logger.info(
+                    "[Discord] slash '%s' invoked by user=%s id=%s channel=%s guild=%s",
+                    _logged_command,
+                    getattr(_user, "name", "?"),
+                    getattr(_user, "id", "?"),
+                    _chan_id,
+                    getattr(interaction, "guild_id", None),
+                )
         except Exception:
             pass  # logging must never block command dispatch
 
