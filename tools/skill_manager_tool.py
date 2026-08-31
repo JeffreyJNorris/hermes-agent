@@ -1387,6 +1387,24 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     }
 
 
+# Every concrete writer, including dashboard/manual callers that intentionally
+# bypass the approval gate, shares the durable handler's cross-process lock.
+def _locked_writer(function):
+    def locked(*args, **kwargs):
+        from tools.write_approval import skill_write_lock
+        with skill_write_lock():
+            return function(*args, **kwargs)
+    return locked
+
+
+_create_skill = _locked_writer(_create_skill)
+_edit_skill = _locked_writer(_edit_skill)
+_patch_skill = _locked_writer(_patch_skill)
+_delete_skill = _locked_writer(_delete_skill)
+_write_file = _locked_writer(_write_file)
+_remove_file = _locked_writer(_remove_file)
+
+
 # =============================================================================
 # Main entry point
 # =============================================================================
@@ -1430,7 +1448,13 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
         old_string=payload_kwargs.get("old_string") or "",
         new_string=payload_kwargs.get("new_string") or "",
     )
-    record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
+    if wa.durable_approval_enabled(wa.SKILLS):
+        record = wa.stage_skill_write(payload, summary=gist, origin=wa.current_origin())
+        if record.get("manifest_version") == 1:
+            receipt = wa.create_skill_durable_approval(record)
+            return json.dumps({"success": True, "staged": True, "gist": gist, **receipt}, ensure_ascii=False)
+    else:
+        record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
          "gist": gist, "message": decision.message},

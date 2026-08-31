@@ -1827,6 +1827,7 @@ DEFAULT_CONFIG = {
         #                     never crammed into a chat bubble), apply with
         #                     /skills approve <id> or drop with /skills reject <id>.
         "write_approval": False,
+        "durable_approval": False,
     },
 
     # Curator — background skill maintenance.
