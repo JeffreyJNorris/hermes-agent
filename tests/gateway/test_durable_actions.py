@@ -17,6 +17,7 @@ from gateway.durable_requests import (
     DurableRequestStore,
     DurableRequestTarget,
     DurableResponderMode,
+    DurableResolveStatus,
     DurableWakeStatus,
     PromptStyle,
 )
@@ -1420,6 +1421,50 @@ def test_action_decision_transitions_atomically(
     assert ticket["status"] == status
     assert ticket["notification_status"] == notification
     assert (ticket["completed_at"] is not None) is completed
+    assert ticket["outcome_reason"] == reason
+
+
+@pytest.mark.parametrize(
+    ("slot", "status", "notification", "reason"),
+    [
+        (1, "ready", "not_ready", None),
+        (2, "declined", "pending", "rejected"),
+    ],
+)
+def test_command_action_decision_uses_existing_atomic_transition(
+    tmp_path: Path,
+    slot: int,
+    status: str,
+    notification: str,
+    reason: str | None,
+) -> None:
+    db_path = tmp_path / "state.db"
+    store = DurableRequestStore(db_path, wall_clock=lambda: 1_000.0)
+    created = _create_approval(store, command_response_allowed=True)
+    claim = store.claim_next_pending(["discord"])
+    assert claim is not None
+    assert store.bind_delivery(
+        request_id=created.request.request_id,
+        claim_id=claim.claim_id,
+        platform="discord",
+        message_id="message-1",
+    ) is not None
+
+    result = store.resolve_command(
+        request_id=created.request.request_id,
+        option_slots=(slot,),
+        platform="discord",
+        channel_id="thread-1",
+        actor_id="actor-1",
+    )
+
+    assert result.status is DurableResolveStatus.RESOLVED
+    ticket = _action_ticket(db_path, created.request.request_id)
+    assert ticket is not None
+    assert (ticket["status"], ticket["notification_status"]) == (
+        status,
+        notification,
+    )
     assert ticket["outcome_reason"] == reason
 
 

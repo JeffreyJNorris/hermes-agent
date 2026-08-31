@@ -149,6 +149,46 @@ def test_selected_request_queues_claims_and_completes_one_wake(tmp_path: Path) -
     assert store.claim_next_wake() is None
 
 
+def test_command_selected_request_queues_generic_wake(tmp_path: Path) -> None:
+    store = _store(tmp_path, Clock())
+    request = store.create(
+        DurableRequestSpec(
+            kind="test.wake",
+            title="Choose",
+            body="Choose one option.",
+            options=(
+                DurableRequestOption("first", "First"),
+                DurableRequestOption("second", "Second"),
+            ),
+            ttl_seconds=60,
+            reference="command-wake",
+        ),
+        target=DurableRequestTarget("discord", "chat", "thread"),
+        responder_mode=DurableResponderMode.INITIATOR,
+        expected_actor_id="actor",
+        origin_type="session",
+        origin_id="agent:main:discord:dm:chat:actor",
+        command_response_allowed=True,
+        wake_on_terminal=True,
+        origin_session_id="physical-session",
+    ).request
+    _bind(store, request.request_id)
+
+    result = store.resolve_command(
+        request_id=request.request_id,
+        option_slots=(2,),
+        platform="discord",
+        channel_id="thread",
+        actor_id="actor",
+    )
+
+    assert result.status is DurableResolveStatus.RESOLVED
+    claim = store.claim_next_wake()
+    assert claim is not None
+    assert claim.request.request_id == request.request_id
+    assert claim.request.selected_option_id == "second"
+
+
 def test_retrying_wake_does_not_starve_later_terminal_events(
     tmp_path: Path,
 ) -> None:

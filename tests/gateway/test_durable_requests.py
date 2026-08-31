@@ -54,6 +54,7 @@ def _create(
     reference: str | None = "weekly",
     actor: str | None = "actor-1",
     origin_id: str = "session-1",
+    command_response_allowed: bool = False,
 ):
     return store.create(
         _spec(reference=reference),
@@ -66,6 +67,7 @@ def _create(
         expected_actor_id=actor,
         origin_type="session",
         origin_id=origin_id,
+        command_response_allowed=command_response_allowed,
     )
 
 
@@ -308,9 +310,197 @@ def test_resolution_is_exactly_once_and_survives_store_restart(tmp_path: Path) -
     assert result.status is DurableResolveStatus.RESOLVED
     assert result.request is not None
     assert result.request.selected_option_id == "reject"
+    assert (
+        result.request.resolution_source
+        is durable_requests.DurableRequestResolutionSource.NATIVE
+    )
     assert replay.status is DurableResolveStatus.ALREADY_RESOLVED
     assert persisted is not None
     assert persisted.selected_option_id == "reject"
+
+
+def test_command_invalid_request_id_returns_not_found_without_sqlite_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = _store(tmp_path, Clock())
+
+    def fail_connect():
+        raise AssertionError("SQLite must not be opened")
+
+    monkeypatch.setattr(store, "_connect", fail_connect)
+
+    result = store.resolve_command(
+        request_id="not-a-request",
+        option_slots=(1,),
+        platform="discord",
+        channel_id="thread-1",
+        actor_id="actor-1",
+    )
+
+    assert result.status is DurableResolveStatus.NOT_FOUND
+
+
+@pytest.mark.parametrize("option_slots", [(), (1, 2), (0,), (-1,), ("1",), (True,)])
+def test_command_requires_one_positive_numeric_slot(
+    tmp_path: Path,
+    option_slots: tuple[object, ...],
+) -> None:
+    store = _store(tmp_path, Clock())
+    request = _create(store, command_response_allowed=True).request
+    _bind(store, request.request_id)
+
+    result = store.resolve_command(
+        request_id=request.request_id,
+        option_slots=option_slots,  # type: ignore[arg-type]
+        platform="discord",
+        channel_id="thread-1",
+        actor_id="actor-1",
+    )
+
+    assert result.status is DurableResolveStatus.INVALID_OPTION
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({"platform": "telegram"}, DurableResolveStatus.SCOPE_MISMATCH),
+        ({"channel_id": "chat-1"}, DurableResolveStatus.WRONG_CHANNEL),
+        ({"actor_id": "actor-2"}, DurableResolveStatus.WRONG_ACTOR),
+        ({"actor_id": None}, DurableResolveStatus.WRONG_ACTOR),
+    ],
+)
+def test_command_validates_platform_channel_and_actor(
+    tmp_path: Path,
+    overrides: dict[str, str | None],
+    expected: DurableResolveStatus,
+) -> None:
+    store = _store(tmp_path, Clock())
+    request = _create(store, command_response_allowed=True).request
+    _bind(store, request.request_id)
+    arguments = {
+        "request_id": request.request_id,
+        "option_slots": (1,),
+        "platform": "discord",
+        "channel_id": "thread-1",
+        "actor_id": "actor-1",
+    }
+    arguments.update(overrides)
+
+    result = store.resolve_command(**arguments)
+
+    assert result.status is expected
+
+
+def test_command_disabled_request_cannot_resolve(tmp_path: Path) -> None:
+    store = _store(tmp_path, Clock())
+    request = _create(store).request
+    _bind(store, request.request_id)
+
+    result = store.resolve_command(
+        request_id=request.request_id,
+        option_slots=(1,),
+        platform="discord",
+        channel_id="thread-1",
+        actor_id="actor-1",
+    )
+
+    assert result.status is DurableResolveStatus.COMMAND_DISABLED
+
+
+def test_command_maps_slot_server_side_and_records_source(tmp_path: Path) -> None:
+    store = _store(tmp_path, Clock())
+    request = _create(store, command_response_allowed=True).request
+    _bind(store, request.request_id)
+
+    result = store.resolve_command(
+        request_id=request.request_id,
+        option_slots=(2,),
+        platform="discord",
+        channel_id="thread-1",
+        actor_id="actor-1",
+    )
+
+    assert result.status is DurableResolveStatus.RESOLVED
+    assert result.request is not None
+    assert result.request.selected_option_id == "reject"
+    assert (
+        result.request.resolution_source
+        is durable_requests.DurableRequestResolutionSource.COMMAND
+    )
+
+
+def test_command_and_native_resolution_race_has_one_winner(tmp_path: Path) -> None:
+    clock = Clock()
+    first_store = _store(tmp_path, clock)
+    request = _create(first_store, command_response_allowed=True).request
+    _bind(first_store, request.request_id)
+    second_store = DurableRequestStore(tmp_path / "state.db", wall_clock=clock)
+    barrier = threading.Barrier(2)
+    results = []
+
+    def resolve_native() -> None:
+        barrier.wait()
+        results.append(
+            first_store.resolve(
+                request_id=request.request_id,
+                option_token="1",
+                platform="discord",
+                channel_id="thread-1",
+                message_id="msg-1",
+                actor_id="actor-1",
+            )
+        )
+
+    def resolve_command() -> None:
+        barrier.wait()
+        results.append(
+            second_store.resolve_command(
+                request_id=request.request_id,
+                option_slots=(2,),
+                platform="discord",
+                channel_id="thread-1",
+                actor_id="actor-1",
+            )
+        )
+
+    threads = [threading.Thread(target=resolve_native), threading.Thread(target=resolve_command)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert sorted(result.status.value for result in results) == [
+        DurableResolveStatus.ALREADY_RESOLVED.value,
+        DurableResolveStatus.RESOLVED.value,
+    ]
+    winner = next(result.request for result in results if result.request is not None)
+    persisted = second_store.get(request_id=request.request_id)
+    assert persisted is not None
+    assert persisted.selected_option_id == winner.selected_option_id
+    assert persisted.resolution_source is winner.resolution_source
+
+
+def test_public_command_resolution_facade_uses_default_store(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = durable_requests.DurableResolveResult(DurableResolveStatus.NOT_FOUND)
+
+    class Store:
+        def resolve_command(self, **kwargs):
+            assert kwargs["option_slots"] == (2,)
+            return expected
+
+    monkeypatch.setattr(durable_requests, "get_durable_request_store", lambda: Store())
+
+    assert durable_requests.resolve_durable_request_command(
+        request_id="drq_valid",
+        option_slots=(2,),
+        platform="discord",
+        channel_id="channel",
+        actor_id="actor",
+    ) is expected
 
 
 def test_any_authorized_mode_accepts_authorized_actor_metadata(tmp_path: Path) -> None:

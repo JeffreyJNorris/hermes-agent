@@ -114,6 +114,9 @@ class DurableResolveStatus(str, Enum):
     NOT_FOUND = "not_found"
     INVALID_OPTION = "invalid_option"
     SCOPE_MISMATCH = "scope_mismatch"
+    WRONG_CHANNEL = "wrong_channel"
+    WRONG_ACTOR = "wrong_actor"
+    COMMAND_DISABLED = "command_disabled"
     NOT_DELIVERED = "not_delivered"
 
 
@@ -1712,79 +1715,149 @@ class DurableRequestStore:
             ):
                 return DurableResolveResult(DurableResolveStatus.SCOPE_MISMATCH)
 
-            options = _deserialize_options(row["options_json"])
             token = str(option_token)
             if not token.isdigit():
                 return DurableResolveResult(DurableResolveStatus.INVALID_OPTION)
             slot = int(token)
-            if slot <= 0 or slot > len(options):
-                return DurableResolveResult(DurableResolveStatus.INVALID_OPTION)
-            selected_option = options[slot - 1]
-
-            updated = conn.execute(
-                """UPDATE durable_requests
-                   SET status = ?, selected_option_id = ?,
-                       resolved_by_actor_id = ?, resolved_at = ?, updated_at = ?,
-                       terminal_reason = NULL,
-                       wake_status = CASE
-                           WHEN wake_requested = 1 AND wake_status = ? THEN ?
-                           ELSE wake_status
-                       END,
-                       wake_claim = NULL, wake_claimed_at = NULL,
-                       wake_reason = NULL
-                   WHERE request_id = ? AND status = ?""",
-                (
-                    DurableRequestStatus.SELECTED.value,
-                    selected_option.id,
-                    actual_actor_id,
-                    now,
-                    now,
-                    DurableWakeStatus.NOT_REQUESTED.value,
-                    DurableWakeStatus.PENDING.value,
-                    rid,
-                    DurableRequestStatus.OPEN.value,
-                ),
-            ).rowcount
-            if updated != 1:
-                current = conn.execute(
-                    "SELECT status FROM durable_requests WHERE request_id = ?",
-                    (rid,),
-                ).fetchone()
-                if current is None:
-                    return DurableResolveResult(DurableResolveStatus.NOT_FOUND)
-                mapped = _resolve_status_for_terminal(
-                    DurableRequestStatus(current["status"])
-                )
-                return DurableResolveResult(
-                    mapped or DurableResolveStatus.NOT_DELIVERED
-                )
-
-            self._transition_action_for_terminal_request_locked(
+            return self._resolve_selected_slot_locked(
                 conn,
-                request_id=rid,
-                request_status=DurableRequestStatus.SELECTED,
-                selected_option_id=selected_option.id,
+                row=row,
+                slot=slot,
+                actor_id=actual_actor_id,
+                source=DurableRequestResolutionSource.NATIVE,
                 now=now,
             )
 
-            resolved = conn.execute(
+    def resolve_command(
+        self,
+        *,
+        request_id: str,
+        option_slots: tuple[int, ...],
+        platform: str,
+        channel_id: str,
+        actor_id: str | None,
+    ) -> DurableResolveResult:
+        try:
+            rid = _validate_request_id(request_id)
+        except DurableRequestError:
+            return DurableResolveResult(DurableResolveStatus.NOT_FOUND)
+        now = float(self._wall_clock())
+        with self._lock, self._transaction(immediate=True) as conn:
+            row = conn.execute(
                 "SELECT * FROM durable_requests WHERE request_id = ?",
                 (rid,),
             ).fetchone()
-            assert resolved is not None
-            request = self._row_to_request(resolved)
-            logger.info(
-                "Durable request resolved",
-                extra={
-                    "request_id": rid,
-                    "platform": row["platform"],
-                    "resolution_status": DurableResolveStatus.RESOLVED.value,
-                },
+            if row is None:
+                return DurableResolveResult(DurableResolveStatus.NOT_FOUND)
+            row = self._expire_row_if_due_locked(conn, row, now)
+            status = DurableRequestStatus(row["status"])
+            terminal_result = _resolve_status_for_terminal(status)
+            if terminal_result is not None:
+                return DurableResolveResult(terminal_result)
+            if status is not DurableRequestStatus.OPEN:
+                return DurableResolveResult(DurableResolveStatus.NOT_DELIVERED)
+            if not bool(row["command_response_allowed"]):
+                return DurableResolveResult(DurableResolveStatus.COMMAND_DISABLED)
+            if str(platform) != row["platform"]:
+                return DurableResolveResult(DurableResolveStatus.SCOPE_MISMATCH)
+            if str(channel_id) != (row["thread_id"] or row["chat_id"]):
+                return DurableResolveResult(DurableResolveStatus.WRONG_CHANNEL)
+
+            actual_actor_id = None if actor_id is None else str(actor_id)
+            if not actual_actor_id or (
+                row["responder_mode"] == DurableResponderMode.INITIATOR.value
+                and actual_actor_id != row["expected_actor_id"]
+            ):
+                return DurableResolveResult(DurableResolveStatus.WRONG_ACTOR)
+            if (
+                not isinstance(option_slots, tuple)
+                or len(option_slots) != 1
+                or type(option_slots[0]) is not int
+                or option_slots[0] <= 0
+            ):
+                return DurableResolveResult(DurableResolveStatus.INVALID_OPTION)
+
+            return self._resolve_selected_slot_locked(
+                conn,
+                row=row,
+                slot=option_slots[0],
+                actor_id=actual_actor_id,
+                source=DurableRequestResolutionSource.COMMAND,
+                now=now,
             )
-            return DurableResolveResult(
-                DurableResolveStatus.RESOLVED,
-                request=request,
-            )
+
+    def _resolve_selected_slot_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        row: sqlite3.Row,
+        slot: int,
+        actor_id: str,
+        source: DurableRequestResolutionSource,
+        now: float,
+    ) -> DurableResolveResult:
+        options = _deserialize_options(row["options_json"])
+        if slot <= 0 or slot > len(options):
+            return DurableResolveResult(DurableResolveStatus.INVALID_OPTION)
+        selected_option = options[slot - 1]
+        request_id = row["request_id"]
+        updated = conn.execute(
+            """UPDATE durable_requests
+               SET status = ?, selected_option_id = ?,
+                   resolved_by_actor_id = ?, resolved_at = ?, updated_at = ?,
+                   terminal_reason = NULL, resolution_source = ?,
+                   wake_status = CASE
+                       WHEN wake_requested = 1 AND wake_status = ? THEN ?
+                       ELSE wake_status
+                   END,
+                   wake_claim = NULL, wake_claimed_at = NULL,
+                   wake_reason = NULL
+               WHERE request_id = ? AND status = ?""",
+            (
+                DurableRequestStatus.SELECTED.value,
+                selected_option.id,
+                actor_id,
+                now,
+                now,
+                source.value,
+                DurableWakeStatus.NOT_REQUESTED.value,
+                DurableWakeStatus.PENDING.value,
+                request_id,
+                DurableRequestStatus.OPEN.value,
+            ),
+        ).rowcount
+        if updated != 1:
+            current = conn.execute(
+                "SELECT status FROM durable_requests WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if current is None:
+                return DurableResolveResult(DurableResolveStatus.NOT_FOUND)
+            mapped = _resolve_status_for_terminal(DurableRequestStatus(current["status"]))
+            return DurableResolveResult(mapped or DurableResolveStatus.NOT_DELIVERED)
+
+        self._transition_action_for_terminal_request_locked(
+            conn,
+            request_id=request_id,
+            request_status=DurableRequestStatus.SELECTED,
+            selected_option_id=selected_option.id,
+            now=now,
+        )
+        resolved = conn.execute(
+            "SELECT * FROM durable_requests WHERE request_id = ?",
+            (request_id,),
+        ).fetchone()
+        assert resolved is not None
+        request = self._row_to_request(resolved)
+        logger.info(
+            "Durable request resolved",
+            extra={
+                "request_id": request_id,
+                "platform": row["platform"],
+                "resolution_status": DurableResolveStatus.RESOLVED.value,
+            },
+        )
+        return DurableResolveResult(DurableResolveStatus.RESOLVED, request=request)
 
     def mark_open_failed(
         self,
@@ -2623,6 +2696,23 @@ def resolve_durable_request(
     )
 
 
+def resolve_durable_request_command(
+    *,
+    request_id: str,
+    option_slots: tuple[int, ...],
+    platform: str,
+    channel_id: str,
+    actor_id: str | None,
+) -> DurableResolveResult:
+    return get_durable_request_store().resolve_command(
+        request_id=request_id,
+        option_slots=option_slots,
+        platform=platform,
+        channel_id=channel_id,
+        actor_id=actor_id,
+    )
+
+
 __all__ = [
     "DEFAULT_DURABLE_REQUEST_TTL_SECONDS",
     "DEFAULT_DURABLE_TERMINAL_RETENTION_SECONDS",
@@ -2661,5 +2751,6 @@ __all__ = [
     "render_durable_request_content",
     "reset_durable_request_store_cache",
     "resolve_durable_request",
+    "resolve_durable_request_command",
     "validate_durable_request_spec",
 ]
