@@ -5366,6 +5366,9 @@ class DiscordAdapter(BasePlatformAdapter):
         the "thinking..." indicator is replaced with that text; otherwise it
         is deleted so the channel isn't cluttered.
         """
+        _command_name = command_text.split(maxsplit=1)[0]
+        _logged_command = _command_name if _command_name == "/request" else command_text
+
         # Log the invoker so ghost-command reports can be triaged.  Discord
         # native slash invocations are always user-initiated (no bot can fire
         # them), but mobile autocomplete / keyboard shortcuts / other users
@@ -5375,7 +5378,7 @@ class DiscordAdapter(BasePlatformAdapter):
             _chan_id = getattr(interaction.channel, "id", None) or getattr(interaction, "channel_id", None)
             logger.info(
                 "[Discord] slash '%s' invoked by user=%s id=%s channel=%s guild=%s",
-                command_text,
+                _logged_command,
                 getattr(_user, "name", "?"),
                 getattr(_user, "id", "?"),
                 _chan_id,
@@ -5386,7 +5389,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # Auth gate — must run before defer() so an ephemeral rejection can
         # be delivered on the still-unresponded interaction.
-        if not await self._check_slash_authorization(interaction, command_text):
+        if not await self._check_slash_authorization(interaction, _logged_command):
             return
 
         deferred_response = False
@@ -5399,7 +5402,7 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.warning(
                 "[Discord] slash %s: interaction expired before defer. "
                 "Executing command anyway, skipping interaction followup.",
-                command_text,
+                _logged_command,
             )
         event = self._build_slash_event(interaction, command_text)
         await self.handle_message(event)
