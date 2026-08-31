@@ -18959,12 +18959,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         policy = _policy_for_source(self.config, source)
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
-        logger.info(
-            "Slash command /%s denied for %s:%s (not admin, not in user_allowed_commands)",
-            canonical_cmd,
-            source.platform.value if source.platform else "?",
-            source.user_id,
-        )
+        if canonical_cmd == "request":
+            logger.info(
+                "Slash command /request denied (not admin, not in user_allowed_commands)"
+            )
+        else:
+            logger.info(
+                "Slash command /%s denied for %s:%s (not admin, not in user_allowed_commands)",
+                canonical_cmd,
+                source.platform.value if source.platform else "?",
+                source.user_id,
+            )
         allowed_preview = sorted(policy.user_allowed_commands)
         if allowed_preview:
             suffix = (
