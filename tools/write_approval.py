@@ -1132,22 +1132,32 @@ def _skill_lstat(path: Path) -> tuple[bool, str, Optional[str]]:
     if stat.S_ISLNK(metadata.st_mode):
         return True, "symlink", None
     if stat.S_ISREG(metadata.st_mode):
-        return True, "file", _skill_digest(path.read_bytes())
-    if stat.S_ISDIR(metadata.st_mode):
-        digest = hashlib.sha256()
         try:
-            for child in sorted(path.rglob("*")):
-                if child.is_symlink():
-                    return True, "symlink", None
-                if child.is_file():
-                    digest.update(child.relative_to(path).as_posix().encode())
-                    digest.update(b"\0")
-                    digest.update(child.read_bytes())
-                    digest.update(b"\0")
+            return True, "file", _skill_digest(_read_regular_nofollow(path))
         except OSError:
             return True, "other", None
-        return True, "directory", digest.hexdigest()
+    if stat.S_ISDIR(metadata.st_mode):
+        return True, "directory", None
     return True, "other", None
+
+
+def _read_regular_nofollow(path: Path) -> bytes:
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode):
+        raise OSError("not a regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+            raise OSError("file identity changed")
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            data = stream.read(MAX_DURABLE_SKILL_FILE_BYTES + 1)
+            if len(data) > MAX_DURABLE_SKILL_FILE_BYTES:
+                raise OSError("file exceeds durable skill limit")
+            return data
+    finally:
+        os.close(fd)
 
 
 def _skill_components_safe(root: Path, relative: Path, *, allow_missing=True) -> bool:
@@ -1174,12 +1184,12 @@ def _skill_relative_path(payload: Dict[str, Any], skill_dir: Path) -> Optional[P
         return skill_dir.relative_to(get_hermes_home() / "skills") / "SKILL.md"
     if action == "patch":
         raw = payload.get("file_path") or "SKILL.md"
-        if sm._validate_file_path(raw):
+        if not isinstance(raw, str) or sm._validate_file_path(raw):
             return None
         return skill_dir.relative_to(get_hermes_home() / "skills") / Path(raw)
     if action in {"write_file", "remove_file"}:
         raw = payload.get("file_path")
-        if not isinstance(raw, str) or not raw or "\\" in raw:
+        if not isinstance(raw, str) or sm._validate_file_path(raw):
             return None
         path = Path(raw)
         if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
@@ -1199,7 +1209,7 @@ def _skill_rejected(reason: str) -> Dict[str, Any]:
     return {"status": "rejected", "reason": reason}
 
 
-def stage_skill_write(payload: Dict[str, Any], *, summary: str, origin: str) -> Dict[str, Any]:
+def _stage_skill_write_locked(payload: Dict[str, Any], *, summary: str, origin: str) -> Dict[str, Any]:
     """Stage exact skill bytes; unsupported shapes remain legacy-manual."""
     from tools import skill_manager_tool as sm
 
@@ -1208,6 +1218,8 @@ def stage_skill_write(payload: Dict[str, Any], *, summary: str, origin: str) -> 
         return _skill_manual(payload, summary, origin, "unsupported_operation")
     if not isinstance(name, str) or sm._validate_name(name):
         return _skill_manual(payload, summary, origin, "invalid_target")
+    if action == "delete":
+        return _skill_manual(payload, summary, origin, "unsupported_operation")
     root = get_hermes_home() / "skills"
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     if root.is_symlink():
@@ -1249,6 +1261,13 @@ def stage_skill_write(payload: Dict[str, Any], *, summary: str, origin: str) -> 
         return _skill_manual(payload, summary, origin, "unsafe_path")
     target = root / relative
     exists, kind, baseline_digest = _skill_lstat(target)
+    baseline_bytes: Optional[bytes] = None
+    if kind == "file":
+        try:
+            baseline_bytes = _read_regular_nofollow(target)
+        except OSError:
+            return _skill_manual(payload, summary, origin, "unsafe_path")
+        baseline_digest = _skill_digest(baseline_bytes)
 
     desired: Optional[bytes] = None
     if action in {"create", "edit"}:
@@ -1261,8 +1280,8 @@ def stage_skill_write(payload: Dict[str, Any], *, summary: str, origin: str) -> 
         if kind != "file" or not isinstance(old, str) or not old or not isinstance(new, str):
             return _skill_manual(payload, summary, origin, "invalid_patch")
         try:
-            current = target.read_text("utf-8")
-        except (UnicodeError, OSError):
+            current = (baseline_bytes or b"").decode("utf-8")
+        except UnicodeError:
             return _skill_manual(payload, summary, origin, "non_text")
         count = current.count(old)
         if not count or (count > 1 and payload.get("replace_all") is not True):
@@ -1312,25 +1331,7 @@ def stage_skill_write(payload: Dict[str, Any], *, summary: str, origin: str) -> 
     if kind == "file":
         fd = os.open(baseline_dir / "0", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as stream:
-            stream.write(target.read_bytes()); stream.flush(); os.fsync(stream.fileno())
-    elif kind == "directory":
-        total = count = 0
-        for source in sorted(target.rglob("*")):
-            if source.is_symlink():
-                shutil.rmtree(directory)
-                return _skill_manual(payload, summary, origin, "unsafe_path")
-            if not source.is_file():
-                continue
-            data = source.read_bytes(); total += len(data); count += 1
-            if (len(data) > MAX_DURABLE_SKILL_FILE_BYTES or total > MAX_DURABLE_SKILL_TOTAL_BYTES
-                    or count > MAX_DURABLE_SKILL_FILES):
-                shutil.rmtree(directory)
-                return _skill_manual(payload, summary, origin, "review_too_large")
-            destination = baseline_dir / "tree" / source.relative_to(target)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(data); stream.flush(); os.fsync(stream.fileno())
+            stream.write(baseline_bytes or b""); stream.flush(); os.fsync(stream.fileno())
     if action != "delete" and sm._guard_agent_created_enabled():
         review_skill = directory / "review" / name
         try:
@@ -1349,7 +1350,7 @@ def stage_skill_write(payload: Dict[str, Any], *, summary: str, origin: str) -> 
                 review_target.parent.mkdir(parents=True, exist_ok=True)
                 review_target.write_bytes(desired)
             scan_error = sm._security_scan_skill(review_skill)
-        except OSError:
+        except Exception:
             scan_error = "staged skill could not be scanned safely"
         shutil.rmtree(directory / "review", ignore_errors=True)
         if scan_error:
@@ -1372,11 +1373,62 @@ def stage_skill_write(payload: Dict[str, Any], *, summary: str, origin: str) -> 
     return record
 
 
+def stage_skill_write(payload: Dict[str, Any], *, summary: str, origin: str) -> Dict[str, Any]:
+    root = get_hermes_home() / "skills"
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    cleanup_terminal_skill_evidence()
+    pending = _pending_dir(SKILLS)
+    before = set(pending.iterdir()) if pending.is_dir() and not pending.is_symlink() else set()
+    try:
+        with _skill_write_lock(root):
+            return _stage_skill_write_locked(payload, summary=summary, origin=origin)
+    except Exception:
+        if pending.is_dir() and not pending.is_symlink():
+            for path in set(pending.iterdir()) - before:
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+            _fsync_dir(pending)
+        raise
+
+
 def prepare_durable_skill_pending(record: Dict[str, Any]):
     from gateway.durable_actions import PreparedDurableAction, encode_durable_action_payload
     pending_id = record.get("id")
+    operations = record.get("operations")
+    operation = operations[0] if isinstance(operations, list) and len(operations) == 1 else None
+    relative = Path(operation.get("relative_path", "")) if isinstance(operation, dict) else Path()
+    digest_re = re.compile(r"[0-9a-f]{64}")
+    baseline_type = operation.get("baseline_type") if isinstance(operation, dict) else None
+    staged_digest = operation.get("staged_digest") if isinstance(operation, dict) else None
+    baseline_digest = operation.get("baseline_digest") if isinstance(operation, dict) else None
+    operation_valid = (
+        isinstance(operation, dict)
+        and operation.get("operation") in {"create", "edit", "patch", "write_file", "remove_file"}
+        and isinstance(operation.get("relative_path"), str)
+        and bool(relative.parts) and not relative.is_absolute()
+        and not ({"", ".", ".."} & set(relative.parts))
+        and type(operation.get("baseline_exists")) is bool
+        and baseline_type in {"missing", "file"}
+        and operation.get("baseline_exists") is (baseline_type == "file")
+        and (operation.get("operation") not in {"edit", "patch", "remove_file"}
+             or baseline_type == "file")
+        and (operation.get("operation") != "create" or baseline_type == "missing")
+        and ((baseline_type == "file" and isinstance(baseline_digest, str)
+              and digest_re.fullmatch(baseline_digest))
+             or (baseline_type == "missing" and baseline_digest is None))
+        and ((staged_digest is None and operation.get("operation") == "remove_file")
+             or (isinstance(staged_digest, str) and digest_re.fullmatch(staged_digest)
+                 and operation.get("operation") != "remove_file"))
+        and type(operation.get("staged_bytes")) is int
+        and 0 <= operation.get("staged_bytes", -1) <= MAX_DURABLE_SKILL_FILE_BYTES
+        and (staged_digest is not None or operation.get("staged_bytes") == 0)
+        and operation.get("expected_mode") == 0o600
+    )
     if (record.get("manifest_version") != 1 or record.get("fingerprint_version") != 1
             or not isinstance(pending_id, str) or not _PENDING_ID_RE.fullmatch(pending_id)
+            or not isinstance(record.get("skill_name"), str)
+            or record["skill_name"] not in relative.parts[:2]
+            or not operation_valid
             or record.get("subject_fingerprint") != _skill_manifest_fingerprint(record)):
         return None
     fingerprint = record["subject_fingerprint"]
@@ -1385,47 +1437,42 @@ def prepare_durable_skill_pending(record: Dict[str, Any]):
         f"skill.apply_pending:{pending_id}:{fingerprint}")
 
 
+def execute_manual_skill_pending(record: Dict[str, Any]):
+    from gateway.durable_actions import DurableActionExecutionContext, DurableActionOutcome, DurableActionStatus
+    prepared = prepare_durable_skill_pending(record)
+    if prepared is None:
+        return DurableActionOutcome(DurableActionStatus.INVALIDATED, reason="record_changed")
+    context = DurableActionExecutionContext(
+        request_id=f"manual_{record['id']}", action_type=prepared.action_type,
+        action_version=prepared.action_version, payload_json=prepared.payload_json,
+        fingerprint=prepared.fingerprint, idempotency_key=prepared.idempotency_key,
+    )
+    return execute_durable_skill_pending(context, _manual=True)
+
+
 def _durable_skill_review(record: Dict[str, Any]) -> Optional[str]:
     operation = record["operations"][0]
     relative = operation["relative_path"]
-    action = operation["operation"]
     before = b""
     if operation["baseline_type"] == "file":
-        try: before = (_skill_pending_path(record["id"]) / "baseline" / "0").read_bytes()
+        try: before = _read_regular_nofollow(_skill_pending_path(record["id"]) / "baseline" / "0")
         except OSError: return None
+        if _skill_digest(before) != operation["baseline_digest"]:
+            return None
     after = b""
     if operation["staged_digest"] is not None:
-        try: after = (_skill_pending_path(record["id"]) / "staged" / "0").read_bytes()
+        try: after = _read_regular_nofollow(_skill_pending_path(record["id"]) / "staged" / "0")
         except OSError: return None
+        if _skill_digest(after) != operation["staged_digest"]:
+            return None
     try:
         old = before.decode("utf-8"); new = after.decode("utf-8")
     except UnicodeDecodeError:
         return None
-    if action == "delete":
-        files = []
-        try:
-            baseline_tree = _skill_pending_path(record["id"]) / "baseline" / "tree"
-            for path in sorted(baseline_tree.rglob("*")):
-                if path.is_symlink() or not path.is_file():
-                    return None
-                data = path.read_bytes()
-                if len(data) > MAX_DURABLE_SKILL_FILE_BYTES:
-                    return None
-                label = str(Path(relative) / path.relative_to(baseline_tree))
-                files.append((label, data.decode("utf-8")))
-        except (OSError, UnicodeDecodeError):
-            return None
-        if len(files) > MAX_DURABLE_SKILL_FILES or sum(len(v.encode()) for _, v in files) > MAX_DURABLE_SKILL_TOTAL_BYTES:
-            return None
-        chunks = []
-        for label, content in files:
-            chunks.append(f"# delete {label}\n" + "".join(difflib.unified_diff(
-                content.splitlines(keepends=True), [], fromfile=f"a/{label}", tofile="/dev/null")))
-        rendered = "".join(chunks)
-    else:
-        rendered = f"# {action} {relative}\n" + "".join(difflib.unified_diff(
-            old.splitlines(keepends=True), new.splitlines(keepends=True),
-            fromfile=f"a/{relative}" if before else "/dev/null", tofile=f"b/{relative}" if after else "/dev/null"))
+    rendered = f"# {operation['operation']} {relative}\n" + "".join(difflib.unified_diff(
+        old.splitlines(keepends=True), new.splitlines(keepends=True),
+        fromfile=f"a/{relative}" if before else "/dev/null",
+        tofile=f"b/{relative}" if after else "/dev/null"))
     return rendered if len(rendered) <= MAX_DURABLE_SKILL_DIFF_CHARS else None
 
 
@@ -1435,20 +1482,36 @@ def create_skill_durable_approval(record: Dict[str, Any]) -> Dict[str, Any]:
         DurableRequestSpec, get_durable_request_store, load_durable_requests_config,
     )
     from hermes_cli.config import load_config_readonly
-    stored = get_pending(SKILLS, str(record.get("id", "")))
+    pending_id = str(record.get("id", ""))
+    manual = lambda reason: {"status": "pending_manual_review", "reason": reason,
+                             "pending_id": pending_id}
+    stored = get_pending(SKILLS, pending_id)
     prepared = prepare_durable_skill_pending(stored or {})
+    if prepared is not None:
+        try:
+            receipt = skill_action_receipt(pending_id)
+        except SkillActionLookupUnavailable:
+            receipt = None
+        if receipt is not None:
+            request_id, status, reconciliation = receipt
+            if reconciliation is not None:
+                status = f"reconciled_{reconciliation}"
+            elif status == "waiting_for_decision":
+                status = "awaiting_approval"
+            return {"status": status, "pending_id": pending_id,
+                    "request_id": request_id, "action_id": request_id}
     review = _durable_skill_review(stored) if stored and prepared else None
     if prepared is None or review is None:
-        return {"status": "pending_manual_review", "reason": "invalid_or_oversize_review"}
+        return manual("invalid_or_oversize_review")
     try:
         config = load_config_readonly(); policy = config.get("durable_approvals", {})
         if not isinstance(policy, dict) or policy.get("enabled") is not True:
-            return {"status": "pending_manual_review", "reason": "durable_disabled"}
+            return manual("durable_disabled")
         if "skill.apply_pending" not in policy.get("allowed_actions", []):
-            return {"status": "pending_manual_review", "reason": "handler_not_allowed"}
+            return manual("handler_not_allowed")
         request_config = load_durable_requests_config()
         if not request_config.available or request_config.target is None:
-            return {"status": "pending_manual_review", "reason": "inbox_unavailable"}
+            return manual("inbox_unavailable")
         from tools.durable_request_tool import _current_origin
         origin = _current_origin(request_config.scheduled_responder_mode)
         result = get_durable_request_store().create_with_action(
@@ -1468,9 +1531,9 @@ def create_skill_durable_approval(record: Dict[str, Any]) -> Dict[str, Any]:
             terminal_retention_seconds=request_config.terminal_retention_seconds,
         )
     except (DurableRequestError, DurableRequestLimitError, ValueError):
-        return {"status": "pending_manual_review", "reason": "review_too_large"}
+        return manual("review_too_large")
     except (OSError, sqlite3.Error):
-        return {"status": "pending_manual_review", "reason": "inbox_unavailable"}
+        return manual("inbox_unavailable")
     linked = {**stored, "durable_request_id": result.request.request_id,
               "durable_action_id": result.request.request_id}
     try: _write_pending_record(linked)
@@ -1592,18 +1655,43 @@ def cleanup_terminal_skill_evidence(*, limit: int = MAX_SKILL_JOURNAL_CLEANUPS) 
             continue
         journal_path = txn / "journal.json"
         try:
-            journal = json.loads(journal_path.read_text("utf-8"))
-        except (OSError, json.JSONDecodeError):
+            journal = json.loads(_read_regular_nofollow(journal_path).decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             continue
-        if journal.get("journal_version") != 1 or journal.get("state") != "COMMITTED":
+        if journal.get("journal_version") != 1 or journal.get("state") not in {
+                "PREPARED", "EXECUTING", "COMMITTED", "UNKNOWN", "ROLLBACK_REQUIRED"}:
             continue
         try: receipt = skill_action_receipt(txn.name)
         except SkillActionLookupUnavailable: continue
-        if receipt is None or receipt[1] not in {"succeeded", "already_applied"}:
+        if receipt is None or (receipt[1] not in {"succeeded", "already_applied"}
+                               and receipt[2] not in {"confirmed_applied", "confirmed_not_applied"}):
             continue
         quarantine = root / ".quarantine" / txn.name
         try:
             if quarantine.is_symlink():
+                continue
+            record = get_pending(SKILLS, txn.name)
+            if prepare_durable_skill_pending(record or {}) is None:
+                continue
+            operation = record["operations"][0]
+            target = root / operation["relative_path"]
+            target_exists, target_kind, target_digest = _skill_lstat(target)
+            q_exists, q_kind, q_digest = _skill_lstat(quarantine)
+            applied_evidence = (
+                not target_exists and q_exists
+                and q_kind == operation["baseline_type"]
+                and q_digest == operation["baseline_digest"]
+            )
+            not_applied_evidence = (
+                target_exists == operation["baseline_exists"]
+                and target_kind == operation["baseline_type"]
+                and target_digest == operation["baseline_digest"]
+                and not q_exists
+            )
+            if receipt[2] == "confirmed_not_applied":
+                if not not_applied_evidence:
+                    continue
+            elif not applied_evidence:
                 continue
             if quarantine.is_dir():
                 if any(path.is_symlink() for path in quarantine.rglob("*")):
@@ -1614,13 +1702,19 @@ def cleanup_terminal_skill_evidence(*, limit: int = MAX_SKILL_JOURNAL_CLEANUPS) 
             _fsync_dir(quarantine.parent)
             journal["state"] = "CLEANED"
             _atomic_skill_write(journal_path, json.dumps(journal, sort_keys=True).encode())
+            shutil.rmtree(txn)
+            _fsync_dir(transactions)
+            staged = _skill_pending_path(txn.name)
+            if staged.is_dir() and not staged.is_symlink():
+                shutil.rmtree(staged)
+                _fsync_dir(staged.parent)
             cleaned += 1
         except OSError:
             continue
     return cleaned
 
 
-def execute_durable_skill_pending(context):
+def execute_durable_skill_pending(context, *, _manual: bool = False):
     from gateway.durable_actions import DurableActionOutcome, DurableActionStatus, decode_durable_action_payload
     from hermes_cli.config import load_config
     failed = lambda status, reason: DurableActionOutcome(status, reason=reason)
@@ -1634,9 +1728,10 @@ def execute_durable_skill_pending(context):
     config = load_config() or {}; skills = config.get("skills", {}); policy = config.get("durable_approvals", {})
     allowed = policy.get("allowed_actions") if isinstance(policy, dict) else None
     if (not isinstance(skills, dict) or skills.get("write_approval") is not True
-            or skills.get("durable_approval") is not True or not isinstance(policy, dict)
+            or (not _manual and (
+            skills.get("durable_approval") is not True or not isinstance(policy, dict)
             or policy.get("enabled") is not True or not isinstance(allowed, list)
-            or "skill.apply_pending" not in allowed):
+            or "skill.apply_pending" not in allowed))):
         return failed(DurableActionStatus.INVALIDATED, "permission_revoked")
     record = get_pending(SKILLS, payload["pending_id"])
     pending_directory = _skill_pending_path(payload["pending_id"])
@@ -1658,30 +1753,88 @@ def execute_durable_skill_pending(context):
     target = root / relative
     staged = _skill_pending_path(record["id"]) / "staged" / "0"
     desired = None
-    if operation["staged_digest"] is not None:
-        _, current_kind, current_digest = _skill_lstat(target)
-        if current_kind == "file" and current_digest == operation["staged_digest"]:
-            return failed(DurableActionStatus.ALREADY_APPLIED, "desired_present")
-        try:
-            if not stat.S_ISREG(staged.lstat().st_mode):
-                return failed(DurableActionStatus.INVALIDATED, "staged_changed")
-            desired = staged.read_bytes()
-        except OSError: return failed(DurableActionStatus.INVALIDATED, "staged_missing")
-        if _skill_digest(desired) != operation["staged_digest"]:
-            return failed(DurableActionStatus.INVALIDATED, "staged_changed")
     with _skill_write_lock(root):
         if not _skill_components_safe(root, relative):
             return failed(DurableActionStatus.INVALIDATED, "target_invalid")
         exists, kind, digest = _skill_lstat(target)
-        if desired is not None and kind == "file" and digest == operation["staged_digest"]:
+        journal_path = root / ".transactions" / record["id"] / "journal.json"
+        if operation["operation"] == "remove_file" and journal_path.exists():
+            try:
+                journal = json.loads(_read_regular_nofollow(journal_path).decode("utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                return failed(DurableActionStatus.UNKNOWN, "journal_invalid")
+            if (journal.get("journal_version") != 1
+                    or journal.get("target_relative_path") != relative.as_posix()
+                    or journal.get("quarantine_relative_path") != f".quarantine/{record['id']}"):
+                return failed(DurableActionStatus.UNKNOWN, "journal_invalid")
+            journal_state = journal.get("state")
+            if journal_state in {"PREPARED", "EXECUTING", "UNKNOWN", "ROLLBACK_REQUIRED"}:
+                return failed(DurableActionStatus.UNKNOWN, "journal_incomplete")
+            if journal_state in {"COMMITTED", "CLEANED"} and not exists:
+                quarantine = root / ".quarantine" / record["id"]
+                q_exists, q_kind, q_digest = _skill_lstat(quarantine)
+                evidence_matches = (
+                    journal_state == "CLEANED" and not q_exists
+                    or journal_state == "COMMITTED" and q_exists
+                    and q_kind == operation["baseline_type"]
+                    and q_digest == operation["baseline_digest"]
+                )
+                if evidence_matches:
+                    return failed(DurableActionStatus.ALREADY_APPLIED, "journal_committed")
+                return failed(DurableActionStatus.UNKNOWN, "journal_conflict")
+        exact_create = operation["operation"] != "create" or (
+            target.parent.is_dir() and not target.parent.is_symlink()
+            and sorted(path.name for path in target.parent.iterdir()) == ["SKILL.md"]
+        )
+        if (operation["staged_digest"] is not None and exact_create
+                and kind == "file" and digest == operation["staged_digest"]):
             return failed(DurableActionStatus.ALREADY_APPLIED, "desired_present")
-        if operation["operation"] in {"remove_file", "delete"} and not exists:
-            return failed(DurableActionStatus.ALREADY_APPLIED, "target_absent")
+        if operation["operation"] == "create" and target.parent.exists():
+            return failed(DurableActionStatus.INVALIDATED, "target_exists")
+        if operation["operation"] == "remove_file" and not exists:
+            return failed(DurableActionStatus.INVALIDATED, "target_absent")
         if (exists != operation["baseline_exists"] or kind != operation["baseline_type"]
                 or digest != operation["baseline_digest"]):
             return failed(DurableActionStatus.INVALIDATED, "baseline_changed")
+        if operation["staged_digest"] is not None:
+            try:
+                desired = _read_regular_nofollow(staged)
+            except OSError:
+                return failed(DurableActionStatus.INVALIDATED, "staged_missing")
+            if _skill_digest(desired) != operation["staged_digest"]:
+                return failed(DurableActionStatus.INVALIDATED, "staged_changed")
+        from tools import skill_manager_tool as sm
+        if sm._guard_agent_created_enabled():
+            review_root = Path(tempfile.mkdtemp(dir=_skill_pending_path(record["id"]), prefix="review-"))
+            try:
+                found = sm._find_skill(record["skill_name"])
+                review_skill = review_root / record["skill_name"]
+                if found:
+                    if any(path.is_symlink() for path in found["path"].rglob("*")):
+                        return failed(DurableActionStatus.INVALIDATED, "security_scan_failed")
+                    shutil.copytree(found["path"], review_skill)
+                    review_target = review_skill / target.relative_to(found["path"])
+                else:
+                    review_skill.mkdir(); review_target = review_skill / "SKILL.md"
+                if desired is None:
+                    review_target.unlink()
+                else:
+                    review_target.parent.mkdir(parents=True, exist_ok=True)
+                    review_target.write_bytes(desired)
+                if sm._security_scan_skill(review_skill):
+                    return failed(DurableActionStatus.INVALIDATED, "security_scan_rejected")
+            except Exception:
+                return failed(DurableActionStatus.INVALIDATED, "security_scan_failed")
+            finally:
+                shutil.rmtree(review_root, ignore_errors=True)
+        re_exists, re_kind, re_digest = _skill_lstat(target)
+        if (re_exists != operation["baseline_exists"] or re_kind != operation["baseline_type"]
+                or re_digest != operation["baseline_digest"]):
+            return failed(DurableActionStatus.INVALIDATED, "baseline_changed")
+        if operation["operation"] == "create" and target.parent.exists():
+            return failed(DurableActionStatus.INVALIDATED, "target_exists")
         try:
-            if operation["operation"] in {"delete", "remove_file"}:
+            if operation["operation"] == "remove_file":
                 txn = root / ".transactions" / record["id"]
                 quarantine = root / ".quarantine" / record["id"]
                 for private_root in (txn.parent, quarantine.parent):
@@ -1719,6 +1872,9 @@ def execute_durable_skill_pending(context):
         except Exception:
             return failed(DurableActionStatus.UNKNOWN, "mutation_unverified")
     _write_pending_record({**record, "status": "applied"})
+    if pending_directory.is_dir() and not pending_directory.is_symlink():
+        shutil.rmtree(pending_directory)
+        _fsync_dir(pending_directory.parent)
     try:
         from tools.skill_manager_tool import finalize_skill_mutation
         finalize_skill_mutation(operation["operation"], record["skill_name"], {"success": True})
@@ -1743,20 +1899,32 @@ def diagnose_durable_skill_pending(context):
     journal_path = root / ".transactions" / record["id"] / "journal.json"
     if journal_path.exists():
         try:
-            journal = json.loads(journal_path.read_text("utf-8"))
+            journal = json.loads(_read_regular_nofollow(journal_path).decode("utf-8"))
             state = journal["state"].lower()
-        except (OSError, KeyError, json.JSONDecodeError): return DurableActionDiagnostic("journal_invalid")
-        target_state = "present" if target.exists() else "absent"
+        except (OSError, UnicodeDecodeError, KeyError, json.JSONDecodeError):
+            return DurableActionDiagnostic("journal_invalid")
+        target_exists, target_kind, target_digest = _skill_lstat(target)
+        target_state = (
+            "baseline" if target_exists and target_kind == operation["baseline_type"]
+            and target_digest == operation["baseline_digest"]
+            else "absent" if not target_exists else "changed"
+        )
         quarantine = root / journal.get("quarantine_relative_path", ".invalid")
         q_exists, q_kind, q_digest = _skill_lstat(quarantine)
         quarantine_state = (
             "baseline" if q_exists and q_kind == operation["baseline_type"]
             and q_digest == operation["baseline_digest"] else "absent" if not q_exists else "changed"
         )
+        recovery = (
+            "confirm_applied" if target_state == "absent" and quarantine_state == "baseline"
+            else "confirm_not_applied" if target_state == "baseline" and quarantine_state == "absent"
+            else "inspect_conflict"
+        )
         return DurableActionDiagnostic("journal_evidence", (
             ("journal_state", state), ("target_state", target_state),
             ("quarantine_state", quarantine_state),
             ("operation_progress", str(journal.get("operation_progress", 0))),
+            ("recovery", recovery),
         ))
     exists, kind, digest = _skill_lstat(target)
     if operation["staged_digest"] and kind == "file" and digest == operation["staged_digest"]:

@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -96,6 +97,15 @@ def test_review_uses_stored_baseline_not_changed_live_file(tmp_path, monkeypatch
     assert wa.skill_pending_diff(record) == expected
 
 
+@pytest.mark.parametrize("snapshot", ["baseline/0", "staged/0"])
+def test_review_rejects_snapshot_bytes_that_do_not_match_manifest(tmp_path, monkeypatch, snapshot):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    skill = tmp_path / "skills" / "demo"; skill.mkdir(parents=True); (skill / "SKILL.md").write_text(VALID)
+    record = wa.stage_skill_write({"action": "edit", "name": "demo", "content": VALID.replace("Do it.", "New.")}, summary="edit", origin="foreground")
+    (tmp_path / "pending" / "skills" / record["id"] / snapshot).write_text("tampered")
+    assert wa.skill_pending_diff(record) == "(durable review unavailable)"
+
+
 def test_non_directory_parent_and_bad_pending_id_fail_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
     skill = tmp_path / "skills" / "demo"; skill.mkdir(parents=True); (skill / "SKILL.md").write_text(VALID)
@@ -124,6 +134,14 @@ def test_apply_single_file_once_and_detect_already_applied(tmp_path, monkeypatch
     assert first.status is DurableActionStatus.SUCCEEDED
     assert second.status is DurableActionStatus.ALREADY_APPLIED
     assert (skill / "references" / "a.md").read_text() == "hello\n"
+
+
+def test_create_already_applied_requires_no_unreviewed_siblings(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    record = wa.stage_skill_write({"action": "create", "name": "demo", "content": VALID}, summary="x", origin="foreground")
+    skill = tmp_path / "skills" / "demo"; skill.mkdir(); (skill / "SKILL.md").write_text(VALID)
+    (skill / "unreviewed.txt").write_text("surprise")
+    assert wa.execute_durable_skill_pending(_context(record)).status is DurableActionStatus.INVALIDATED
 
 
 def test_manifest_or_staged_tampering_invalidates(tmp_path, monkeypatch):
@@ -155,7 +173,7 @@ def test_paths_symlinks_external_and_unsupported_fall_back(tmp_path, monkeypatch
     assert wa.stage_skill_write({"action": "rename", "name": "demo"}, summary="x", origin="foreground")["status"] == "pending_manual_review"
 
 
-def test_delete_moves_whole_skill_to_journaled_quarantine(tmp_path, monkeypatch):
+def test_remove_file_moves_target_to_journaled_quarantine(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _config(monkeypatch)
     skill = tmp_path / "skills" / "demo"
@@ -163,19 +181,16 @@ def test_delete_moves_whole_skill_to_journaled_quarantine(tmp_path, monkeypatch)
     (skill / "SKILL.md").write_text(VALID)
     (skill / "references").mkdir()
     (skill / "references" / "a.md").write_text("a")
-    record = wa.stage_skill_write(
-        {"action": "delete", "name": "demo", "absorbed_into": ""},
-        summary="delete", origin="foreground",
-    )
+    record = wa.stage_skill_write({"action": "remove_file", "name": "demo", "file_path": "references/a.md"}, summary="remove", origin="foreground")
 
     outcome = wa.execute_durable_skill_pending(_context(record))
 
     assert outcome.status is DurableActionStatus.SUCCEEDED
-    assert not skill.exists()
+    assert skill.exists() and not (skill / "references" / "a.md").exists()
     journal = json.loads((tmp_path / "skills" / ".transactions" / record["id"] / "journal.json").read_text())
     assert journal["state"] == "COMMITTED"
-    assert (Path(journal["quarantine_relative_path"]) / "SKILL.md").name == "SKILL.md"
-    assert (tmp_path / "pending" / "skills" / record["id"]).exists()
+    assert (tmp_path / "skills" / journal["quarantine_relative_path"]).read_text() == "a"
+    assert not (tmp_path / "pending" / "skills" / record["id"]).exists()
 
 
 def test_handler_is_statically_registered():
@@ -202,6 +217,16 @@ def test_complete_review_creates_idempotent_bounded_action(tmp_path, monkeypatch
     assert first == second and first["status"] == "awaiting_approval"
     assert wa.linked_skill_request_id(wa.get_pending(wa.SKILLS, record["id"])) == first["request_id"]
     reset_durable_request_store_cache()
+
+
+def test_terminal_request_recreation_reports_terminal_status_without_snapshots(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    record = wa.stage_skill_write({"action": "create", "name": "demo", "content": VALID}, summary="x", origin="foreground")
+    shutil.rmtree(tmp_path / "pending" / "skills" / record["id"])
+    monkeypatch.setattr(wa, "skill_action_receipt", lambda pending_id: ("request-1", "succeeded", None))
+    receipt = wa.create_skill_durable_approval(record)
+    assert receipt == {"status": "succeeded", "pending_id": record["id"],
+                       "request_id": "request-1", "action_id": "request-1"}
 
 
 def test_real_skill_manage_builds_request_without_content_in_action(tmp_path, monkeypatch):
@@ -253,6 +278,16 @@ def test_linked_manual_approve_authorizes_and_reject_cancels(tmp_path, monkeypat
     reset_durable_request_store_cache()
 
 
+def test_manual_fallback_manifest_applies_through_exact_handler_and_receipt_has_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    from hermes_cli.write_approval_commands import handle_pending_subcommand
+    record = wa.stage_skill_write({"action": "create", "name": "demo", "content": VALID}, summary="x", origin="foreground")
+    fallback = wa.create_skill_durable_approval(record)
+    assert fallback["pending_id"] == record["id"]
+    assert "Approved 1" in handle_pending_subcommand(wa.SKILLS, ["approve", record["id"]])
+    assert (tmp_path / "skills" / "demo" / "SKILL.md").read_text() == VALID
+
+
 def test_root_change_oversize_and_binary_baseline_fail_closed(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
     record = wa.stage_skill_write({"action": "create", "name": "demo", "content": VALID}, summary="x", origin="foreground")
@@ -265,16 +300,44 @@ def test_root_change_oversize_and_binary_baseline_fail_closed(tmp_path, monkeypa
     assert binary["status"] == huge["status"] == "pending_manual_review"
 
 
-def test_delete_fault_after_executing_is_unknown_with_journal_evidence(tmp_path, monkeypatch):
+def test_absent_remove_without_journal_invalidates_and_security_is_rechecked(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
-    skill = tmp_path / "skills" / "demo"; skill.mkdir(parents=True)
-    (skill / "SKILL.md").write_text(VALID)
+    skill = tmp_path / "skills" / "demo"; (skill / "references").mkdir(parents=True)
+    (skill / "SKILL.md").write_text(VALID); target = skill / "references" / "a"; target.write_text("a")
+    removed = wa.stage_skill_write({"action": "remove_file", "name": "demo", "file_path": "references/a"}, summary="x", origin="foreground")
+    target.unlink()
+    assert wa.execute_durable_skill_pending(_context(removed)).status is DurableActionStatus.INVALIDATED
+    edit = wa.stage_skill_write({"action": "edit", "name": "demo", "content": VALID.replace("Do it.", "changed")}, summary="x", origin="foreground")
+    target.write_text("a")
+    scan_remove = wa.stage_skill_write({"action": "remove_file", "name": "demo", "file_path": "references/a"}, summary="x", origin="foreground")
+    monkeypatch.setattr("tools.skill_manager_tool._guard_agent_created_enabled", lambda: True)
+    monkeypatch.setattr("tools.skill_manager_tool._security_scan_skill", lambda path: "blocked")
+    assert wa.execute_durable_skill_pending(_context(edit)).status is DurableActionStatus.INVALIDATED
+    assert (skill / "SKILL.md").read_text() == VALID
+    monkeypatch.setattr("tools.skill_manager_tool._security_scan_skill", lambda path: (_ for _ in ()).throw(OSError()))
+    assert wa.execute_durable_skill_pending(_context(scan_remove)).status is DurableActionStatus.INVALIDATED
+    assert target.read_text() == "a"
+    assert not (tmp_path / "skills" / ".transactions" / scan_remove["id"]).exists()
+
+
+def test_whole_skill_delete_remains_manual_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    skill = tmp_path / "skills" / "demo"; skill.mkdir(parents=True); (skill / "SKILL.md").write_text(VALID)
     record = wa.stage_skill_write({"action": "delete", "name": "demo", "absorbed_into": ""}, summary="delete", origin="foreground")
+    assert record["status"] == "pending_manual_review"
+    assert record["payload"]["action"] == "delete"
+
+
+def test_remove_fault_after_executing_is_unknown_with_journal_evidence(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    skill = tmp_path / "skills" / "demo"; (skill / "references").mkdir(parents=True)
+    (skill / "SKILL.md").write_text(VALID); target = skill / "references" / "a"; target.write_text("a")
+    record = wa.stage_skill_write({"action": "remove_file", "name": "demo", "file_path": "references/a"}, summary="remove", origin="foreground")
     context = _context(record)
     real_replace = wa.os.replace
 
     def fail_target(source, destination, *args, **kwargs):
-        if Path(source) == skill:
+        if Path(source) == target:
             raise OSError("fault")
         return real_replace(source, destination, *args, **kwargs)
 
@@ -283,39 +346,61 @@ def test_delete_fault_after_executing_is_unknown_with_journal_evidence(tmp_path,
     diagnostic = wa.diagnose_durable_skill_pending(context)
     assert diagnostic.code == "journal_evidence"
     assert ("journal_state", "executing") in diagnostic.facts
-    assert skill.exists()
+    assert ("recovery", "confirm_not_applied") in diagnostic.facts
+    assert target.exists()
 
 
 @pytest.mark.parametrize("fault", [
     "prepared", "executing", "renamed", "source_fsynced",
     "quarantine_fsynced", "committed",
 ])
-def test_delete_every_journal_boundary_becomes_unknown_without_replay(tmp_path, monkeypatch, fault):
+def test_remove_every_journal_boundary_becomes_unknown_without_replay(tmp_path, monkeypatch, fault):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
-    skill = tmp_path / "skills" / "demo"; skill.mkdir(parents=True)
-    (skill / "SKILL.md").write_text(VALID)
-    record = wa.stage_skill_write({"action": "delete", "name": "demo", "absorbed_into": ""}, summary="delete", origin="foreground")
+    skill = tmp_path / "skills" / "demo"; (skill / "references").mkdir(parents=True)
+    (skill / "SKILL.md").write_text(VALID); target = skill / "references" / "a"; target.write_text("a")
+    record = wa.stage_skill_write({"action": "remove_file", "name": "demo", "file_path": "references/a"}, summary="remove", origin="foreground")
     context = _context(record)
     monkeypatch.setattr(wa, "_skill_journal_fault", lambda point: (_ for _ in ()).throw(OSError(point)) if point == fault else None)
     assert wa.execute_durable_skill_pending(context).status is DurableActionStatus.UNKNOWN
-    before = skill.exists()
+    before = target.exists()
     assert wa.execute_durable_skill_pending(context).status in {DurableActionStatus.UNKNOWN, DurableActionStatus.ALREADY_APPLIED}
-    assert skill.exists() == before
+    assert target.exists() == before
 
 
 def test_committed_cleanup_is_bounded_and_unknown_is_retained(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
     root = tmp_path / "skills"
-    for pending_id, state in (("a" * 8, "COMMITTED"), ("b" * 8, "UNKNOWN")):
-        txn = root / ".transactions" / pending_id; quarantine = root / ".quarantine" / pending_id
-        txn.mkdir(parents=True); quarantine.mkdir(parents=True)
-        (quarantine / "SKILL.md").write_text(VALID)
-        (txn / "journal.json").write_text(json.dumps({"journal_version": 1, "state": state, "operation_progress": 1}))
-    monkeypatch.setattr(wa, "skill_action_receipt", lambda pid: ("req", "succeeded", None) if pid == "a" * 8 else ("req", "unknown", None))
+    records = []
+    for name in ("one", "two"):
+        skill = root / name; (skill / "references").mkdir(parents=True)
+        (skill / "SKILL.md").write_text(VALID.replace("name: demo", f"name: {name}"))
+        (skill / "references" / "a").write_text(name)
+        records.append(wa.stage_skill_write({"action": "remove_file", "name": name, "file_path": "references/a"}, summary="x", origin="foreground"))
+    assert wa.execute_durable_skill_pending(_context(records[0])).status is DurableActionStatus.SUCCEEDED
+    monkeypatch.setattr(wa, "_skill_journal_fault", lambda point: (_ for _ in ()).throw(OSError()) if point == "executing" else None)
+    assert wa.execute_durable_skill_pending(_context(records[1])).status is DurableActionStatus.UNKNOWN
+    monkeypatch.setattr(wa, "skill_action_receipt", lambda pid: ("req", "succeeded", None) if pid == records[0]["id"] else ("req", "unknown", None))
     assert wa.cleanup_terminal_skill_evidence(limit=1) == 1
-    assert not (root / ".quarantine" / ("a" * 8)).exists()
-    assert json.loads((root / ".transactions" / ("a" * 8) / "journal.json").read_text())["state"] == "CLEANED"
-    assert (root / ".quarantine" / ("b" * 8)).exists()
+    assert not (root / ".quarantine" / records[0]["id"]).exists()
+    assert not (root / ".transactions" / records[0]["id"]).exists()
+    assert (root / ".transactions" / records[1]["id"]).exists()
+
+
+@pytest.mark.parametrize("fault,reconciliation,cleaned", [
+    ("committed", "confirmed_applied", 1),
+    ("prepared", "confirmed_not_applied", 1),
+    ("executing", "confirmed_applied", 0),
+])
+def test_reconciliation_cleans_only_matching_remove_evidence(tmp_path, monkeypatch, fault, reconciliation, cleaned):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path)); _config(monkeypatch)
+    skill = tmp_path / "skills" / "demo"; (skill / "references").mkdir(parents=True)
+    (skill / "SKILL.md").write_text(VALID); (skill / "references" / "a").write_text("a")
+    record = wa.stage_skill_write({"action": "remove_file", "name": "demo", "file_path": "references/a"}, summary="x", origin="foreground")
+    monkeypatch.setattr(wa, "_skill_journal_fault", lambda point: (_ for _ in ()).throw(OSError()) if point == fault else None)
+    assert wa.execute_durable_skill_pending(_context(record)).status is DurableActionStatus.UNKNOWN
+    monkeypatch.setattr(wa, "skill_action_receipt", lambda pid: ("req", "unknown", reconciliation))
+    assert wa.cleanup_terminal_skill_evidence() == cleaned
+    assert (tmp_path / "skills" / ".transactions" / record["id"]).exists() is (not cleaned)
 
 
 def test_terminal_rejection_cleans_staged_bytes_but_unknown_retains_them(tmp_path, monkeypatch):

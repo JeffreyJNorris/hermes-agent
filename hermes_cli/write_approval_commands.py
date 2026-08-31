@@ -200,6 +200,9 @@ def _apply_one(subsystem: str, rec, memory_store):
             result = apply_memory_pending(payload, memory_store)
             return bool(result.get("success")), result.get("error", "")
         else:
+            if rec.get("manifest_version") == 1:
+                outcome = wa.execute_manual_skill_pending(rec)
+                return outcome.status.value in {"succeeded", "already_applied"}, outcome.reason or ""
             from tools.skill_manager_tool import apply_skill_pending
             result = json.loads(apply_skill_pending(payload))
             return bool(result.get("success")), result.get("error", "")
