@@ -1859,14 +1859,6 @@ class DurableRequestStore:
             if row is None:
                 return DurableResolveResult(DurableResolveStatus.NOT_FOUND)
             row = self._expire_row_if_due_locked(conn, row, now)
-            status = DurableRequestStatus(row["status"])
-            terminal_result = _resolve_status_for_terminal(status)
-            if terminal_result is not None:
-                return DurableResolveResult(terminal_result)
-            if status is not DurableRequestStatus.OPEN:
-                return DurableResolveResult(DurableResolveStatus.NOT_DELIVERED)
-            if not bool(row["command_response_allowed"]):
-                return DurableResolveResult(DurableResolveStatus.COMMAND_DISABLED)
             if str(platform) != row["platform"]:
                 return DurableResolveResult(DurableResolveStatus.SCOPE_MISMATCH)
             if str(channel_id) != (row["thread_id"] or row["chat_id"]):
@@ -1878,6 +1870,15 @@ class DurableRequestStore:
                 and actual_actor_id != row["expected_actor_id"]
             ):
                 return DurableResolveResult(DurableResolveStatus.WRONG_ACTOR)
+
+            status = DurableRequestStatus(row["status"])
+            terminal_result = _resolve_status_for_terminal(status)
+            if terminal_result is not None:
+                return DurableResolveResult(terminal_result)
+            if status is not DurableRequestStatus.OPEN:
+                return DurableResolveResult(DurableResolveStatus.NOT_DELIVERED)
+            if not bool(row["command_response_allowed"]):
+                return DurableResolveResult(DurableResolveStatus.COMMAND_DISABLED)
             if (
                 not isinstance(option_slots, tuple)
                 or len(option_slots) != 1

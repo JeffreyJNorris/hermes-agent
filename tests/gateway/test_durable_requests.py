@@ -414,6 +414,46 @@ def test_command_disabled_request_cannot_resolve(tmp_path: Path) -> None:
     assert result.status is DurableResolveStatus.COMMAND_DISABLED
 
 
+@pytest.mark.parametrize(
+    ("answered", "overrides", "expected"),
+    [
+        (False, {"channel_id": "chat-1"}, DurableResolveStatus.WRONG_CHANNEL),
+        (False, {"actor_id": "actor-2"}, DurableResolveStatus.WRONG_ACTOR),
+        (True, {"channel_id": "chat-1"}, DurableResolveStatus.WRONG_CHANNEL),
+        (True, {"actor_id": "actor-2"}, DurableResolveStatus.WRONG_ACTOR),
+    ],
+)
+def test_command_state_does_not_leak_across_scope(
+    tmp_path: Path,
+    answered: bool,
+    overrides: dict[str, str],
+    expected: DurableResolveStatus,
+) -> None:
+    store = _store(tmp_path, Clock())
+    request = _create(store, command_response_allowed=answered).request
+    _bind(store, request.request_id)
+    if answered:
+        assert store.resolve_command(
+            request_id=request.request_id,
+            option_slots=(1,),
+            platform="discord",
+            channel_id="thread-1",
+            actor_id="actor-1",
+        ).status is DurableResolveStatus.RESOLVED
+    arguments = {
+        "request_id": request.request_id,
+        "option_slots": (1,),
+        "platform": "discord",
+        "channel_id": "thread-1",
+        "actor_id": "actor-1",
+    }
+    arguments.update(overrides)
+
+    result = store.resolve_command(**arguments)
+
+    assert result.status is expected
+
+
 def test_command_maps_slot_server_side_and_records_source(tmp_path: Path) -> None:
     store = _store(tmp_path, Clock())
     request = _create(store, command_response_allowed=True).request
