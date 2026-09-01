@@ -100,35 +100,49 @@ User action may be repeated safely, but cannot produce a second terminal choice.
 
 1. Set `durable_requests.command_responses.enabled: false` to stop granting the
    capability to new requests. Existing records keep their persisted policy.
-2. While the Phase 5A runtime is still installed, list both active states:
+2. Stop the Phase 5A gateway and verify that no second gateway process is using
+   the profile. Keep the gateway stopped through inventory, cleanup, backup,
+   binary or symlink rollback, and the old-runtime start. Run only the trusted
+   local `hermes durable` CLI against this quiescent ledger.
+3. Inventory both active states from offset zero with the maximum page size:
 
    ```bash
-   hermes durable requests list --status pending_delivery --json
-   hermes durable requests list --status open --json
+   hermes durable requests list --status pending_delivery --limit 100 --offset 0 --json
+   hermes durable requests list --status open --limit 100 --offset 0 --json
    ```
 
+   For each command, repeat it with `--offset NEXT_OFFSET` using the exact
+   `next_offset` returned by the previous page. Continue until `next_offset` is
+   absent. The ledger permits up to 1,000 active rows while the default page
+   contains only 50, so the first page is not a complete rollback inventory.
+
    For every `pending_delivery` row whose `delivery_mode` is `text_command`,
-   let Phase 5A finish delivery or cancel it with the supported operator command:
+   cancel it with the supported operator command:
 
    ```bash
    hermes durable requests cancel drq_RECEIPT --yes
    ```
 
-   Do not restart a pre-5A worker until the `pending_delivery` listing has zero
-   text-command rows. The older worker does not understand `delivery_mode` and
-   could treat the text delivery as native work. Do not clear claims or change
-   states with ad hoc SQL.
-3. Resolve or cancel each `open` text-command request before rollback when
-   practical. A pre-5A runtime cannot answer it by `/request respond`. If it
-   must remain open, set `durable_requests.enabled: false` before starting the
-   old runtime and leave durable processing disabled; the request is
-   intentionally stranded until Phase 5A is restored. This pauses every durable
-   request, not only text-command rows.
-4. Stop the gateway and take a consistent backup of the active profile's
-   `state.db` and its WAL/SHM files before changing binaries.
-5. Roll back application code. The additive `delivery_mode`,
+   Cancel each `open` text-command request too. A pre-5A runtime cannot answer
+   it by `/request respond`. If an open request must be preserved, set
+   `durable_requests.enabled: false` and keep durable processing disabled on the
+   old runtime; the request is intentionally stranded until Phase 5A is
+   restored. This pauses every durable request, not only text-command rows.
+   Do not clear claims or change states with ad hoc SQL.
+4. Repeat both complete paginated scans from offset zero, again following every
+   `next_offset` until absent. Require zero `pending_delivery` text-command rows.
+   Also require zero `open` text-command rows unless
+   `durable_requests.enabled: false` will remain in effect on the old runtime.
+   Do not proceed based on an earlier page or pre-cleanup inventory.
+5. With the gateway still stopped, take a consistent backup of the active
+   profile's `state.db` and its WAL/SHM files.
+6. Perform the normal immutable binary or symlink rollback while preserving
+   service singleton ownership. The additive `delivery_mode`,
    `command_response_allowed`, `text_command_fallback_allowed`, and
    `resolution_source` columns may remain; do not drop or rewrite them.
+7. Start exactly one old-runtime gateway. If any open text-command request was
+   intentionally stranded, confirm durable processing remains disabled and
+   re-enable it only after restoring Phase 5A.
 
 Terminal `delivery_unknown` rows remain authoritative evidence and must not be
 retried or rewritten during rollback. Follow the general durable-operations
