@@ -49,14 +49,15 @@ For a scheduled request, `any_authorized` means any user accepted by the
 Discord adapter's existing user/role authorization settings. It does not mean
 anyone who can see the channel.
 
-Explicit request commands are disabled by default. When `enabled` is true,
-new requests snapshot whether command responses are allowed; changing the
-configuration does not widen an existing request. `allow_on_native_delivery`
-adds `/request respond <request-id> <number>` as an alternative to native
-buttons. `allow_text_delivery_fallback` permits one command-driven text
-presentation only when native delivery returns the structural `unsupported`
-result. It never falls back after a failed or ambiguous send. Historical rows
-migrate as native delivery with command responses and text fallback disabled.
+Explicit request commands are disabled by default. When
+`durable_requests.command_responses.enabled` is true, new requests snapshot
+whether command responses are allowed; changing the configuration does not
+widen an existing request. `allow_on_native_delivery` adds
+`/request respond <request-id> <number>` as an alternative to native buttons.
+`allow_text_delivery_fallback` permits one command-driven text presentation
+only when native delivery returns the structural `unsupported` result. It
+never falls back after a failed or ambiguous send. Historical rows migrate as
+native delivery with command responses and text fallback disabled.
 
 ## Tool contract
 

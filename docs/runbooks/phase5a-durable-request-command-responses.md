@@ -16,10 +16,11 @@ durable_requests:
     allow_text_delivery_fallback: true
 ```
 
-`enabled` affects only newly created requests. The other two settings permit
-native requests to advertise the command and permit explicitly unsupported
-native delivery to use one text presentation, respectively. Existing and
-migrated rows remain command-disabled; `delivery_mode` defaults to `native`.
+`durable_requests.command_responses.enabled` affects only newly created
+requests. The other two settings permit native requests to advertise the
+command and permit explicitly unsupported native delivery to use one text
+presentation, respectively. Existing and migrated rows remain
+command-disabled; `delivery_mode` defaults to `native`.
 
 ## Command contract
 
@@ -70,8 +71,8 @@ hermes durable doctor --json
 hermes doctor
 ```
 
-Inspection exposes structural `delivery_mode`, command permission, and
-`resolution_source`, not content or scope. Health reports a
+Inspection exposes structural `delivery_mode` and `resolution_source`, not
+content, command permission, or scope. Health reports a
 `text_command_delivery` backlog. Metrics use bounded result/event labels only;
 receipts never become labels. Follow the general procedures in
 [`docs/operations/durable-operations.md`](../operations/durable-operations.md)
@@ -98,14 +99,41 @@ User action may be repeated safely, but cannot produce a second terminal choice.
 ## Rollback
 
 1. Set `durable_requests.command_responses.enabled: false` to stop granting the
-   capability to new requests; leave existing records intact.
-2. Stop the gateway and take a consistent backup of the active profile's
-   `state.db` before changing binaries.
-3. Roll back application code. The additive `delivery_mode`,
+   capability to new requests. Existing records keep their persisted policy.
+2. While the Phase 5A runtime is still installed, list both active states:
+
+   ```bash
+   hermes durable requests list --status pending_delivery --json
+   hermes durable requests list --status open --json
+   ```
+
+   For every `pending_delivery` row whose `delivery_mode` is `text_command`,
+   let Phase 5A finish delivery or cancel it with the supported operator command:
+
+   ```bash
+   hermes durable requests cancel drq_RECEIPT --yes
+   ```
+
+   Do not restart a pre-5A worker until the `pending_delivery` listing has zero
+   text-command rows. The older worker does not understand `delivery_mode` and
+   could treat the text delivery as native work. Do not clear claims or change
+   states with ad hoc SQL.
+3. Resolve or cancel each `open` text-command request before rollback when
+   practical. A pre-5A runtime cannot answer it by `/request respond`. If it
+   must remain open, set `durable_requests.enabled: false` before starting the
+   old runtime and leave durable processing disabled; the request is
+   intentionally stranded until Phase 5A is restored. This pauses every durable
+   request, not only text-command rows.
+4. Stop the gateway and take a consistent backup of the active profile's
+   `state.db` and its WAL/SHM files before changing binaries.
+5. Roll back application code. The additive `delivery_mode`,
    `command_response_allowed`, `text_command_fallback_allowed`, and
    `resolution_source` columns may remain; do not drop or rewrite them.
-4. Inspect active text-command or unknown deliveries before restart. An older
-   binary must not be used to resend them or infer state from Discord messages.
+
+Terminal `delivery_unknown` rows remain authoritative evidence and must not be
+retried or rewritten during rollback. Follow the general durable-operations
+backup and UNKNOWN guidance; provider messages are never a source of business
+state.
 
 Phase 5A deliberately defers multi-slot syntax, atomic multi-select, ranked or
 partial selections, and multi-select action approvals to later work. Do not
