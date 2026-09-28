@@ -257,6 +257,36 @@ async def test_durable_request_command_stays_in_physical_channel(adapter, monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("attached_from", ["message", "snapshot", "reference"])
+async def test_unmentioned_request_with_attachment_does_not_bypass_mention_gate(
+    adapter, monkeypatch, attached_from
+):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    message = make_message(
+        channel=FakeTextChannel(channel_id=321),
+        content="/request respond drq_abcdefghijklmnopqrstuvwxyz123456 1",
+    )
+    attachment = SimpleNamespace(filename="note.txt")
+    if attached_from == "message":
+        message.attachments = [attachment]
+    elif attached_from == "snapshot":
+        message.message_snapshots = [SimpleNamespace(content="", attachments=[attachment])]
+    else:
+        message.reference = SimpleNamespace(
+            message_id=124,
+            resolved=SimpleNamespace(content="", attachments=[attachment]),
+        )
+    adapter._collect_attachment_media = AsyncMock(
+        return_value=([], [], [], "[Content of note.txt]:\nnot a command")
+    )
+
+    assert await adapter._handle_message(message) is False
+    adapter.handle_message.assert_not_awaited()
+    adapter._collect_attachment_media.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_unmentioned_bot_chunks_join_recent_tag_batch(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
@@ -1082,4 +1112,3 @@ class TestNonConversationalTrackerOffload:
             await _asyncio.gather(first, second)
 
         assert sorted(writes[-1]) == ["1", "2"]
-

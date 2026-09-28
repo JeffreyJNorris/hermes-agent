@@ -6289,14 +6289,23 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if snapshot_text_parts and not raw_content:
                 raw_content = "\n".join(snapshot_text_parts)
                 normalized_content = raw_content
+        reference = getattr(message, "reference", None)
+        resolved_reference = getattr(reference, "resolved", None) if reference else None
+        referenced_attachments = list(getattr(resolved_reference, "attachments", []) or [])
+        all_attachments = list(message.attachments) + snapshot_attachments + referenced_attachments
         if self._self_is_explicitly_mentioned(message):
             mention_prefix = True
             if self._client.user:
                 normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
                 normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
             message.content = normalized_content
-        # The gateway validates /request itself; keep its actual delivery channel through Discord ingress.
-        is_request_command = bool(normalized_content) and normalized_content.split(maxsplit=1)[0] == "/request"
+        # Only direct text commands bypass mention and threading; attachment text can prefix event.text.
+        is_request_command = (
+            bool(normalized_content)
+            and normalized_content.split(maxsplit=1)[0] == "/request"
+            and not all_attachments
+            and not getattr(message, "message_snapshots", None)
+        )
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
@@ -6373,12 +6382,6 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                             notify_error,
                         )
                     return False
-        referenced_attachments = []
-        reference = getattr(message, "reference", None)
-        resolved_reference = getattr(reference, "resolved", None) if reference else None
-        if resolved_reference is not None:
-            referenced_attachments = list(getattr(resolved_reference, "attachments", []) or [])
-        all_attachments = list(message.attachments) + snapshot_attachments + referenced_attachments
         if normalized_content.startswith("/"):
             msg_type = MessageType.COMMAND
         elif all_attachments:
