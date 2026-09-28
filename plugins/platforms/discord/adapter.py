@@ -6295,6 +6295,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
                 normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
             message.content = normalized_content
+        # The gateway validates /request itself; keep its actual delivery channel through Discord ingress.
+        is_request_command = bool(normalized_content) and normalized_content.split(maxsplit=1)[0] == "/request"
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
@@ -6326,6 +6328,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     not self._self_is_explicitly_mentioned(message)
                     and not mention_prefix
                     and not self._is_bot_tag_debounce_continuation(message)
+                    and not is_request_command
                 ):
                     return False
         # Auto-thread: isolate each @mention in a text channel into its own thread (Slack-style).
@@ -6333,7 +6336,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
             # Voice-linked and reply exclusions live in the auto-thread gate below, not in skip_thread.
-            skip_thread = bool(channel_keys & no_thread_channels) or (
+            skip_thread = is_request_command or bool(channel_keys & no_thread_channels) or (
                 is_free_channel and not self._discord_free_response_auto_thread()
             )
             auto_thread = self._extra_or_env_flag("auto_thread", "DISCORD_AUTO_THREAD", "true", truthy=True)

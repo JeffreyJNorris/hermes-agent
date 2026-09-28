@@ -232,6 +232,31 @@ async def test_discord_accepts_and_strips_bot_mentions_when_required(adapter, mo
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mentioned", [False, True])
+async def test_durable_request_command_stays_in_physical_channel(adapter, monkeypatch, mentioned):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    adapter._auto_create_thread = AsyncMock(
+        return_value=FakeThread(channel_id=456, name="auto-thread")
+    )
+    bot_user = adapter._client.user
+    command = "/request respond drq_abcdefghijklmnopqrstuvwxyz123456 1"
+    message = make_message(
+        channel=FakeTextChannel(channel_id=321),
+        content=f"<@{bot_user.id}> {command}" if mentioned else command,
+        mentions=[bot_user] if mentioned else [],
+    )
+
+    assert await adapter._handle_message(message) is True
+
+    adapter._auto_create_thread.assert_not_awaited()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == command
+    assert event.source.chat_id == "321"
+    assert event.source.thread_id is None
+
+
+@pytest.mark.asyncio
 async def test_unmentioned_bot_chunks_join_recent_tag_batch(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
@@ -1057,5 +1082,4 @@ class TestNonConversationalTrackerOffload:
             await _asyncio.gather(first, second)
 
         assert sorted(writes[-1]) == ["1", "2"]
-
 
