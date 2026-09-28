@@ -16,6 +16,7 @@ def hermes_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_SESSION_KEY", "discord:123:thread")
     monkeypatch.setenv("HERMES_SESSION_USER_ID", "456")
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "789")
     monkeypatch.setenv("HERMES_SESSION_ID", "session-1")
     from gateway.durable_requests import reset_durable_request_store_cache
 
@@ -92,6 +93,17 @@ def test_unavailable_durable_path_stays_manual(hermes_home, allowed, inbox, reas
     assert wa.pending_count(wa.MEMORY) == 1
 
 
+def test_missing_live_channel_keeps_memory_change_manual(hermes_home, monkeypatch):
+    from gateway.durable_requests import get_durable_request_store
+    from tools import write_approval as wa
+
+    _configure()
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID")
+    result = wa.create_memory_durable_approval(_stage())
+    assert result == {"status": "pending_manual_review", "reason": "inbox_unavailable"}
+    assert get_durable_request_store().claim_next_pending(["discord"]) is None
+
+
 def test_complete_review_creates_one_idempotent_request_with_bounded_payload(hermes_home):
     import sqlite3
     from gateway.durable_actions import decode_durable_action_payload
@@ -113,18 +125,31 @@ def test_complete_review_creates_one_idempotent_request_with_bounded_payload(her
     assert "exact reviewed fact" not in payload_json
     linked = wa.get_pending(wa.MEMORY, record["id"])
     assert linked["durable_request_id"] == first["request_id"]
+    from gateway.durable_requests import get_durable_request_store
+    assert get_durable_request_store().get(request_id=first["request_id"]).target.chat_id == "789"
 
 
 def test_oversize_review_falls_back_without_creating_action(hermes_home):
-    import sqlite3
+    from gateway.durable_requests import get_durable_request_store
     from tools import write_approval as wa
 
     _configure()
     record = _stage("x" * 5000)
     result = wa.create_memory_durable_approval(record)
     assert result == {"status": "pending_manual_review", "reason": "review_too_large"}
-    with sqlite3.connect(hermes_home / "state.db") as conn:
-        assert conn.execute("SELECT count(*) FROM durable_action_tickets").fetchone()[0] == 0
+    assert get_durable_request_store().claim_next_pending(["discord"]) is None
+
+
+def test_utf16_oversize_review_stays_manual_before_delivery(hermes_home):
+    from gateway.durable_requests import get_durable_request_store
+    from tools import write_approval as wa
+
+    _configure()
+    record = _stage("🙂" * 650)
+    assert wa.create_memory_durable_approval(record) == {
+        "status": "pending_manual_review", "reason": "review_too_large"
+    }
+    assert get_durable_request_store().claim_next_pending(["discord"]) is None
 
 
 def _context(record):
@@ -234,8 +259,67 @@ def test_review_body_is_complete_and_not_truncated(hermes_home):
     content = "first line\nlast line"
     result = wa.create_memory_durable_approval(_stage(content))
     request = get_durable_request_store().get(request_id=result["request_id"])
-    assert json.loads(request.body)["operations"][0]["content"] == content
+    assert "Target: MEMORY.md" in request.body
+    assert "Add:" in request.body
+    assert "  | first line\n  | last line" in request.body
+    assert not request.body.lstrip().startswith("{")
     assert "..." not in request.body
+
+
+def test_review_describes_full_pinned_replace_and_batch(hermes_home):
+    from tools import write_approval as wa
+
+    record = {
+        "target_path": "USER.md",
+        "payload": {
+            "action": "batch",
+            "operations": [
+                {"action": "replace", "old_text": "old", "matched_entry": "full old\nentry", "content": "new\nentry"},
+                {"action": "remove", "old_text": "gone", "matched_entry": "complete gone entry"},
+            ],
+        },
+    }
+    body = wa._memory_review(record)
+    assert "Target: USER.md" in body
+    assert "1. Replace:\nFull entry:\n  | full old\n  | entry\nWith:\n  | new\n  | entry" in body
+    assert "2. Remove:\nFull entry:\n  | complete gone entry" in body
+    assert "matched_entry" not in body
+
+
+def test_staging_keeps_pinned_entry_for_review(hermes_home):
+    from tools import write_approval as wa
+    from tools.memory_tool import MemoryStore
+
+    store = MemoryStore()
+    store.load_from_disk()
+    assert store.add("memory", "full old entry")["success"]
+    record = wa.stage_write(
+        wa.MEMORY,
+        {"action": "replace", "target": "memory", "old_text": "old",
+         "matched_entry": "full old entry", "content": "new entry"},
+        summary="replace memory", origin="foreground",
+    )
+    assert "Full entry:\n  | full old entry" in wa._memory_review(record)
+
+
+def test_unpinned_replace_stays_on_manual_review(hermes_home):
+    from gateway.durable_requests import get_durable_request_store
+    from tools import write_approval as wa
+    from tools.memory_tool import MemoryStore
+
+    _configure()
+    store = MemoryStore()
+    store.load_from_disk()
+    assert store.add("memory", "full old entry")["success"]
+    record = wa.stage_write(
+        wa.MEMORY,
+        {"action": "replace", "target": "memory", "old_text": "old", "content": "new"},
+        summary="replace memory", origin="foreground",
+    )
+    assert wa.create_memory_durable_approval(record) == {
+        "status": "pending_manual_review", "reason": "invalid_record"
+    }
+    assert get_durable_request_store().claim_next_pending(["discord"]) is None
 
 
 def test_linked_manual_approve_authorizes_same_handler_and_reject_cancels(hermes_home):
@@ -441,7 +525,7 @@ def test_durable_disabled_keeps_exact_legacy_staged_response(hermes_home):
     assert "review with /memory pending" in result["message"]
 
 
-def test_review_is_canonical_json_for_normalized_execution(hermes_home):
+def test_review_quotes_content_that_looks_like_review_labels(hermes_home):
     from gateway.durable_requests import get_durable_request_store
     from tools import write_approval as wa
 
@@ -449,14 +533,13 @@ def test_review_is_canonical_json_for_normalized_execution(hermes_home):
     record = _stage("  Add:\nWith:\n exact value  ")
     receipt = wa.create_memory_durable_approval(record)
     request = get_durable_request_store().get(request_id=receipt["request_id"])
-    assert json.loads(request.body) == {
-        "target": "memory",
-        "operations": [{
-            "action": "add",
-            "content": "Add:\nWith:\n exact value",
-            "old_text": "",
-        }],
-    }
+    assert request.body == (
+        "Target: MEMORY.md\n\n"
+        "1. Add:\n"
+        "  | Add:\n"
+        "  | With:\n"
+        "  |  exact value"
+    )
 
 
 def test_unknown_diagnostic_reports_only_structural_target_state(hermes_home):

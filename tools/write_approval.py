@@ -244,6 +244,7 @@ def _memory_operations(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         "action": payload.get("action"),
         "content": payload.get("content"),
         "old_text": payload.get("old_text"),
+        "matched_entry": payload.get("matched_entry"),
     }]
 
 
@@ -253,6 +254,8 @@ def _normalize_memory_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "action": operation.get("action"),
         "content": str(operation.get("content") or "").strip(),
         "old_text": str(operation.get("old_text") or "").strip(),
+        **({"matched_entry": operation["matched_entry"]}
+           if isinstance(operation.get("matched_entry"), str) else {}),
     } for operation in _memory_operations(payload)]
     if payload.get("action") == "batch":
         return {"action": "batch", "target": target, "operations": operations}
@@ -490,15 +493,31 @@ def prepare_durable_memory_pending(record: Dict[str, Any]):
 
 
 def _memory_review(record: Dict[str, Any]) -> str:
-    return json.dumps(
-        {
-            "operations": _memory_operations(record["payload"]),
-            "target": record["logical_target"],
-        },
-        ensure_ascii=False,
-        indent=2,
-        sort_keys=True,
-    )
+    def quoted(value: str) -> str:
+        return "\n".join(f"  | {line}" for line in value.split("\n"))
+
+    parts = [f"Target: {record['target_path']}"]
+    for index, operation in enumerate(_memory_operations(record["payload"]), 1):
+        action = operation["action"]
+        if action == "add":
+            detail = f"Add:\n{quoted(operation['content'])}"
+        else:
+            entry = operation.get("matched_entry")
+            if not isinstance(entry, str) or not entry:
+                raise ValueError("staged memory entry is not pinned")
+            subject = f"Full entry:\n{quoted(entry)}"
+            detail = (f"{action.capitalize()}:\n{subject}" +
+                      (f"\nWith:\n{quoted(operation['content'])}" if action == "replace" else ""))
+        parts.append(f"{index}. {detail}")
+    return "\n\n".join(parts)
+
+
+def _durable_review_fits(review: str) -> bool:
+    from gateway.interactive import MAX_PROMPT_BODY_LENGTH
+    from gateway.platforms.base import utf16_len
+
+    # Leave room for the title, options, request receipt, and command fallback.
+    return utf16_len(review) <= MAX_PROMPT_BODY_LENGTH
 
 
 def create_memory_durable_approval(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -521,6 +540,12 @@ def create_memory_durable_approval(record: Dict[str, Any]) -> Dict[str, Any]:
     if prepared is None:
         return {"status": "pending_manual_review", "reason": "invalid_record"}
     try:
+        review = _memory_review(record)
+    except ValueError:
+        return {"status": "pending_manual_review", "reason": "invalid_record"}
+    if not _durable_review_fits(review):
+        return {"status": "pending_manual_review", "reason": "review_too_large"}
+    try:
         config = load_config_readonly()
         policy = config.get("durable_approvals", {})
         if not isinstance(policy, dict) or policy.get("enabled") is not True:
@@ -531,16 +556,17 @@ def create_memory_durable_approval(record: Dict[str, Any]) -> Dict[str, Any]:
         request_config = load_durable_requests_config()
         if not request_config.available or request_config.target is None:
             return {"status": "pending_manual_review", "reason": "inbox_unavailable"}
-        from tools.durable_request_tool import _current_origin
+        from tools.durable_request_tool import _current_origin, _delivery_target_for_origin
         try:
             origin = _current_origin(request_config.scheduled_responder_mode)
+            target = _delivery_target_for_origin(origin, request_config.target)
         except ValueError:
             return {"status": "pending_manual_review", "reason": "inbox_unavailable"}
         result = get_durable_request_store().create_with_action(
             DurableRequestSpec(
                 kind="tool.durable_approval.memory.apply_pending",
                 title="Apply staged memory change?",
-                body=_memory_review(record),
+                body=review,
                 options=(
                     DurableRequestOption(id="approve", label="Approve"),
                     DurableRequestOption(id="reject", label="Reject"),
@@ -549,7 +575,7 @@ def create_memory_durable_approval(record: Dict[str, Any]) -> Dict[str, Any]:
                 reference=f"memory.apply_pending:{record['id']}",
             ),
             action=prepared,
-            target=request_config.target,
+            target=target,
             responder_mode=origin.responder_mode,
             expected_actor_id=origin.expected_actor_id,
             origin_type=origin.origin_type,
@@ -1463,7 +1489,7 @@ def create_skill_durable_approval(record: Dict[str, Any]) -> Dict[str, Any]:
                     "request_id": request_id, "action_id": request_id}
     review = (_durable_skill_review(stored, max_chars=MAX_DURABLE_SKILL_DIFF_CHARS)
               if stored and prepared else None)
-    if prepared is None or review is None:
+    if prepared is None or review is None or not _durable_review_fits(review):
         return manual("invalid_or_oversize_review")
     try:
         config = load_config_readonly(); policy = config.get("durable_approvals", {})
@@ -1474,8 +1500,12 @@ def create_skill_durable_approval(record: Dict[str, Any]) -> Dict[str, Any]:
         request_config = load_durable_requests_config()
         if not request_config.available or request_config.target is None:
             return manual("inbox_unavailable")
-        from tools.durable_request_tool import _current_origin
-        origin = _current_origin(request_config.scheduled_responder_mode)
+        from tools.durable_request_tool import _current_origin, _delivery_target_for_origin
+        try:
+            origin = _current_origin(request_config.scheduled_responder_mode)
+            target = _delivery_target_for_origin(origin, request_config.target)
+        except ValueError:
+            return manual("inbox_unavailable")
         result = get_durable_request_store().create_with_action(
             DurableRequestSpec(
                 kind="tool.durable_approval.skill.apply_pending",
@@ -1485,7 +1515,7 @@ def create_skill_durable_approval(record: Dict[str, Any]) -> Dict[str, Any]:
                          DurableRequestOption(id="reject", label="Reject")),
                 ttl_seconds=request_config.default_ttl_seconds,
                 reference=f"skill.apply_pending:{stored['id']}",
-            ), action=prepared, target=request_config.target,
+            ), action=prepared, target=target,
             responder_mode=origin.responder_mode, expected_actor_id=origin.expected_actor_id,
             origin_type=origin.origin_type, origin_id=origin.origin_id,
             command_response_allowed=(request_config.command_responses_enabled

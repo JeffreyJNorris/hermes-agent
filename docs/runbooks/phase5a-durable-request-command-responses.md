@@ -30,6 +30,11 @@ Answer in the request's exact delivery channel:
 /request respond drq_RECEIPT 2
 ```
 
+For live Discord requests this is the originating channel or thread. For
+scheduled requests it is the configured inbox. The request's persisted target
+does not change if configuration later changes. A missing live channel is not
+silently redirected to the inbox.
+
 The responder must already pass normal Hermes command authorization and the
 request's responder policy. Phase 5A accepts exactly one positive numeric slot.
 Labels, canonical option IDs, bare numbers, `approve`, ranges, and lists such as

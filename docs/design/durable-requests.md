@@ -38,7 +38,15 @@ durable_requests:
     allow_text_delivery_fallback: true
 ```
 
-Current delivery support uses a Discord inbox only. The model cannot choose the platform,
+The configured inbox is the destination for scheduled/cron requests. Requests
+created in a live Discord conversation use that conversation's exact channel
+or thread instead. If the trusted live channel is missing or inconsistent,
+posting fails; staged writes remain on manual review. Existing requests keep
+their persisted target across restart and configuration changes. Memory-write
+approval cards show the complete staged change as readable quoted text; a
+replace/remove without a pinned prior entry stays on manual review.
+
+Current delivery support uses Discord only. The model cannot choose the platform,
 channel, thread, responder policy, or actor scope. Disabling the feature pauses
 outbox delivery and restart reconciliation without deleting persisted rows; they
 can resume if the same profile is enabled again.
