@@ -127,6 +127,16 @@ class TestClarifyChoiceViewConstruction:
         )
 
 
+    def test_other_button_has_plain_label(self):
+        view = ClarifyChoiceView(
+            choices=["red", "blue"],
+            clarify_id="cidOtherLabel",
+            allowed_user_ids=set(),
+        )
+
+        assert view.children[-1].label == "✏️ Other (type answer)"
+
+
 # ===========================================================================
 # Choice callback → resolve_gateway_clarify
 # ===========================================================================
@@ -193,6 +203,48 @@ class TestClarifyOtherButton:
         interaction.response.send_message.assert_called_once()
         pending = cm.get_pending_for_session("sk-E")
         assert pending is None or pending.awaiting_text is False
+
+
+class TestClarifyTimeout:
+    """A timed-out Discord view must release the gateway clarify wait."""
+
+    def setup_method(self):
+        _clear_clarify_state()
+
+    @pytest.mark.asyncio
+    async def test_timeout_unblocks_waiting_clarify(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("cidT", "sk-T", "Pick", ["x"])
+        view = ClarifyChoiceView(
+            choices=["x"],
+            clarify_id="cidT",
+            allowed_user_ids=set(),
+        )
+
+        await view.on_timeout()
+
+        # The agent-side wait must return immediately when the UI expires;
+        # otherwise the controls are dead while the session remains wedged.
+        assert cm.wait_for_response("cidT", timeout=0.05) == ""
+
+    @pytest.mark.asyncio
+    async def test_timeout_does_not_overwrite_resolved_prompt(self):
+        """A completed choice/Other response must keep its final UI state."""
+        view = ClarifyChoiceView(
+            choices=["x"],
+            clarify_id="cid-resolved",
+            allowed_user_ids=set(),
+        )
+        view.resolved = True
+        view._message = SimpleNamespace(
+            embeds=[],
+            edit=AsyncMock(),
+        )
+
+        await view.on_timeout()
+
+        view._message.edit.assert_not_awaited()
 
 
 # ===========================================================================

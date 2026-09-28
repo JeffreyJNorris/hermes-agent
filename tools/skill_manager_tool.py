@@ -629,7 +629,32 @@ def _run_write_gate(build_staging):
     if decision.blocked:
         return tool_error(decision.message, success=False)
     payload, gist = build_staging(wa)
-    record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
+    if wa.durable_approval_enabled(wa.SKILLS):
+        name = payload.get("name", "")
+        existing = _find_skill(name)
+        if existing:
+            try:
+                from agent.skill_utils import is_external_skill_path, is_org_mirror_path
+                from tools import skill_usage
+                protected = (
+                    is_external_skill_path(existing["path"])
+                    or is_org_mirror_path(existing["path"], _skills_dir())
+                    or skill_usage.is_protected_builtin(name)
+                    or skill_usage.is_bundled(name)
+                    or skill_usage.is_hub_installed(name)
+                )
+            except Exception:
+                protected = True
+            if protected:
+                return tool_error("Skill approval cannot target protected or non-personal skills.", success=False)
+        record = wa.stage_skill_write(payload, summary=gist, origin=wa.current_origin())
+        if record.get("status") == "rejected":
+            return tool_error(f"Durable skill approval rejected: {record.get('reason')}", success=False)
+        if record.get("manifest_version") == 1:
+            receipt = wa.create_skill_durable_approval(record)
+            return json.dumps({"success": True, "staged": True, "gist": gist, **receipt}, ensure_ascii=False)
+    else:
+        record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
     return json.dumps({"success": True, "staged": True, "pending_id": record["id"],
                        "gist": gist, "message": decision.message}, ensure_ascii=False)
 
@@ -713,6 +738,23 @@ def _act_patch(a):
     return _patch_skill(a["name"], a["old_string"], a["new_string"], a["file_path"], a["replace_all"])
 
 
+# Share the durable handler's cross-process lock for concrete writes.
+def _locked_writer(function):
+    def locked(*args, **kwargs):
+        from tools.write_approval import skill_write_lock
+        with skill_write_lock():
+            return function(*args, **kwargs)
+    return locked
+
+
+_create_skill = _locked_writer(_create_skill)
+_edit_skill = _locked_writer(_edit_skill)
+_patch_skill = _locked_writer(_patch_skill)
+_delete_skill = _locked_writer(_delete_skill)
+_write_file = _locked_writer(_write_file)
+_remove_file = _locked_writer(_remove_file)
+
+
 # action -> handler(args dict) returning a result dict, or a tool_error JSON string for
 # argument-shape errors. "edit" is a legacy alias for a full rewrite (not in the schema).
 _ACTION_HANDLERS = {
@@ -762,6 +804,32 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
     # Only AFTER the write gate passed (staged writes returned early): never push un-reviewed content.
     with suppress(Exception):
         _maybe_debounced_sync_push(name)
+
+
+def finalize_skill_mutation(action: str, name: str, result: Dict[str, Any]) -> None:
+    """Run the shared cache, provenance, telemetry, and sync finalizers."""
+    if not result.get("success"):
+        return
+    try:
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+        clear_skills_system_prompt_cache(clear_snapshot=True)
+    except Exception:
+        pass
+    try:
+        from tools.skill_usage import bump_patch, forget, mark_agent_created
+        from tools.skill_provenance import is_background_review
+        if action == "create" and is_background_review():
+            mark_agent_created(name)
+        elif action in {"patch", "edit", "write_file", "remove_file"}:
+            bump_patch(name)
+        elif action == "delete" and not result.get("_archived"):
+            forget(name)
+    except Exception:
+        pass
+    try:
+        _maybe_debounced_sync_push(name)
+    except Exception:
+        pass
 
 
 def skill_manage(

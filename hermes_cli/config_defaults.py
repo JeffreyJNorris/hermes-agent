@@ -1303,6 +1303,7 @@ DEFAULT_CONFIG = {
         # true = foreground writes prompt inline; background writes are staged (/memory
         # pending|approve <id>|reject <id>). To disable memory: memory_enabled.
         "write_approval": False,
+        "durable_approval": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
         # Periodic built-in memory review; 0 when an external provider auto-extracts.
@@ -1476,6 +1477,7 @@ DEFAULT_CONFIG = {
         # through the unchanged-file dedup and, if still over, drops the oldest entries (0 = keep
         # the ledger append-only forever, the previous behaviour).
         "ledger_max_bytes": 5 * 1024 * 1024,
+        "durable_approval": False,
     },
 
     # Curator — background maintenance of AGENT-CREATED skills (never hub-installed): marks
@@ -1640,6 +1642,22 @@ DEFAULT_CONFIG = {
         "free_response_rooms": "",  # comma-separated room IDs answered without mention
         "allowed_rooms": "",  # if set, ONLY respond in these room IDs (whitelist)
     },
+    # Durable finite-choice requests and trusted action approvals are opt-in.
+    "durable_requests": {
+        "enabled": False,
+        "inbox": {"platform": "discord", "chat_id": "", "thread_id": None},
+        "default_ttl_seconds": 86400,
+        "max_ttl_seconds": 604800,
+        "terminal_retention_seconds": 604800,
+        "scheduled_responder_policy": "any_authorized",
+        "command_responses": {
+            "enabled": False,
+            "allow_on_native_delivery": True,
+            "allow_text_delivery_fallback": True,
+        },
+    },
+    "durable_approvals": {"enabled": False, "allowed_actions": []},
+
     # Approvals for dangerous commands.
     # mode: manual (always prompt) | smart (aux LLM auto-approves low-risk) | off (= --yolo)
     # cron_mode / single_query_mode / unattended_mode: deny | approve — what to do when a

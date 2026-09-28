@@ -319,6 +319,83 @@ def stat_db_file_identity(path) -> "tuple[int, int] | None":
     return (st.st_dev, st.st_ino) if st.st_dev and st.st_ino else None
 
 
+MAX_DURABLE_ACTION_PAYLOAD_BYTES = 16_384
+MAX_DURABLE_ACTION_OUTCOME_JSON_BYTES = 16_384
+MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH = 1_024
+
+
+DURABLE_ACTION_SCHEMA_SQL = f"""
+CREATE TABLE IF NOT EXISTS durable_action_tickets (
+    request_id TEXT PRIMARY KEY,
+    action_type TEXT NOT NULL,
+    action_version INTEGER NOT NULL,
+    payload_json TEXT NOT NULL
+        CHECK (length(CAST(payload_json AS BLOB)) <= {MAX_DURABLE_ACTION_PAYLOAD_BYTES}),
+    fingerprint TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    status TEXT NOT NULL,
+    execution_claim TEXT,
+    execution_claimed_at REAL,
+    execution_started_at REAL,
+    outcome_reason TEXT
+        CHECK (
+            outcome_reason IS NULL
+            OR length(outcome_reason) <= {MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH}
+        ),
+    outcome_json TEXT
+        CHECK (
+            outcome_json IS NULL
+            OR length(CAST(outcome_json AS BLOB))
+                <= {MAX_DURABLE_ACTION_OUTCOME_JSON_BYTES}
+        ),
+    completed_at REAL,
+    notification_status TEXT NOT NULL,
+    notification_claim TEXT,
+    notification_claimed_at REAL,
+    notification_completed_at REAL,
+    notification_reason TEXT
+        CHECK (
+            notification_reason IS NULL
+            OR length(notification_reason) <= {MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH}
+        ),
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_action_tickets_idempotency
+    ON durable_action_tickets(action_type, idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_durable_action_tickets_runnable
+    ON durable_action_tickets(status, execution_claimed_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_durable_action_tickets_notification
+    ON durable_action_tickets(notification_status, notification_claimed_at, updated_at);
+CREATE TABLE IF NOT EXISTS durable_action_reconciliations (
+    reconciliation_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL UNIQUE,
+    outcome TEXT NOT NULL,
+    operator_identity TEXT NOT NULL CHECK(length(operator_identity) <= 128),
+    note TEXT CHECK(note IS NULL OR length(note) <= 1024),
+    superseded_by_request_id TEXT,
+    created_at REAL NOT NULL,
+    FOREIGN KEY(request_id) REFERENCES durable_action_tickets(request_id)
+);
+"""
+
+
+def reconcile_durable_action_schema(conn) -> None:
+    """Create the action ledger and upgrade pre-notification-reason ledgers."""
+    conn.executescript(DURABLE_ACTION_SCHEMA_SQL)
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(durable_action_tickets)")
+    }
+    if "notification_reason" not in columns:
+        conn.execute(
+            "ALTER TABLE durable_action_tickets ADD COLUMN notification_reason TEXT "
+            f"CHECK (notification_reason IS NULL OR length(notification_reason) "
+            f"<= {MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH})"
+        )
+
+
+
+
 # Row probes shared by the messages / compression mixins.
 _ENDED_ROW_SQL = "SELECT ended_at, end_reason FROM sessions WHERE id = ?"
 _COMPRESSION_LOCK_ROW_SQL = "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?"
@@ -584,6 +661,49 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     origin_session_id TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS durable_requests (
+    request_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    options_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    platform TEXT NOT NULL,
+    chat_id TEXT NOT NULL,
+    thread_id TEXT,
+    message_id TEXT,
+    responder_mode TEXT NOT NULL,
+    expected_actor_id TEXT,
+    origin_type TEXT NOT NULL,
+    origin_id TEXT NOT NULL,
+    reference TEXT,
+    delivery_mode TEXT NOT NULL DEFAULT 'native',
+    command_response_allowed INTEGER NOT NULL DEFAULT 0,
+    text_command_fallback_allowed INTEGER NOT NULL DEFAULT 0,
+    resolution_source TEXT,
+    selected_option_id TEXT,
+    resolved_by_actor_id TEXT,
+    resolved_at REAL,
+    terminal_reason TEXT,
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    delivery_claim TEXT,
+    delivery_claimed_at REAL,
+    delivered_at REAL,
+    wake_requested INTEGER NOT NULL DEFAULT 0,
+    wake_status TEXT NOT NULL DEFAULT 'not_requested',
+    wake_attempts INTEGER NOT NULL DEFAULT 0,
+    wake_claim TEXT,
+    wake_claimed_at REAL,
+    wake_delivered_at REAL,
+    wake_reason TEXT,
+    origin_session_id TEXT,
+    origin_ui_session_id TEXT,
+    origin_profile TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
@@ -604,7 +724,16 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
-"""
+CREATE INDEX IF NOT EXISTS idx_durable_requests_status_expiry
+    ON durable_requests(status, expires_at);
+CREATE INDEX IF NOT EXISTS idx_durable_requests_delivery
+    ON durable_requests(status, delivery_claimed_at);
+CREATE INDEX IF NOT EXISTS idx_durable_requests_platform
+    ON durable_requests(platform, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_requests_origin_reference
+    ON durable_requests(origin_type, origin_id, reference)
+    WHERE reference IS NOT NULL;
+""" + DURABLE_ACTION_SCHEMA_SQL
 
 # Indexes on later-added columns must run AFTER _reconcile_columns(), or executescript fails on legacy DBs.
 DEFERRED_INDEX_SQL = """
@@ -702,6 +831,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_tool_names
 -- a small candidate set before compression-chain and preview hydration.
 CREATE INDEX IF NOT EXISTS idx_sessions_effective_activity
     ON sessions(COALESCE(last_activity_at, started_at) DESC, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_durable_requests_wake
+    ON durable_requests(wake_status, resolved_at, request_id);
 """
 
 

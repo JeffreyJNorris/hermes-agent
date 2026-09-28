@@ -7,6 +7,7 @@ import logging
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -62,7 +63,7 @@ from tools.cronjob_job_args import (
     _validate_context_from_refs,
     _validate_cron_base_url,
     _validate_cron_script_path)
-from tools.registry import registry, tool_error
+from tools.registry import registry, tool_error, tool_result
 
 
 def _dumps(payload: Dict[str, Any]) -> str:
@@ -185,10 +186,19 @@ def _claim_for_manual_run(job_id: str, log_label: str):
     """At-most-once claim shared by the sync and background run paths: ``(claimed_job, None)`` or
     ``(None, error_dict)`` in the ``_execute_job_now`` shape. A lost claim is labelled precisely —
     claim_job_for_fire also returns False for paused/disabled/missing jobs, not just in-flight ones."""
+    from cron.executions import (
+        ExecutionAlreadyRunning, abandon_claimed_execution, create_execution,
+    )
+    try:
+        execution_id = create_execution(job_id, source="direct")["id"]
+    except ExecutionAlreadyRunning:
+        return None, {"claimed": False, "success": False, "error": _ALREADY_RUNNING_ERROR}
     try:
         claimed_job = claim_job_for_fire(job_id, manual=True, return_job=True)
         if isinstance(claimed_job, dict):
+            claimed_job["execution_id"] = execution_id
             return claimed_job, None
+        abandon_claimed_execution(execution_id)
         refreshed = get_job(job_id)
         if refreshed is None:
             reason = "Job no longer exists; nothing to run."
@@ -200,8 +210,8 @@ def _claim_for_manual_run(job_id: str, log_label: str):
     except Exception as e:
         logger.error("Failed to claim cron job %s for %s: %s", job_id, log_label, e)
         with contextlib.suppress(Exception):
-            mark_job_run(job_id, False, str(e))
-        return None, {"claimed": True, "success": False, "error": str(e)}
+            abandon_claimed_execution(execution_id)
+        return None, {"claimed": False, "success": False, "error": str(e)}
 
 
 def _execute_job_now(job: Dict[str, Any], extra_prompt: Optional[str] = None) -> Dict[str, Any]:
@@ -281,6 +291,9 @@ def _run_claimed_job(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
         # outlived by real jobs, so it alone cannot stop a manual run from double-firing a job the ticker
         # (or another manual run) is still executing.
         if not try_register_running_job(job_id):
+            if job.get("execution_id"):
+                from cron.executions import abandon_claimed_execution
+                abandon_claimed_execution(job["execution_id"])
             return {"claimed": True, "success": False, "error": _ALREADY_RUNNING_ERROR}
         _registered = True
 
@@ -899,6 +912,42 @@ def _resolve_job_or_error(job_id: str):
     return job, None
 
 
+def _resolve_job_for_tool(
+    job_ref: str,
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    try:
+        job = resolve_job_ref(job_ref)
+    except AmbiguousJobReference as exc:
+        return None, json.dumps(
+            {
+                "success": False,
+                "error": str(exc),
+                "matches": [
+                    {
+                        "id": match["id"],
+                        "name": match.get("name"),
+                        "schedule": match.get("schedule_display"),
+                        "next_run_at": match.get("next_run_at"),
+                    }
+                    for match in exc.matches
+                ],
+            },
+            indent=2,
+        )
+    if job is None:
+        return None, json.dumps(
+            {
+                "success": False,
+                "error": (
+                    f"Job with ID or name '{job_ref}' not found. "
+                    "Use cronjob(action='list') to inspect jobs."
+                ),
+            },
+            indent=2,
+        )
+    return job, None
+
+
 def cronjob(
     action: str,
     job_id: Optional[str] = None,
@@ -1089,9 +1138,116 @@ _HANDLER_FORWARDED_ARGS = (
     "paused_reason", "pinned")
 
 
+def _durable_resume_from_model(args: Dict[str, Any]) -> Optional[str]:
+    """Apply trusted policy only at the model-facing cron tool boundary."""
+    normalized = str(args.get("action", "")).strip().lower()
+    if normalized == "resume":
+        try:
+            from gateway.durable_actions import (
+                DurableActionStatus,
+                lookup_durable_action_preparer,
+            )
+            from gateway.durable_requests import (
+                DurableRequestError,
+                DurableRequestLimitError,
+                DurableRequestOption,
+                DurableRequestSpec,
+                get_durable_request_store,
+                load_durable_requests_config,
+            )
+            from hermes_cli.config import load_config_readonly
+            from tools.durable_request_tool import _current_origin
+
+            raw_config = load_config_readonly()
+            policy = raw_config.get("durable_approvals", {})
+            if not isinstance(policy, dict):
+                return tool_error("durable approvals configuration is invalid")
+            enabled = policy.get("enabled", False)
+            if not isinstance(enabled, bool):
+                return tool_error("durable approvals configuration is invalid")
+            if enabled is False:
+                return None
+            allowed = policy.get("allowed_actions")
+            if not isinstance(allowed, list) or any(
+                not isinstance(action, str) for action in allowed
+            ):
+                return tool_error("durable approvals configuration is invalid")
+            if "cron.resume" not in allowed:
+                return tool_error("cron.resume durable approval is not allowlisted")
+
+            request_config = load_durable_requests_config()
+            if not request_config.available or request_config.target is None:
+                return tool_error("durable request inbox is not configured")
+            origin = _current_origin(request_config.scheduled_responder_mode)
+            job_id = args.get("job_id")
+            if not isinstance(job_id, str) or not job_id.strip():
+                return tool_error("job_id is required for action 'resume'", success=False)
+            job, resolution_error = _resolve_job_or_error(job_id)
+            if resolution_error is not None:
+                return resolution_error
+            assert job is not None
+            job_id = job["id"]
+            prepare = lookup_durable_action_preparer("cron.resume", 1)
+            if prepare is None:
+                return tool_error("cron.resume durable approval handler is unavailable")
+            prepared = prepare(job_id)
+            result = get_durable_request_store().create_with_action(
+                DurableRequestSpec(
+                    kind="tool.durable_approval.cron.resume",
+                    title="Resume scheduled job?",
+                    body=f"Resume paused cron job {job_id}?",
+                    options=(
+                        DurableRequestOption(id="approve", label="Resume"),
+                        DurableRequestOption(id="reject", label="Keep paused"),
+                    ),
+                    ttl_seconds=request_config.default_ttl_seconds,
+                    reference=f"durable-action:{prepared.idempotency_key}",
+                ),
+                action=prepared,
+                target=request_config.target,
+                responder_mode=origin.responder_mode,
+                expected_actor_id=origin.expected_actor_id,
+                origin_type=origin.origin_type,
+                origin_id=origin.origin_id,
+                command_response_allowed=(
+                    request_config.command_responses_enabled
+                    and request_config.allow_on_native_delivery
+                ),
+                text_command_fallback_allowed=(
+                    request_config.command_responses_enabled
+                    and request_config.allow_text_delivery_fallback
+                ),
+                origin_session_id=origin.origin_session_id,
+                origin_ui_session_id=origin.origin_ui_session_id,
+                origin_profile=origin.origin_profile,
+                maximum_ttl_seconds=request_config.max_ttl_seconds,
+                terminal_retention_seconds=request_config.terminal_retention_seconds,
+            )
+            return tool_result(
+                status=(
+                    "approval_pending"
+                    if result.ticket.status is DurableActionStatus.WAITING_FOR_DECISION
+                    else result.ticket.status.value
+                ),
+                request_id=result.request.request_id,
+                action="cron.resume",
+                expires_at=(
+                    datetime.fromtimestamp(
+                        result.request.expires_at,
+                        tz=timezone.utc,
+                    ).isoformat().replace("+00:00", "Z")
+                ),
+                created=result.created,
+            )
+        except (DurableRequestError, DurableRequestLimitError, ValueError) as exc:
+            return tool_error(str(exc))
+
 def _cronjob_handler(args, **kw):
     """Model-tool dispatch: resolves the one model-facing ``monitor`` field into the stored
     ``monitor_script``/``monitor_url`` pair (legacy field names still accepted)."""
+    durable_result = _durable_resume_from_model(args)
+    if durable_result is not None:
+        return durable_result
     _mon_script, _mon_url = _split_monitor_arg(args.get("monitor"), args.get("monitor_script"), args.get("monitor_url"))
     return cronjob(
         action=args.get("action", ""),

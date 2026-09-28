@@ -1285,6 +1285,7 @@ class TurnRunner:
             mem_notif = "on" if mem_notif else "off"
         agent.memory_notifications = str(mem_notif).lower() if mem_notif else "on"
         agent.clarify_callback = self._clarify_callback_sync
+        agent.interactive_prompt_callback = self._interactive_prompt_callback_sync
         # Thinking between tool calls is independent of tool_progress mode (Mattermost opts in
         # per platform so global scratch-text doesn't leak into threads).
         agent.thinking_progress = ctx._thinking_enabled
@@ -1307,6 +1308,38 @@ class TurnRunner:
         ctx.tools_holder[0] = getattr(agent, "tools", None)  # transcript logging
 
     # ── blocking prompts from the agent thread (approval / clarify) ─────────────────────────
+
+    def _interactive_prompt_callback_sync(self, prompt):
+        """Bind a finite-choice prompt to this turn's trusted delivery scope."""
+        from gateway.interactive import PromptOutcome, PromptOutcomeStatus, PromptScope
+        from gateway.interactive_bridge import InteractivePromptBridge
+
+        ctx = self._ctx
+        if ctx._status_adapter is None or ctx._loop_for_step is None:
+            return PromptOutcome(PromptOutcomeStatus.UNSUPPORTED, reason="gateway_context_unavailable")
+        session_key = str(ctx.session_key or "")
+        platform = str(ctx.source.platform.value)
+        chat_id = str(ctx.source.chat_id or "")
+        if not session_key or not platform or not chat_id:
+            return PromptOutcome(PromptOutcomeStatus.UNSUPPORTED, reason="trusted_scope_unavailable")
+        scope = PromptScope(
+            session_key=session_key,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=str(ctx.source.thread_id) if ctx.source.thread_id is not None else None,
+            expected_actor_id=str(ctx.source.user_id) if ctx.source.user_id is not None else None,
+        )
+
+        async def _send_fallback(chat_id, content, metadata):
+            return await ctx._status_adapter.send(chat_id=chat_id, content=content, metadata=metadata)
+
+        return InteractivePromptBridge(
+            adapter=ctx._status_adapter,
+            scope=scope,
+            event_loop=ctx._loop_for_step,
+            metadata=ctx._status_thread_metadata,
+            fallback_sender=_send_fallback,
+        ).request_sync(prompt)
 
     def _close_native_stream_boundary(self, reason: str, placeholder: str | None = None, reopen: bool = False) -> bool:
         """Native-streaming platforms (e.g. WeCom): an interrupting interaction (approval or clarify
@@ -1690,9 +1723,13 @@ class TurnRunner:
         from gateway.run import _wrap_current_message_with_observed_context
         from tools.approval import register_gateway_notify, unregister_gateway_notify
         from tools.approval_context import reset_current_session_key, set_current_session_key
+        from tools.interactive_prompt_context import (
+            bind_interactive_prompt_callback, reset_interactive_prompt_callback,
+        )
         ctx = self._ctx
         session_key = ctx.session_key or ""
         token = set_current_session_key(session_key)
+        interactive_token = bind_interactive_prompt_callback(self._interactive_prompt_callback_sync)
         register_gateway_notify(session_key, self._approval_notify_sync)
         try:
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
@@ -1724,6 +1761,7 @@ class TurnRunner:
                 return agent.run_conversation(api_message, **kwargs)
         finally:
             unregister_gateway_notify(session_key)
+            reset_interactive_prompt_callback(interactive_token)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
             # run (interrupt, completion, gateway shutdown). Idempotent.
             with suppress(Exception):

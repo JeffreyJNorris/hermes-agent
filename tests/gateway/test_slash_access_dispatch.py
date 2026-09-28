@@ -304,6 +304,99 @@ async def test_running_agent_fastpath_allows_admin_command():
     assert "⛔" not in (result or "")
 
 
+@pytest.mark.asyncio
+async def test_request_command_uses_access_gate_before_cold_dispatch(caplog):
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": [],
+        }
+    )
+    runner._handle_request_command = AsyncMock(return_value="Response recorded.")
+    receipt = "drq_" + "S" * 32
+    source = _make_source(
+        user_id="sensitive-actor",
+        chat_id="sensitive-channel",
+    )
+    source.thread_id = "sensitive-thread"
+
+    with caplog.at_level("INFO", logger="gateway.run"):
+        result = await runner._handle_message(
+            _make_event(f"/request respond {receipt} 787878", source)
+        )
+
+    assert "⛔" in result
+    runner._handle_request_command.assert_not_awaited()
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("Slash command /request denied" in message for message in messages)
+    assert all("sensitive-actor" not in message for message in messages)
+    assert all("sensitive-channel" not in message for message in messages)
+    assert all("sensitive-thread" not in message for message in messages)
+    assert all("sess-1" not in message for message in messages)
+    assert all(receipt not in message for message in messages)
+    assert all("respond" not in message for message in messages)
+    assert all("787878" not in message for message in messages)
+
+
+@pytest.mark.asyncio
+async def test_request_command_dispatches_while_busy_after_access_check():
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": ["request"],
+        }
+    )
+    src = _make_source(user_id="999")
+    sk = build_session_key(src)
+    runner._running_agents[sk] = MagicMock()
+    runner._running_agents_ts[sk] = 0
+    runner._handle_request_command = AsyncMock(return_value="Response recorded.")
+
+    result = await runner._handle_message(
+        _make_event("/request respond drq_" + "A" * 32 + " 1", src)
+    )
+
+    assert result == "Response recorded."
+    runner._handle_request_command.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_approve_keeps_precedence_over_request_handler():
+    runner = _make_runner()
+    runner._handle_approve_command = AsyncMock(return_value="approval-handled")
+    runner._handle_request_command = AsyncMock(return_value="request-handled")
+
+    result = await runner._handle_message(_make_event("/approve", _make_source()))
+
+    assert result == "approval-handled"
+    runner._handle_request_command.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_malformed_request_command_is_consumed_before_agent_dispatch():
+    runner = _make_runner()
+    runner._handle_message_with_agent = AsyncMock(return_value="model-received-command")
+
+    result = await runner._handle_message(
+        _make_event("/request respond not-a-receipt approve", _make_source())
+    )
+
+    assert result == "Usage: /request respond <request-id> <number>"
+    runner._handle_message_with_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["1", "approve", "ordinary chat"])
+async def test_bare_values_and_chat_remain_normal_agent_input(text):
+    runner = _make_runner()
+    runner._handle_message_with_agent = AsyncMock(return_value="agent-handled")
+
+    result = await runner._handle_message(_make_event(text, _make_source()))
+
+    assert result == "agent-handled"
+    runner._handle_message_with_agent.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # Alias resolution — /h aliases to /help; the gate must canonicalize before
 # checking access. /hist (history alias) is a real one to exercise.

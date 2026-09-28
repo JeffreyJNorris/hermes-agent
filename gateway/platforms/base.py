@@ -1665,7 +1665,8 @@ _SEND_RETRY_INLINE_WAIT_CAP_SECS = 60.0
 # not_found (chat/thread/message gone), rate_limited, transient (connection-level, retry-safe),
 # unknown.
 SEND_ERROR_KINDS = frozenset(
-    {"too_long", "bad_format", "forbidden", "not_found", "rate_limited", "transient", "unknown"})
+    {"too_long", "bad_format", "forbidden", "not_found", "rate_limited", "transient",
+     "unsupported", "delivery_unknown", "unknown"})
 
 # ``not_found`` substrings by blast radius: chat-level = target dead; thread/topic/message-level
 # leaves the parent chat reachable.
@@ -2856,6 +2857,85 @@ class BasePlatformAdapter(ABC):
         (``/approve``/``/always``/``/cancel``)."""
         return SendResult(success=False, error="Not supported")
 
+    async def send_interactive_prompt(
+        self,
+        chat_id: str,
+        prompt: "InteractivePrompt",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Deliver a registered finite-choice prompt using native controls.
+
+        This phase-one extension is optional and intentionally non-abstract so
+        existing adapters remain source-compatible.  ``success=True`` means the
+        provider send completed and MUST include ``message_id``.  Implementations
+        render controls only; prompt state, validation, authorization scope,
+        replay protection, timeout, and resolution belong to
+        :mod:`gateway.interactive`.
+
+        Adapters must fail rather than silently remove options.  Unsupported
+        transports return the standard explicit optional-feature result below;
+        the gateway may then reserve and deliver the serialized text fallback.
+        """
+        return SendResult(
+            success=False,
+            error="Interactive prompts are not supported",
+            error_kind="unsupported",
+        )
+
+    async def send_durable_request(
+        self,
+        chat_id: str,
+        request: "DurableRequest",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Deliver a persisted finite-choice request using native controls.
+
+        This optional method is separate from ``send_interactive_prompt``:
+        durable requests outlive the originating turn and the gateway process.
+        ``success=True`` means the provider send completed and MUST include the
+        exact provider ``message_id`` so the durable ledger can bind delivery.
+        ``transient`` and ``rate_limited`` results are retryable only when no
+        provider send was attempted; after a send attempt with an uncertain
+        outcome, implementations must return ``delivery_unknown``. Adapters
+        render controls only and never perform application mutations.
+        """
+        return SendResult(
+            success=False,
+            error="Durable requests are not supported",
+            error_kind="unsupported",
+        )
+
+    async def send_durable_request_text(
+        self,
+        chat_id: str,
+        request: "DurableRequest",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Deliver one complete command-driven durable request message."""
+
+        return SendResult(
+            success=False,
+            error="Durable request text delivery is not supported",
+            error_kind="unsupported",
+        )
+
+    async def restore_durable_request(
+        self,
+        request: "DurableRequest",
+    ) -> SendResult:
+        """Restore native handling for an already-bound durable request.
+
+        Providers with persistent component registration should override this
+        method, reconcile the exact stored message, and register its callbacks.
+        A permanently missing message returns ``error_kind="not_found"``.
+        Transient failures must not mutate the durable ledger.
+        """
+        return SendResult(
+            success=False,
+            error="Durable request restoration is not supported",
+            error_kind="unsupported",
+        )
+
     async def send_clarify(
         self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
         session_key: str, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
@@ -4019,12 +4099,30 @@ class BasePlatformAdapter(ABC):
                     self._discard_text_debounce(session_key)
                     await self._dispatch_active_session_command(event, session_key, cmd)
                 else:
-                    logger.debug("[%s] Command '/%s' bypassing active-session guard for %s",
-                                 self.name, cmd, session_key)
+                    if cmd == "request":
+                        logger.debug("[%s] Command '/request' bypassing active-session guard", self.name)
+                    else:
+                        logger.debug("[%s] Command '/%s' bypassing active-session guard for %s",
+                                     self.name, cmd, session_key)
                     await self._dispatch_inline_reply(event)
             except Exception as e:
                 logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
             return
+        # An active text-fallback prompt must receive its answer while the
+        # originating turn is waiting. Ordinary commands retain precedence.
+        if not cmd and event.allow_gateway_control:
+            try:
+                from gateway.interactive import has_active_text_fallback
+                has_fallback = has_active_text_fallback(session_key)
+            except Exception:
+                has_fallback = False
+            if has_fallback:
+                try:
+                    await self._dispatch_inline_reply(event)
+                except Exception as exc:
+                    logger.error("[%s] Interactive text-fallback dispatch failed (%s)",
+                                 self.name, type(exc).__name__)
+                return
         # Clarify bypass: while blocked on clarify_tool the next message must reach the
         # text-intercept so numeric/exact/"Other" answers resolve it and unblock the agent.
         # Otherwise it lands in _pending_messages as a follow-up turn and the answer is

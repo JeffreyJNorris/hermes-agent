@@ -51,6 +51,10 @@ _OBSERVABLE_METRIC_NAMES = (
     "hermes.cron.scheduler.heartbeat_age_seconds", "hermes.cron.scheduler.last_success_age_seconds",
     "hermes.cron.scheduler.catch_up_occurrences", "hermes.cron.jobs.enabled", "hermes.cron.jobs.running",
     "hermes.cron.jobs.overdue",
+    "hermes_durable_requests", "hermes_durable_actions", "hermes_durable_notifications",
+    "hermes_durable_stale_claims", "hermes_durable_unknown_actions", "hermes_durable_reconciliations",
+    "hermes_durable_oldest_backlog_seconds", "hermes_durable_command_responses",
+    "hermes_durable_delivery_events",
 )
 
 
@@ -154,6 +158,12 @@ def _count(failure_msg: str, module: str, read: Callable[[Any], Any]) -> int:
         return 0
 
 
+def _read_durable_snapshot():
+    from agent.monitoring.durable_health import build_durable_health_snapshot
+
+    return build_durable_health_snapshot()
+
+
 def _read_background_work_count() -> int:
     """Live background/subagent work that ``active_agents`` (foreground turns + in-flight cron + API
     runs) deliberately does NOT include: backgrounded ``delegate_task`` subagents,
@@ -191,6 +201,18 @@ def _read_runtime_snapshot(config: Dict[str, Any]):
         # the exception *type* (the message could carry paths); exc_info stays on DEBUG.
         logger.warning("cron health snapshot unavailable; cron telemetry not exported (error_type=%s)", type(exc).__name__)
         logger.debug("cron health snapshot traceback", exc_info=True)
+    try:
+        durable_snapshot = _read_durable_snapshot()
+    except Exception as exc:
+        logger.warning(
+            "durable health snapshot unavailable; durable telemetry not exported (error_type=%s)",
+            type(exc).__name__,
+        )
+        logger.debug(
+            "durable health snapshot failed (error_type=%s)", type(exc).__name__
+        )
+    else:
+        gateway_snapshot.metrics.extend(durable_snapshot.metrics)
     return gateway_snapshot
 
 

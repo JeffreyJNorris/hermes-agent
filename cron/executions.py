@@ -35,12 +35,13 @@ _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
 
+class ExecutionAlreadyRunning(RuntimeError):
+    """Raised when another live process owns this job's execution slot."""
+
+
 # --- executions ledger --------------------------------------------------------------------------
 
 def _connect() -> sqlite3.Connection:
-    # Late imports: a scheduler daemon that outlives an on-disk upgrade already has the OLD
-    # ``hermes_cli.sqlite_util`` / ``cron.jobs`` cached, so new names must be resolved at call time,
-    # not at import time (the guarantee cron/ledger.py used to carry, see e24c8499).
     from cron.jobs import _ensure_cron_dir
     from hermes_cli.sqlite_util import open_db
 
@@ -57,6 +58,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              id TEXT PRIMARY KEY,
              job_id TEXT NOT NULL,
              source TEXT NOT NULL,
+             trigger_id TEXT,
              process_id TEXT NOT NULL,
              pid INTEGER NOT NULL,
              process_started_at INTEGER,
@@ -77,6 +79,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(
         conn, "executions", "handoff_started_at", "handoff_started_at REAL"
     )
+    add_column_if_missing(conn, "executions", "trigger_id", "trigger_id TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -91,6 +94,22 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
     )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_source_trigger "
+        "ON executions(source, trigger_id) WHERE trigger_id IS NOT NULL"
+    )
+    # Older ledgers may contain abandoned active rows. Reconcile only owners
+    # proven dead before adding the cross-process exclusivity constraint.
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' "
+        "AND name='idx_executions_one_active_per_job'"
+    ).fetchone() is None:
+        _recover_dead_active_unlocked(conn)
+        conn.execute(
+            "CREATE UNIQUE INDEX idx_executions_one_active_per_job "
+            "ON executions(job_id) "
+            "WHERE status IN ('claimed','running')"
+        )
 
 
 @contextmanager
@@ -134,7 +153,7 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     except Exception:
         return True  # fail safe: inability to prove death must not rewrite state
     if started_at is None:
-        return pid == os.getpid()
+        return True
     current = _process_start_time(pid)
     if current is None:
         return True  # cannot compare -> cannot prove death; a misread must not rewrite state
@@ -170,6 +189,52 @@ def _claim_age_seconds(claimed_at: str) -> float:
     return (_hermes_now() - datetime.fromisoformat(claimed_at)).total_seconds()
 
 
+def _recover_dead_active_unlocked(
+    conn: sqlite3.Connection, *, job_id: Optional[str] = None
+) -> int:
+    """Release active slots only when their exact owner is proven dead."""
+    params: tuple[Any, ...] = ()
+    clause = ""
+    if job_id is not None:
+        clause = " AND job_id=?"
+        params = (str(job_id),)
+    rows = conn.execute(
+        "SELECT id, process_id, pid, process_started_at FROM executions "
+        "WHERE status IN ('claimed','running')" + clause,
+        params,
+    ).fetchall()
+    now = _hermes_now().isoformat()
+    changed = 0
+    for row in rows:
+        if row["process_id"] == _PROCESS_ID:
+            continue
+        if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+            continue
+        changed += conn.execute(
+            "UPDATE executions SET status='unknown', finished_at=?, error=? "
+            "WHERE id=? AND status IN ('claimed','running')",
+            (
+                now,
+                "Execution owner exited before a durable terminal state; "
+                "whether side effects ran is unknown.",
+                row["id"],
+            ),
+        ).rowcount
+    return changed
+
+
+def _raise_if_job_active(conn: sqlite3.Connection, job_id: str) -> None:
+    row = conn.execute(
+        "SELECT id FROM executions WHERE job_id=? "
+        "AND status IN ('claimed','running') LIMIT 1",
+        (str(job_id),),
+    ).fetchone()
+    if row is not None:
+        raise ExecutionAlreadyRunning(
+            f"cron job {job_id!r} already has an active execution"
+        )
+
+
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
     conn.execute(
         """DELETE FROM executions WHERE id IN (
@@ -191,14 +256,19 @@ def create_execution(
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
     with _transaction() as conn:
-        conn.execute(
-            """INSERT INTO executions
-               (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at, scheduled_instant)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
-            (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now, canonical_instant(scheduled_instant)),
-        )
+        _recover_dead_active_unlocked(conn, job_id=str(job_id))
+        try:
+            conn.execute(
+                """INSERT INTO executions
+                   (id, job_id, source, process_id, pid, process_started_at,
+                    status, claimed_at, scheduled_instant)
+                   VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
+                (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
+                 _process_start_time(pid), now, canonical_instant(scheduled_instant)),
+            )
+        except sqlite3.IntegrityError:
+            _raise_if_job_active(conn, str(job_id))
+            raise
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)
     return record  # type: ignore[return-value]
@@ -259,6 +329,74 @@ def adopt_claimed_execution(execution_id: str) -> Optional[Dict[str, Any]]:
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)
     return record
+
+
+def create_triggered_execution(
+    job_id: str,
+    *,
+    source: str,
+    trigger_id: str,
+) -> tuple[Dict[str, Any], bool]:
+    """Create one idempotent execution reservation for an external trigger."""
+
+    normalized_trigger = str(trigger_id).strip()
+    if not normalized_trigger:
+        raise ValueError("trigger_id is required")
+    now = _hermes_now().isoformat()
+    execution_id = uuid.uuid4().hex
+    pid = os.getpid()
+    with _transaction() as conn:
+        existing = conn.execute(
+            "SELECT * FROM executions WHERE source=? AND trigger_id=?",
+            (str(source), normalized_trigger),
+        ).fetchone()
+        if existing is not None:
+            return dict(existing), False
+        _recover_dead_active_unlocked(conn, job_id=str(job_id))
+        try:
+            conn.execute(
+                """INSERT INTO executions
+                   (id, job_id, source, trigger_id, process_id, pid,
+                    process_started_at, status, claimed_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'claimed', ?)""",
+                (
+                    execution_id,
+                    str(job_id),
+                    str(source),
+                    normalized_trigger,
+                    _PROCESS_ID,
+                    pid,
+                    _process_start_time(pid),
+                    now,
+                ),
+            )
+        except sqlite3.IntegrityError:
+            existing = conn.execute(
+                "SELECT * FROM executions WHERE source=? AND trigger_id=?",
+                (str(source), normalized_trigger),
+            ).fetchone()
+            if existing is None:
+                _raise_if_job_active(conn, str(job_id))
+                raise
+            return dict(existing), False
+        row = conn.execute(
+            "SELECT * FROM executions WHERE id=?",
+            (execution_id,),
+        ).fetchone()
+    record = dict(row) if row is not None else None
+    _emit_execution_state(record)
+    return record, True  # type: ignore[return-value]
+
+
+def abandon_claimed_execution(execution_id: str) -> bool:
+    """Remove a reservation when executor submission definitely did not occur."""
+
+    with _transaction() as conn:
+        deleted = conn.execute(
+            "DELETE FROM executions WHERE id=? AND status='claimed'",
+            (str(execution_id),),
+        ).rowcount
+    return deleted == 1
 
 
 def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:

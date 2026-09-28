@@ -1805,6 +1805,8 @@ class GatewayShutdownMixin:
         logger.info("Stopping gateway%s...", " for restart" if self._restart_requested else "")
         ctx.started_at = time.monotonic()
         self._running = False
+        from gateway.interactive import clear_all_interactive_prompts
+        clear_all_interactive_prompts()
         self._clear_plugin_message_injector()
         self._draining = True
         self._mark_api_runs_shutdown_requested()

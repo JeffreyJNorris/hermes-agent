@@ -20,6 +20,8 @@ import threading
 import time
 from unittest.mock import patch
 
+import pytest
+
 
 def _wait_until(predicate, timeout=10.0, interval=0.005):
     """Block until ``predicate()`` is truthy or ``timeout`` elapses.
@@ -387,6 +389,8 @@ def test_fire_due_forwards_manual_force_to_store_claim(monkeypatch):
     from cron.scheduler_provider import InProcessCronScheduler
 
     claims = []
+    monkeypatch.setattr("cron.executions.create_execution", lambda *_a, **_kw: {"id": "mock-execution"})
+    monkeypatch.setattr("cron.executions.set_execution_occurrence", lambda *_a: None)
     monkeypatch.setattr(
         jobs,
         "claim_job_for_fire",
@@ -423,6 +427,83 @@ def test_fire_due_lost_claim_does_not_run(monkeypatch):
     assert ran == []
 
 
+
+
+def test_fire_due_loses_to_execution_owned_by_another_process(monkeypatch):
+    from cron.executions import ExecutionAlreadyRunning
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    claims = []
+    monkeypatch.setattr(
+        "cron.jobs.claim_job_for_fire",
+        lambda job_id: claims.append(job_id) or True,
+    )
+    monkeypatch.setattr("cron.jobs.get_job", lambda _job_id: {"id": "j1"})
+    monkeypatch.setattr(
+        "cron.executions.create_execution",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ExecutionAlreadyRunning("external owner")
+        ),
+    )
+    monkeypatch.setattr(
+        "cron.scheduler.run_one_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("busy job must not run")
+        ),
+    )
+
+    assert InProcessCronScheduler().fire_due("j1") is False
+    assert claims == []
+
+
+def test_fire_due_records_failed_attempt_when_pre_dispatch_claim_raises(monkeypatch):
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    finished = []
+    monkeypatch.setattr(
+        "cron.executions.create_execution",
+        lambda *_args, **_kwargs: {"id": "exec-j1"},
+    )
+    monkeypatch.setattr(
+        "cron.executions.finish_execution",
+        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+    )
+
+    monkeypatch.setattr("cron.jobs.claim_job_for_fire", lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("claim failed")))
+    monkeypatch.setattr(
+        "cron.scheduler.run_one_job",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("pre-dispatch failure must not run")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="claim failed"):
+        InProcessCronScheduler().fire_due("j1")
+
+    assert finished[0][0] == "exec-j1"
+    assert finished[0][1]["success"] is False
+
+
+def test_fire_due_records_failed_attempt_when_store_claim_declines(monkeypatch):
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    finished = []
+    monkeypatch.setattr(
+        "cron.executions.create_execution",
+        lambda *_args, **_kwargs: {"id": "exec-j1"},
+    )
+    monkeypatch.setattr(
+        "cron.executions.finish_execution",
+        lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
+    )
+    monkeypatch.setattr("cron.jobs.claim_job_for_fire", lambda *_a, **_kw: False)
+    run = patch("cron.scheduler.run_one_job")
+    with run as mocked_run:
+        assert InProcessCronScheduler().fire_due("j1") is False
+
+    assert finished[0][0] == "exec-j1"
+    assert finished[0][1]["success"] is False
+    mocked_run.assert_not_called()
 
 
 # ── F2a: ticker liveness — survival, heartbeat, honest status (#32612, #32895) ──

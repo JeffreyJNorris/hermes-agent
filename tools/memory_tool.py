@@ -96,6 +96,12 @@ def _gate_or_stage(store: "MemoryStore", summary: str, detail: str, payload: Dic
     if (unmatched := _pin_matched_entries(store, payload)) is not None:
         return unmatched
     record = wa.stage_write(wa.MEMORY, payload, summary=f"{summary}: {detail[:120]}", origin=wa.current_origin())
+    if wa.durable_approval_enabled(wa.MEMORY):
+        receipt = wa.create_memory_durable_approval(record)
+        return json.dumps(
+            {"success": True, "staged": True, "pending_id": record["id"], **receipt},
+            ensure_ascii=False,
+        )
     return json.dumps({"success": True, "staged": True, "pending_id": record["id"], "message": decision.message},
                       ensure_ascii=False)
 

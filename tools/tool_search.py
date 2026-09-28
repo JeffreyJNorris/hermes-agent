@@ -35,6 +35,7 @@ logger = logging.getLogger("tools.tool_search")
 # maps to one gateway request. Describe has no such remote limit.
 _MAX_QUERIES_PER_CALL = 7
 _MAX_DESCRIBE_NAMES_PER_CALL = 10
+_ALWAYS_VISIBLE_BUILTIN_TOOLS = frozenset({"request_decision", "durable_request"})
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,8 @@ def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) 
     user override), OR an MCP tool, OR neither core nor a session-gated GUI surface (i.e. a
     plugin tool). Bridge names never defer."""
     if name in BRIDGE_TOOL_NAMES:
+        return False
+    if name in _ALWAYS_VISIBLE_BUILTIN_TOOLS:
         return False
     if defer_tools is not None and name in defer_tools:
         return True

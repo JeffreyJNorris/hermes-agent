@@ -177,10 +177,15 @@ class CronScheduler(ABC):
     def claim_fire(self, job_id: str, *, force: bool = False, manual: bool = False) -> dict | None:
         """Durably claim one fire + create its audit attempt. Transports call this synchronously
         before acknowledging, then pass the exact snapshot to ``fire_claimed`` off-thread."""
-        from cron.executions import create_execution, finish_execution, set_execution_occurrence
+        from cron.executions import (
+            ExecutionAlreadyRunning, create_execution, finish_execution, set_execution_occurrence,
+        )
         from cron.jobs import claim_job_for_fire
 
-        execution = create_execution(job_id, source=self.name)
+        try:
+            execution = create_execution(job_id, source=self.name)
+        except ExecutionAlreadyRunning:
+            return None
         claim_kwargs = {"return_job": True}
         if force:
             claim_kwargs["force"] = True

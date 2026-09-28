@@ -830,7 +830,7 @@ class TestHealthDetailedEndpoint:
         with patch.object(adapter, "_write_runtime_status_safe"):
             adapter._record_api_metrics({"total_tokens": 9}, 0.02)
         app = _create_app(adapter)
-        with patch("gateway.status.read_runtime_status", return_value={
+        with patch("gateway.readiness._probe_disk", return_value={"status": "ok"}), patch("gateway.status.read_runtime_status", return_value={
             "gateway_state": "running",
             "platforms": {"telegram": {"state": "connected"}},
             "active_agents": 2,
@@ -856,6 +856,7 @@ class TestHealthDetailedEndpoint:
                 # gateway, so running + 2 agents ⇒ busy and drainable.
                 assert data["gateway_busy"] is True
                 assert data["gateway_drainable"] is True
+                assert "durable" in data["readiness"]["checks"]
                 assert isinstance(data["pid"], int)
                 assert "updated_at" in data
 

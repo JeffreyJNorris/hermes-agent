@@ -1,0 +1,57 @@
+"""Per-turn access to the gateway-owned synchronous prompt callback.
+
+The callback is deliberately context-bound. A domain tool outside an active
+gateway request cannot reach provider adapters or prompt registry internals.
+Common typed choice and confirmation helpers live in
+``gateway.interactive_decisions``.
+"""
+
+from __future__ import annotations
+
+from contextvars import ContextVar, Token
+from typing import Callable
+
+from gateway.interactive import InteractivePromptSpec, PromptOutcome
+
+InteractivePromptCallback = Callable[[InteractivePromptSpec], PromptOutcome]
+
+_INTERACTIVE_PROMPT_CALLBACK: ContextVar[InteractivePromptCallback | None] = ContextVar(
+    "hermes_interactive_prompt_callback",
+    default=None,
+)
+
+
+def bind_interactive_prompt_callback(
+    callback: InteractivePromptCallback,
+) -> Token[InteractivePromptCallback | None]:
+    if not callable(callback):
+        raise TypeError("interactive prompt callback must be callable")
+    return _INTERACTIVE_PROMPT_CALLBACK.set(callback)
+
+
+def reset_interactive_prompt_callback(
+    token: Token[InteractivePromptCallback | None],
+) -> None:
+    _INTERACTIVE_PROMPT_CALLBACK.reset(token)
+
+
+def get_interactive_prompt_callback() -> InteractivePromptCallback | None:
+    return _INTERACTIVE_PROMPT_CALLBACK.get()
+
+
+def require_interactive_prompt_callback() -> InteractivePromptCallback:
+    callback = get_interactive_prompt_callback()
+    if callback is None:
+        raise RuntimeError(
+            "interactive prompts are unavailable outside an active gateway request"
+        )
+    return callback
+
+
+__all__ = [
+    "InteractivePromptCallback",
+    "bind_interactive_prompt_callback",
+    "get_interactive_prompt_callback",
+    "require_interactive_prompt_callback",
+    "reset_interactive_prompt_callback",
+]

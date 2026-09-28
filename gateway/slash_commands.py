@@ -35,7 +35,6 @@ from utils import atomic_json_write, is_truthy_value
 
 logger = logging.getLogger("gateway.run")
 
-
 # /rollback result keys -> i18n line for files the safe restore left alone.
 _ROLLBACK_SKIP_LINES = (("skipped_user_edits", "gateway.rollback.kept_user_edits"),
                         ("skipped_oversize", "gateway.rollback.kept_oversize"),
@@ -81,6 +80,17 @@ with open(output_path, "wb") as f:
 with open(exit_code_path, "w", encoding="utf-8") as f:
     f.write(str(rc))
 """.strip()
+
+# Upper bound on the off-loop agent-resource cleanup during a /new or /reset
+# (see _handle_reset_command). A stuck teardown must not block the event loop;
+# past this the reset proceeds and the cleanup is left to finish (or leak) in
+# its worker thread. (#35994)
+_RESET_CLEANUP_TIMEOUT_S = 30.0
+_REQUEST_COMMAND_MAX_LENGTH = 256
+_REQUEST_COMMAND_USAGE = "Usage: /request respond <request-id> <number>"
+_REQUEST_RESPOND_RE = re.compile(
+    r"respond\s+(drq_[A-Za-z0-9_-]+)\s+([1-9][0-9]*)\s*"
+)
 
 
 def _nested_dict(root: dict, *keys: str) -> dict:
@@ -201,6 +211,56 @@ class GatewaySlashCommandsMixin(
         except Exception:
             return None
         return (entry[0] if entry else None) if isinstance(entry, (tuple, list)) else entry or None
+
+    async def _handle_request_command(self, event: MessageEvent) -> str:
+        """Resolve one durable request option from an explicit receipt."""
+        from gateway.durable_requests import (
+            DurableRequestError,
+            DurableResolveStatus,
+            _validate_request_id,
+            resolve_durable_request_command,
+        )
+
+        raw = event.text or ""
+        args = event.get_command_args()
+        if (
+            len(raw) > _REQUEST_COMMAND_MAX_LENGTH
+            or len(args) > _REQUEST_COMMAND_MAX_LENGTH
+        ):
+            return _REQUEST_COMMAND_USAGE
+        match = _REQUEST_RESPOND_RE.fullmatch(args)
+        if match is None:
+            return _REQUEST_COMMAND_USAGE
+        request_id, raw_slot = match.groups()
+        try:
+            _validate_request_id(request_id)
+        except DurableRequestError:
+            return _REQUEST_COMMAND_USAGE
+
+        source = event.source
+        result = await asyncio.to_thread(
+            resolve_durable_request_command,
+            request_id=request_id,
+            option_slots=(int(raw_slot),),
+            platform=source.platform.value,
+            channel_id=str(source.thread_id or source.chat_id),
+            actor_id=source.user_id,
+        )
+        from gateway.durable_operations import record_durable_command_response
+
+        record_durable_command_response(result.status)
+        messages = {
+            DurableResolveStatus.RESOLVED: "Response recorded.",
+            DurableResolveStatus.ALREADY_RESOLVED: "This request has already been answered.",
+            DurableResolveStatus.EXPIRED: "This request has expired.",
+            DurableResolveStatus.CANCELLED: "This request is no longer active.",
+            DurableResolveStatus.INVALID_OPTION: "That option is not valid for this request.",
+            DurableResolveStatus.WRONG_CHANNEL: "This request is unavailable here.",
+            DurableResolveStatus.WRONG_ACTOR: "You cannot answer this request.",
+            DurableResolveStatus.NOT_FOUND: "This request is unavailable.",
+            DurableResolveStatus.COMMAND_DISABLED: "This request cannot be answered by command.",
+        }
+        return messages.get(result.status, "This request is unavailable.")
 
     def _resident_agent_for(self, session_key: str):
         """The live running agent for *session_key*, else the cached one, else None. The pending

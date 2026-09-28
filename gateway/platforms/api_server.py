@@ -2436,10 +2436,23 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # drainable use the same shared contract as /api/status so the two never disagree.
         active_api_runs, process_depth, active_delegations = self._readiness_work_counts()
         from gateway.run import _resolve_gateway_model
+        runner = self.gateway_runner or request.app.get("gateway_runner")
+
+        def _task_alive(name: str) -> bool | None:
+            if runner is None:
+                return None
+            task = getattr(runner, name, None)
+            return task is not None and not task.done()
+
         readiness = collect_runtime_readiness(
-            configured_model=_resolve_gateway_model(), runtime_status=runtime,
-            active_api_runs=active_api_runs, process_completion_queue_depth=process_depth,
-            active_delegations=active_delegations)
+            configured_model=_resolve_gateway_model(),
+            runtime_status=runtime,
+            active_api_runs=active_api_runs,
+            process_completion_queue_depth=process_depth,
+            active_delegations=active_delegations,
+            durable_request_worker_alive=_task_alive("_durable_request_task"),
+            durable_action_worker_alive=_task_alive("_durable_action_task"),
+        )
         return web.json_response({
 "status": readiness["status"], "readiness": readiness, "platform": "hermes-agent",
             "version": _hermes_version(), "gateway_state": gw_state,

@@ -13,6 +13,7 @@ the safety net in _run_agent discards leaked command text.
 """
 
 import asyncio
+import logging
 
 import pytest
 
@@ -154,6 +155,46 @@ class TestCommandBypassActiveSession:
 
 
 
+    @pytest.mark.asyncio
+    async def test_request_busy_log_omits_session_scope(self, caplog):
+        adapter = _make_adapter()
+        chat_id = "sensitive-channel-actor-thread"
+        sk = _session_key(chat_id)
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        with caplog.at_level(logging.DEBUG):
+            await adapter.handle_message(
+                _make_event(
+                    "/request respond drq_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA 1",
+                    chat_id=chat_id,
+                )
+            )
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(
+            message.endswith("Command '/request' bypassing active-session guard")
+            for message in messages
+        )
+        assert all(chat_id not in message for message in messages)
+        assert all(sk not in message for message in messages)
+        assert any("handled:request" in r for r in adapter.sent_responses)
+
+    @pytest.mark.asyncio
+    async def test_unrelated_busy_command_keeps_session_diagnostic(self, caplog):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        with caplog.at_level(logging.DEBUG):
+            await adapter.handle_message(_make_event("/status"))
+
+        assert any(
+            message.endswith(
+                f"Command '/status' bypassing active-session guard for {sk}"
+            )
+            for message in (record.getMessage() for record in caplog.records)
+        )
+
 
 # ---------------------------------------------------------------------------
 # Tests: non-bypass-set commands (no dedicated Level-2 handler) also bypass
@@ -288,4 +329,3 @@ class TestBypassWithBotnameSuffix:
             "/stop@MyHermesBot was queued instead of bypassing"
         )
         assert any("handled:stop" in r for r in adapter.sent_responses)
-

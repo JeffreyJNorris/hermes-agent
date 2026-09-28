@@ -1215,10 +1215,43 @@ class GatewayInboundMixin:
             return None
         _reply = self._hm_update_prompt_reply(event, _quick_key)
         if _reply is None:
+            _reply = self._hm_interactive_text_reply(event, source, _quick_key)
+        if _reply is None:
             _reply = await self._hm_clarify_reply(event, source, _quick_key)
         if _reply is None:
             _reply = await self._hm_slash_confirm_reply(event, _quick_key)
         return _reply
+
+    @staticmethod
+    def _hm_interactive_text_reply(
+        event: "MessageEvent", source: SessionSource, session_key: str
+    ) -> Optional[str]:
+        """Consume only a numeric answer to the session's active text-fallback prompt."""
+        from gateway.interactive import ResolveStatus, resolve_text_fallback_for_session
+
+        try:
+            result = resolve_text_fallback_for_session(
+                session_key=session_key,
+                text=event.text or "",
+                platform=str(source.platform.value),
+                channel_id=str(source.thread_id or source.chat_id or ""),
+                actor_id=str(source.user_id) if source.user_id is not None else None,
+            )
+        except Exception as exc:
+            logger.error("Interactive prompt text interception failed (%s)", type(exc).__name__)
+            return None
+        if result is None:
+            return None
+        return {
+            ResolveStatus.RESOLVED: "",
+            ResolveStatus.INVALID_OPTION: "That selection is not valid. Reply with one of the numbered options.",
+            ResolveStatus.EXPIRED: "That prompt has expired.",
+            ResolveStatus.CANCELLED: "That prompt is no longer active.",
+            ResolveStatus.WRONG_DELIVERY_MODE: "That prompt must be answered using its active controls.",
+            ResolveStatus.NOT_DELIVERED: "That prompt is not ready for a response yet.",
+            ResolveStatus.SCOPE_MISMATCH: "That interaction cannot answer this prompt.",
+            ResolveStatus.ALREADY_RESOLVED: "That prompt was already answered.",
+        }.get(result.status, "That prompt is unknown or no longer available.")
 
     async def _hm_dispatch_idle_commands(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str

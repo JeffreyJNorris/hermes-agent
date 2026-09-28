@@ -2197,6 +2197,7 @@ from gateway.run_goals import GatewayGoalsMixin
 from gateway.run_agent_cache import GatewayAgentCacheMixin
 from gateway.run_profile_reconcile import GatewayProfileReconcileMixin
 from gateway.run_plugin_rewire import GatewayPluginRewireMixin
+from gateway.run_durable import GatewayDurableMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
     _reply_anchor_for_event,
@@ -3062,6 +3063,53 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         from tools.process_registry_notifications import format_process_notification
         return format_process_notification(evt)
 
+    if evt_type == "durable_request_terminal":
+        lines = [
+            "[IMPORTANT: A durable request created by this session reached a terminal state.",
+            f"Request ID: {evt.get('request_id', 'unknown')}",
+        ]
+        if reference := str(evt.get("reference") or "").strip():
+            lines.append(f"Reference: {reference}")
+        lines.extend((
+            f"Status: {evt.get('status', 'unknown')}",
+            f"Title: {evt.get('title', '')}",
+            f"Question: {evt.get('question', '')}",
+        ))
+        if (label := evt.get("selected_label")) is not None:
+            index = evt.get("selected_index")
+            lines.append(f"Selected option: {f'{index}. ' if index is not None else ''}{label}")
+        elif reason := str(evt.get("terminal_reason") or "").strip():
+            lines.append(f"Reason: {reason}")
+        lines.extend((
+            "",
+            "This is persisted user input, not an authorization token. Re-check current "
+            "application state and retain all normal security approval requirements before taking action.]",
+        ))
+        return "\n".join(lines)
+
+    if evt_type == "durable_action_terminal":
+        status = str(evt.get("action_status") or "unknown")
+        decision = {"declined": "rejected", "expired": "expired", "cancelled": "cancelled",
+                    "abandoned": "abandoned"}.get(status, "approved")
+        effect = {
+            "succeeded": "Action was applied.",
+            "already_applied": "The action was already applied; it was not applied again.",
+            "unknown": "The action result is ambiguous and must be inspected before any retry.",
+        }.get(status, "No action was applied.")
+        lines = [
+            "[IMPORTANT: A trusted durable action reached a terminal state.",
+            f"Request ID: {evt.get('request_id', 'unknown')}",
+            f"Action: {evt.get('action_type', 'unknown')}",
+            f"Decision: {decision}",
+            f"Action status: {status}",
+        ]
+        if reason := str(evt.get("outcome_reason") or "").strip():
+            lines.append(f"Reason: {reason}")
+        lines.extend(("", effect,
+            "The durable approval result remains persisted. Do not treat the original selection "
+            "as authorization for a different action.]"))
+        return "\n".join(lines)
+
     return None
 
 
@@ -3387,7 +3435,8 @@ class GatewayRunner(
     GatewayVoiceMixin, GatewayAdapterLifecycleMixin, GatewayTopicThreadsMixin, GatewayTurnMixin,
     GatewayShutdownMixin, GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin,
     GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin,
-    GatewayAgentCacheMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin):
+    GatewayAgentCacheMixin, GatewayProfileReconcileMixin, GatewayPluginRewireMixin,
+    GatewayDurableMixin):
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
 
     # Class-level defaults so partial construction in tests doesn't blow up on attribute access.
@@ -3647,6 +3696,15 @@ class GatewayRunner(
         # Value: (AIAgent, config_signature); LRU cap in _enforce_agent_cache_cap, TTL in expiry watcher.
         self._agent_cache: "OrderedDict[str, tuple]" = OrderedDict()
         self._agent_cache_lock = threading.Lock()
+        self._durable_request_bridges: Dict[str, Any] = {}
+        from hermes_constants import get_default_hermes_root
+        self._durable_request_home = (
+            get_default_hermes_root()
+            if getattr(self.config, "multiplex_profiles", False)
+            else Path(get_hermes_home())
+        )
+        self._durable_request_task: Optional[asyncio.Task] = None
+        self._durable_action_task: Optional[asyncio.Task] = None
         # Launch-time identity of the profile that owns ``self.adapters``; ``_authorization_adapter``
         # compares against this rather than the per-turn ``_active_profile_name()``. A multiplex
         # host's primary map is always the default profile, even when a named profile launched
@@ -4284,6 +4342,7 @@ class GatewayRunner(
             scope_id=str(getattr(context.source, "scope_id", "") or ""),
             parent_chat_id=str(getattr(context.source, "parent_chat_id", "") or ""),
             session_key=context.session_key,
+            session_id=context.session_id,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,

@@ -116,6 +116,33 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
     assert get_session_env("HERMES_SESSION_THREAD_ID") == ""
 
 
+def test_set_session_env_rebinds_physical_session_id_each_turn(monkeypatch):
+    """Cached gateway agents still need their durable origin on later turns."""
+    runner = object.__new__(GatewayRunner)
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    context = SessionContext(
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="approvals",
+            user_id="123456",
+        ),
+        connected_platforms=[],
+        home_channels={},
+        session_key="agent:main:discord:dm:approvals",
+        session_id="20260829_durable_origin",
+    )
+
+    first_tokens = runner._set_session_env(context)
+    assert get_session_env("HERMES_SESSION_ID") == context.session_id
+    runner._clear_session_env(first_tokens)
+
+    second_tokens = runner._set_session_env(context)
+    try:
+        assert get_session_env("HERMES_SESSION_ID") == context.session_id
+    finally:
+        runner._clear_session_env(second_tokens)
+
+
 def test_get_session_env_falls_back_to_os_environ(monkeypatch):
     """get_session_env should fall back to os.environ when contextvar is unset."""
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
@@ -315,4 +342,3 @@ async def test_plugin_slash_command_sees_session_env(monkeypatch):
     assert seen["chat_id"] == "c1"
     # Bound only for the handler call, not leaked past dispatch
     assert get_session_env("HERMES_SESSION_KEY") == ""
-

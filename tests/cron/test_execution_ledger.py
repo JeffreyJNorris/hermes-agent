@@ -9,6 +9,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 
 def _point_ledger(monkeypatch, tmp_path):
     import cron.executions as executions
@@ -42,6 +44,7 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
 def test_execution_can_be_loaded_by_exact_attempt_id(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     first = executions.create_execution("same-job", source="builtin")
+    first = executions.finish_execution(first["id"], success=True)
     second = executions.create_execution("same-job", source="builtin")
 
     assert executions.get_execution(first["id"]) == first
@@ -227,6 +230,25 @@ def test_quick_backup_includes_execution_ledger():
     assert "cron/executions.db" in _QUICK_STATE_FILES
 
 
+def test_execution_ledger_follows_active_profile_home(tmp_path):
+    import cron.executions as executions
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    profile_home = tmp_path / "profiles" / "operations"
+    profile_home.mkdir(parents=True)
+    token = set_hermes_home_override(profile_home)
+    try:
+        record = executions.create_execution("profile-job", source="builtin")
+    finally:
+        reset_hermes_home_override(token)
+
+    assert record["job_id"] == "profile-job"
+    assert (profile_home / "cron" / "executions.db").is_file()
+
+
 def test_failed_execution_keeps_error(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
 
@@ -274,8 +296,10 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
         [
             sys.executable,
             "-c",
-            "import json; from cron.executions import recover_interrupted_executions, list_executions; "
+            "import json; from cron.executions import create_execution, recover_interrupted_executions, list_executions; "
             "print(recover_interrupted_executions()); "
+            "replacement=create_execution('restart-job', source='builtin'); "
+            "print(replacement['id']); "
             "print(json.dumps(list_executions(job_id='restart-job'))) ",
         ],
         cwd=repo,
@@ -286,15 +310,88 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
     )
     lines = recover.stdout.strip().splitlines()
     assert lines[0] == "1"
-    records = json.loads(lines[1])
-    assert len(records) == 1
-    assert records[0]["id"] == execution_id
-    assert records[0]["status"] == "unknown"
-    assert records[0]["finished_at"]
-    assert "restart" in records[0]["error"].lower()
-    # Recovery only classifies the old attempt. It must not manufacture a new
-    # claimed record (which would imply an automatic retry).
-    assert [r["status"] for r in records] == ["unknown"]
+    replacement_id = lines[1]
+    records = json.loads(lines[2])
+    assert len(records) == 2
+    assert [(row["id"], row["status"]) for row in records] == [
+        (replacement_id, "claimed"),
+        (execution_id, "unknown"),
+    ]
+    interrupted = records[1]
+    assert interrupted["finished_at"]
+    assert "restart" in interrupted["error"].lower()
+
+
+def test_live_execution_in_another_process_blocks_durable_reservation(
+    monkeypatch, tmp_path
+):
+    """A CLI-owned run must exclude a gateway-owned continuation."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    repo = Path(__file__).resolve().parents[2]
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(tmp_path)
+    env["PYTHONPATH"] = str(repo)
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; "
+            "from cron.executions import create_execution, mark_execution_running; "
+            "r=create_execution('shared-job', source='direct'); "
+            "mark_execution_running(r['id']); print('ready', flush=True); "
+            "time.sleep(30)",
+        ],
+        cwd=repo,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        assert holder.stdout is not None
+        assert holder.stdout.readline().strip() == "ready"
+        busy_error = getattr(executions, "ExecutionAlreadyRunning", RuntimeError)
+        with pytest.raises(busy_error):
+            executions.create_triggered_execution(
+                "shared-job",
+                source="durable_request",
+                trigger_id="drq_cross_process",
+            )
+        assert len(executions.list_executions(job_id="shared-job")) == 1
+    finally:
+        holder.terminate()
+        holder.wait(timeout=10)
+
+
+def test_live_foreign_pid_without_start_identity_remains_live(monkeypatch, tmp_path):
+    """Restricted process metadata must fail closed, not permit overlap."""
+    executions = _point_ledger(monkeypatch, tmp_path)
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        with executions._transaction() as conn:
+            conn.execute(
+                """INSERT INTO executions
+                   (id, job_id, source, process_id, pid, process_started_at,
+                    status, claimed_at)
+                   VALUES ('foreign-live', 'shared-job', 'direct', 'foreign',
+                           ?, NULL, 'running', '2026-08-25T00:00:00+00:00')""",
+                (holder.pid,),
+            )
+
+        with pytest.raises(executions.ExecutionAlreadyRunning):
+            executions.create_triggered_execution(
+                "shared-job",
+                source="durable_request",
+                trigger_id="drq_null_start_identity",
+            )
+
+        rows = executions.list_executions(job_id="shared-job")
+        assert [(row["id"], row["status"]) for row in rows] == [
+            ("foreign-live", "running")
+        ]
+    finally:
+        holder.terminate()
+        holder.wait(timeout=10)
 
 
 def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch):
@@ -325,6 +422,28 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         })
     ]
     assert "submit-fail" not in scheduler.get_running_job_ids()
+
+
+def test_builtin_tick_skips_job_owned_by_another_process(monkeypatch):
+    import cron.scheduler as scheduler
+
+    monkeypatch.setattr(
+        scheduler,
+        "create_execution",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            scheduler.ExecutionAlreadyRunning("external owner")
+        ),
+    )
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "busy-job"}])
+    monkeypatch.setattr(scheduler, "advance_next_runs", lambda _ids: 0)
+    monkeypatch.setattr(
+        scheduler,
+        "_get_parallel_pool",
+        lambda _workers: object(),
+    )
+
+    assert scheduler.tick(verbose=False, sync=False) == 0
+    assert "busy-job" not in scheduler.get_running_job_ids()
 
 
 def test_run_one_job_records_running_then_terminal(monkeypatch):
@@ -490,3 +609,121 @@ def test_job_listing_exposes_latest_execution(monkeypatch, tmp_path):
     listed = jobs.list_jobs(include_disabled=True)
     assert listed[0]["latest_execution"]["id"] == record["id"]
     assert listed[0]["latest_execution"]["status"] == "running"
+
+
+def test_triggered_execution_is_idempotent_by_source_and_trigger(
+    monkeypatch,
+    tmp_path,
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    first, first_created = executions.create_triggered_execution(
+        "job-1",
+        source="durable_request",
+        trigger_id="drq_1",
+    )
+    second, second_created = executions.create_triggered_execution(
+        "job-1",
+        source="durable_request",
+        trigger_id="drq_1",
+    )
+    executions.finish_execution(first["id"], success=True)
+    independent, independent_created = executions.create_triggered_execution(
+        "job-1",
+        source="manual",
+        trigger_id="drq_1",
+    )
+
+    assert first_created is True
+    assert second_created is False
+    assert second["id"] == first["id"]
+    assert first["trigger_id"] == "drq_1"
+    assert independent_created is True
+    assert independent["id"] != first["id"]
+
+
+def test_durable_action_trigger_has_its_own_idempotency_scope(
+    monkeypatch,
+    tmp_path,
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    action, created = executions.create_triggered_execution(
+        "job-1", source="durable_action", trigger_id="drq_1"
+    )
+    replay, replay_created = executions.create_triggered_execution(
+        "job-1", source="durable_action", trigger_id="drq_1"
+    )
+
+    assert created is True
+    assert replay_created is False
+    assert replay["id"] == action["id"]
+
+
+def test_abandon_triggered_reservation_only_removes_claimed_attempt(
+    monkeypatch,
+    tmp_path,
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    claimed, _ = executions.create_triggered_execution(
+        "job-1",
+        source="durable_request",
+        trigger_id="drq_claimed",
+    )
+    assert executions.abandon_claimed_execution(claimed["id"]) is True
+    running, _ = executions.create_triggered_execution(
+        "job-1",
+        source="durable_request",
+        trigger_id="drq_running",
+    )
+    executions.mark_execution_running(running["id"])
+
+    assert executions.abandon_claimed_execution(claimed["id"]) is False
+    assert executions.abandon_claimed_execution(running["id"]) is False
+    assert executions.latest_execution("job-1")["id"] == running["id"]
+
+
+def test_existing_execution_ledger_adds_trigger_column_and_unique_index(
+    monkeypatch,
+    tmp_path,
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
+    conn = sqlite3.connect(executions.EXECUTIONS_FILE)
+    try:
+        conn.execute(
+            """CREATE TABLE executions (
+                 id TEXT PRIMARY KEY,
+                 job_id TEXT NOT NULL,
+                 source TEXT NOT NULL,
+                 process_id TEXT NOT NULL,
+                 pid INTEGER NOT NULL,
+                 process_started_at INTEGER,
+                 status TEXT NOT NULL,
+                 claimed_at TEXT NOT NULL,
+                 started_at TEXT,
+                 finished_at TEXT,
+                 error TEXT
+               )"""
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    row, created = executions.create_triggered_execution(
+        "job-1",
+        source="durable_request",
+        trigger_id="drq_migrated",
+    )
+
+    assert created is True
+    assert row["trigger_id"] == "drq_migrated"
+    conn = sqlite3.connect(executions.EXECUTIONS_FILE)
+    try:
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(executions)")}
+        indexes = {r[1] for r in conn.execute("PRAGMA index_list(executions)")}
+    finally:
+        conn.close()
+    assert "trigger_id" in columns
+    assert "idx_executions_source_trigger" in indexes
+    assert "idx_executions_one_active_per_job" in indexes

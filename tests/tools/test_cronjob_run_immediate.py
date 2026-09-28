@@ -17,11 +17,22 @@ import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
+from cron.executions import ExecutionAlreadyRunning
 from tools.cronjob_tools import cronjob, _execute_job_now
 from tools.environments.base import set_activity_callback
 
 _JOB = {"id": "job-run-1", "name": "manual run", "prompt": "hi",
         "schedule": {"kind": "cron", "expr": "0 9 * * *"}}
+
+
+@pytest.fixture(autouse=True)
+def _completed_execution_stub(monkeypatch):
+    """Mock the ledger alongside the mocked run body; it normally finishes the row."""
+    monkeypatch.setattr("cron.executions.create_execution", lambda *_a, **_kw: {"id": "mock-execution"})
+    monkeypatch.setattr("cron.executions.get_execution", lambda _id: {"status": "completed"})
+    monkeypatch.setattr("cron.executions.abandon_claimed_execution", lambda _id: True)
 
 class TestCronjobRunExecutesImmediately:
     def test_run_action_claims_and_fires_via_run_one_job(self):
@@ -127,7 +138,7 @@ class TestCronjobRunExecutesImmediately:
 
         assert res["success"] is True
         m_run.assert_called_once_with(
-            {**_JOB, "fire_claim": {"by": "manual-owner"}},
+            {**_JOB, "fire_claim": {"by": "manual-owner"}, "execution_id": "mock-execution"},
             adapters=adapters,
             loop=gateway_loop,
             extra_prompt=None,
@@ -145,7 +156,7 @@ class TestCronjobRunExecutesImmediately:
 
         assert res["success"] is True
         m_run.assert_called_once_with(
-            {**_JOB, "fire_claim": {"by": "manual-owner"}},
+            {**_JOB, "fire_claim": {"by": "manual-owner"}, "execution_id": "mock-execution"},
             adapters=None,
             loop=None,
             extra_prompt=None,
@@ -168,6 +179,27 @@ class TestCronjobRunExecutesImmediately:
             "boom",
             expected_fire_owner="manual-owner",
         )
+
+    def test_execute_job_now_does_not_mutate_job_when_execution_is_busy(self):
+        """A losing manual contender must not claim or mark the active job."""
+        with patch(
+            "cron.executions.create_execution",
+            side_effect=ExecutionAlreadyRunning("active owner"),
+        ), patch(
+            "tools.cronjob_tools.claim_job_for_fire"
+        ) as m_claim, patch(
+            "tools.cronjob_tools.mark_job_run"
+        ) as m_mark, patch(
+            "cron.scheduler.run_one_job"
+        ) as m_run:
+            res = _execute_job_now(dict(_JOB))
+
+        assert res["claimed"] is False
+        assert res["success"] is False
+        assert "already running" in res["error"].lower()
+        m_claim.assert_not_called()
+        m_mark.assert_not_called()
+        m_run.assert_not_called()
 
     def test_execute_job_now_heartbeats_while_job_runs(self):
         """A manual run ticks the caller's activity tracker while the job

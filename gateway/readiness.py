@@ -94,9 +94,61 @@ def _probe_session_store(runtime_status: dict[str, Any], state_db_probe: dict[st
     return _check("ok" if state_db_probe.get("status") == "ok" else "unavailable")
 
 
+def _probe_durable(
+    home: Path,
+    *,
+    request_worker_alive: bool | None,
+    action_worker_alive: bool | None,
+    now: float | None,
+) -> dict[str, Any]:
+    from gateway.durable_operations import DurableOperationsStore
+
+    config: dict[str, Any] = {}
+    try:
+        loaded = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            config = loaded
+    except Exception:
+        pass
+    request_config = config.get("durable_requests")
+    action_config = config.get("durable_approvals")
+    requests_enabled = (
+        isinstance(request_config, dict) and request_config.get("enabled") is True
+    )
+    actions_enabled = (
+        isinstance(action_config, dict) and action_config.get("enabled") is True
+    )
+    allowed_actions = (
+        action_config.get("allowed_actions", ()) if isinstance(action_config, dict) else ()
+    )
+    result = DurableOperationsStore(
+        home / "state.db", reconcile_schema=False
+    ).check_health(
+        requests_enabled=requests_enabled,
+        actions_enabled=actions_enabled,
+        allowed_actions=allowed_actions,
+        request_worker_alive=request_worker_alive,
+        action_worker_alive=action_worker_alive,
+        now=now,
+    )
+    return _check(
+        "ok" if result.severity == "ok" else "degraded",
+        severity=result.severity,
+        code=result.code,
+        counts=dict(result.counts),
+    )
+
+
 def collect_runtime_readiness(
-    *, configured_model: str, runtime_status: dict[str, Any] | None, active_api_runs: int = 0,
-    process_completion_queue_depth: int = 0, active_delegations: int = 0,
+    *,
+    configured_model: str,
+    runtime_status: dict[str, Any] | None,
+    active_api_runs: int = 0,
+    process_completion_queue_depth: int = 0,
+    active_delegations: int = 0,
+    durable_request_worker_alive: bool | None = None,
+    durable_action_worker_alive: bool | None = None,
+    now: float | None = None,
 ) -> dict[str, Any]:
     """Bounded readiness diagnostics, no runtime mutation.  Even authenticated, probes
     expose status and counts only: never config values, credentials, paths, payloads."""
@@ -110,6 +162,12 @@ def collect_runtime_readiness(
         "model": _check("ok" if str(configured_model or "").strip() else "degraded"),
         "disk": _probe_disk(home),
         "gateway": _probe_gateway(runtime),
+        "durable": _probe_durable(
+            home,
+            request_worker_alive=durable_request_worker_alive,
+            action_worker_alive=durable_action_worker_alive,
+            now=now,
+        ),
         "background_queues": _check(
             "ok", active_api_runs=max(0, int(active_api_runs)),
             process_completions=max(0, int(process_completion_queue_depth)),

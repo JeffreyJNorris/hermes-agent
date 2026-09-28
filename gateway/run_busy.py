@@ -883,7 +883,7 @@ class GatewayBusySessionMixin:
     _COMMAND_HANDLER_ALIASES = {"bg": "_handle_background_command", "sethome": "_handle_set_home_command"}
     # Ordinary slash handlers shared by idle and busy dispatch.
     _PLAIN_COMMANDS = (
-        "status", "context", "restart", "approve", "deny", "pause", "agents", "bg", "btw",
+        "status", "context", "restart", "approve", "deny", "request", "pause", "agents", "bg", "btw",
         "kanban", "subgoal", "heartbeat", "busy", "yolo", "verbose", "footer", "help",
         "commands", "profile", "login", "update", "version",
     )
@@ -1104,8 +1104,8 @@ class GatewayBusySessionMixin:
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
         logger.info(
-            "Slash command /%s denied for %s:%s (not admin, not in user_allowed_commands)",
-            canonical_cmd, source.platform.value if source.platform else "?", source.user_id,
+            "Slash command /%s denied (platform=%s, reason=not_authorized)",
+            canonical_cmd, source.platform.value if source.platform else "?",
         )
         allowed_preview = sorted(policy.user_allowed_commands)
         if allowed_preview:

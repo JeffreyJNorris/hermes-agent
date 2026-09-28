@@ -55,6 +55,10 @@ _SESSION_ASYNC_DELIVERY = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_U
 # Request-local proof that the client resumes SessionDB history. No env fallback
 # or child-process export: a bound id alone cannot authorize detached delivery.
 _SESSION_HISTORY_DELIVERY = ContextVar("HERMES_SESSION_HISTORY_DELIVERY", default=_UNSET)
+# Stable scheduler-owned job identifier. Durable request references use this
+# trusted value to make repeated cron runs idempotent without letting the model
+# choose another job's origin scope.
+_CRON_JOB_ID: ContextVar = ContextVar("HERMES_CRON_JOB_ID", default=_UNSET)
 
 # Cron auto-delivery vars, set per-job in run_job() so concurrent jobs don't clobber.
 _CRON_AUTO_DELIVER_PLATFORM = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
@@ -65,9 +69,8 @@ _CRON_AUTO_DELIVER_THREAD_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", 
 # absent: it is a bool capability, read via async_delivery_supported).
 _VAR_MAP = {var.name: var for var in (
     *_SESSION_VARS, _CRON_AUTO_DELIVER_PLATFORM, _CRON_AUTO_DELIVER_CHAT_ID,
-    _CRON_AUTO_DELIVER_THREAD_ID,
+    _CRON_AUTO_DELIVER_THREAD_ID, _CRON_JOB_ID,
 )}
-
 
 def _runtime_cwd(func: str, *args: Any) -> None:
     """Best-effort call of ``agent.runtime_cwd.<func>``; import/runtime failures are ignored."""
@@ -120,6 +123,7 @@ def set_session_vars(
     browser_control_transport_family: str = "", cwd: str = "", async_delivery: bool = True,
     ui_session_id: str = "", cron_session: Any = _UNSET, parent_chat_id: str = "",
     session_history_delivery: str | None = None,
+    cron_job_id: Any = _UNSET,
 ) -> list:
     """Set all session context variables and return reset tokens.  Call
     ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
@@ -129,9 +133,11 @@ def set_session_vars(
     ``"1"`` (audited producers — explicit session-id header, native API sessions, /v1/runs) or
     ``""`` / omitted (default-deny, #98619).  ``None`` leaves the var at ``_UNSET`` ("never
     declared"), which ``session_history_delivery_supported()`` treats as NOT capable — an omitted declaration
-    cannot grant wake authority."""
+    cannot grant wake authority. ``cron_job_id`` is the scheduler-owned stable job id."""
     global _session_context_engaged
     _session_context_engaged = True
+    if cron_job_id is _UNSET and cron_session is not _UNSET:
+        cron_job_id = ""
     values = (
         platform, source, chat_id, chat_type, chat_name, thread_id, user_id, user_id_alt,
         user_name, scope_id, session_key, session_id, ui_session_id, message_id, profile,
@@ -140,6 +146,7 @@ def set_session_vars(
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     tokens.append(_SESSION_HISTORY_DELIVERY.set(_UNSET if session_history_delivery is None else session_history_delivery))
+    tokens.append(_CRON_JOB_ID.set(cron_job_id))
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
 
@@ -152,6 +159,7 @@ def clear_session_vars(tokens: list) -> None:
     declared nothing, and an undeclared capability FAILS CLOSED (#98619)."""
     for var in _SESSION_VARS:
         var.set("")
+    _CRON_JOB_ID.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
     _runtime_cwd("clear_session_cwd")

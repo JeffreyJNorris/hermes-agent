@@ -20,7 +20,10 @@ _env_path = get_env_path()
 load_hermes_dotenv(hermes_home=_env_path.parent, project_env=PROJECT_ROOT / ".env")
 
 from hermes_cli.colors import Colors, color
-from hermes_cli.doctor_report import Finding, _section, check_bool, check_info, doctor_check, warn_on_error
+from hermes_cli.doctor_report import (
+    Finding, _section, check_bool, check_fail, check_info, check_ok, check_warn,
+    doctor_check, warn_on_error,
+)
 from hermes_cli.doctor_connectivity import _has_healthy_oauth_fallback_for_apikey_provider, build_probes, run_probes
 from hermes_cli.doctor_tools import _safe_which
 
@@ -105,6 +108,33 @@ def _check_api_connectivity(should_fix: bool, f: Finding) -> None:
             f.issues.extend(r.issues)
 
 
+def _check_durable_operations(issues: list[str]) -> None:
+    """Render the read-only durable health result without attempting repair."""
+    _section("Durable operations")
+    try:
+        from hermes_cli.durable import durable_health_result
+
+        result = durable_health_result()
+    except Exception as exc:
+        check_fail("Durable health unavailable", f"({type(exc).__name__})")
+        issues.append("Inspect durable operations: hermes durable doctor")
+        return
+    detail = result.code.replace("_", " ")
+    if result.severity == "ok":
+        check_ok("Durable operations healthy", f"({detail})")
+        return
+    if result.severity == "warning":
+        check_warn("Durable operations degraded", f"({detail})")
+    else:
+        check_fail("Durable operations unhealthy", f"({detail})")
+    issues.append("Inspect durable operations: hermes durable doctor")
+
+
+@doctor_check()
+def _check_durable_operations_finding(should_fix: bool, f: Finding) -> None:
+    _check_durable_operations(f.manual_issues)
+
+
 # Ordered (section title, check). None title = check prints its own header (or none); order is user-visible.
 DOCTOR_CHECKS = (
     ('Security Advisories', _check_security_advisories), ('MCP Server Security', _check_mcp_security),
@@ -119,6 +149,7 @@ DOCTOR_CHECKS = (
     (None, _check_npm_audit), ('API Connectivity', _check_api_connectivity),
     ('Tool Availability', _check_tool_availability), ('Skills Hub', _check_skills_hub),
     ('Memory Provider', _check_memory_provider), (None, _check_profiles),
+    (None, _check_durable_operations_finding),
 )
 
 

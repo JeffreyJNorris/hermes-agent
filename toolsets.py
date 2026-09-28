@@ -157,6 +157,8 @@ TOOLSETS = {
         role="setup",
     ),
     "clarify": _ts("Ask the user clarifying questions (multiple-choice or open-ended)", ["clarify"]),
+    "decision": _ts("Request one closed finite-choice decision from the active user", ["request_decision"]),
+    "durable_request": _ts("Post and inspect persisted finite-choice requests", ["durable_request"]),
     "code_execution": _ts("Run Python scripts that call tools programmatically (reduces LLM round trips)", ["execute_code"]),
     "delegation": _ts("Spawn subagents with isolated context for complex subtasks", ["delegate_task"]),
     "homeassistant": _ts("Home Assistant smart home control and monitoring", _HA_TOOLS),
@@ -213,12 +215,12 @@ TOOLSETS = {
 
     # Mirrors hermes-cli; `hermes tools` platform config filters it down and
     # _get_platform_tools() drops _DEFAULT_OFF_TOOLSETS unless user-enabled.
-    "hermes-cron": _bundle("Default cron toolset - same core tools as hermes-cli; gated by `hermes tools`"),
+    "hermes-cron": _bundle("Default cron toolset - same core tools as hermes-cli; gated by `hermes tools`", ["durable_request"]),
     "hermes-telegram": _bundle("Telegram bot toolset - full access for personal use (terminal has safety checks)"),
     "hermes-discord": _bundle(
         "Discord bot toolset - full access (terminal has safety checks via dangerous "
         "command approval)",
-        ["discord", "discord_admin"],
+        ["request_decision", "durable_request", "discord", "discord_admin"],
     ),
     "hermes-whatsapp": _bundle("WhatsApp bot toolset - similar to Telegram (personal messaging, more trusted)"),
     "hermes-slack": _bundle("Slack bot toolset - full access for workspace use (terminal has safety checks)"),
