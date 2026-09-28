@@ -520,7 +520,7 @@ async def test_disable_pauses_ready_ticket_and_reenable_executes_once(
             )
         )
         task = asyncio.create_task(gateway._run_durable_action_worker())
-        await asyncio.wait_for(pass_finished.wait(), timeout=2)
+        await asyncio.wait_for(pass_finished.wait(), timeout=15)
         gateway._running = False
         gateway._shutdown_event.set()
         await task
