@@ -106,6 +106,77 @@ class TestEditMessageHappyPath:
         assert sends == []  # no continuations for a short edit
 
 
+class TestThreadEdits:
+    @staticmethod
+    def wire_thread(adapter, cached):
+        message = SimpleNamespace(id=42, edit=AsyncMock(), delete=AsyncMock())
+        thread = SimpleNamespace(
+            id=777,
+            get_partial_message=MagicMock(return_value=message),
+            send=AsyncMock(return_value=SimpleNamespace(id=9001)),
+        )
+        parent = SimpleNamespace(
+            id=555,
+            get_partial_message=MagicMock(return_value=SimpleNamespace(edit=AsyncMock())),
+            send=AsyncMock(return_value=SimpleNamespace(id=9010)),
+        )
+        adapter._client = SimpleNamespace(
+            get_channel=MagicMock(side_effect=lambda target: (
+                thread if target == 777 and cached else parent if target == 555 else None
+            )),
+            fetch_channel=AsyncMock(return_value=thread),
+        )
+        return thread, parent, message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cached", [True, False])
+    async def test_thread_metadata_routes_edit_to_the_sent_message_channel(self, cached):
+        adapter = _make_adapter()
+        thread, parent, message = self.wire_thread(adapter, cached)
+
+        result = await adapter.edit_message(
+            "555", "42", "Working", metadata={"thread_id": "777"},
+        )
+
+        assert result.success is True
+        adapter._client.get_channel.assert_called_once_with(777)
+        thread.get_partial_message.assert_called_once_with(42)
+        message.edit.assert_awaited_once_with(content="Working")
+        parent.get_partial_message.assert_not_called()
+        if cached:
+            adapter._client.fetch_channel.assert_not_awaited()
+        else:
+            adapter._client.fetch_channel.assert_awaited_once_with(777)
+
+    @pytest.mark.asyncio
+    async def test_thread_preview_is_cleared_when_actual_thread_message_is_deleted(self):
+        adapter = _make_adapter()
+        thread, parent, message = self.wire_thread(adapter, True)
+        metadata = {"thread_id": "777"}
+
+        await adapter.edit_message("555", "42", "x" * 3000, metadata=metadata)
+        await adapter.edit_message("555", "42", "x" * 3500, metadata=metadata)
+
+        assert message.edit.await_count == 1
+        assert ("777", "42") in adapter._last_overflow_preview
+        assert await adapter.delete_message("777", "42") is True
+        assert adapter._last_overflow_preview == {}
+
+    @pytest.mark.asyncio
+    async def test_final_overflow_continuations_stay_in_the_thread(self):
+        adapter = _make_adapter()
+        thread, parent, message = self.wire_thread(adapter, True)
+
+        result = await adapter.edit_message(
+            "555", "42", "x" * 3000, finalize=True, metadata={"thread_id": "777"},
+        )
+
+        assert result.success is True
+        assert result.continuation_message_ids
+        assert thread.send.await_count > 0
+        parent.send.assert_not_awaited()
+
+
 # --------------------------------------------------------------------------- #
 # Mid-stream overflow — TRUNCATE, never split (the #48648 lesson)
 # --------------------------------------------------------------------------- #

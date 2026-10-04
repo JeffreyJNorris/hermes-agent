@@ -32,7 +32,7 @@ async def _fire_post_delivery_cb(cb):
     result = cb()
     if _inspect.isawaitable(result):
         await result
-from gateway.platforms.base import BasePlatformAdapter, SendResult
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.session import SessionSource
 
 
@@ -263,6 +263,8 @@ async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
 
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="-1001")
     session_key = "agent:main:telegram:group:-1001"
+    delivery_event = asyncio.Event()
+    adapter._active_sessions[session_key] = delivery_event
 
     pre_existing_fired = []
 
@@ -285,6 +287,7 @@ async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
     assert result["final_response"] == "done"
     cb = adapter.pop_post_delivery_callback(session_key)
     assert callable(cb)
+    delivery_event._hermes_delivery_outcome = (None, True)
     await _fire_post_delivery_cb(cb)
     for _ in range(20):
         await asyncio.sleep(0.01)
@@ -295,3 +298,92 @@ async def test_cleanup_chains_with_existing_callback(monkeypatch, tmp_path):
     # deletes at least one progress bubble.
     assert pre_existing_fired == [True]
     assert len(adapter.deleted) >= 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery_ok", [True, False])
+async def test_status_cleanup_follows_real_final_delivery(monkeypatch, tmp_path, delivery_ok):
+    """Load real temp config, run the gateway, and deliver through the base adapter."""
+    class StatusDeliveryAdapter(CleanupCaptureAdapter):
+        def __init__(self):
+            super().__init__(Platform.DISCORD)
+            self.deleted_event = asyncio.Event()
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            result = await super().send(chat_id, content, reply_to, metadata)
+            if content.endswith("done") and not delivery_ok:
+                return SendResult(success=False, error="Final delivery rejected")
+            return result
+
+        async def delete_message(self, chat_id, message_id):
+            result = await super().delete_message(chat_id, message_id)
+            self.deleted_event.set()
+            return result
+
+    from gateway import run
+    real_loader = run._load_gateway_config
+    adapter = StatusDeliveryAdapter()
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, ProgressAgent, cleanup_on=True)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", real_loader)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "display:\n  platforms:\n    discord:\n      tool_progress: status\n"
+        "      cleanup_progress: true\n      interim_assistant_messages: false\n",
+        encoding="utf-8",
+    )
+    source = SessionSource(platform=Platform.DISCORD, chat_id="123", thread_id="456")
+    session_key = "agent:main:discord:thread:456"
+    responses = []
+
+    async def handler(event):
+        result = await runner._run_agent(
+            message=event.text, context_prompt="", history=[], source=source,
+            session_id="status-session", session_key=session_key,
+        )
+        responses.append(result)
+        return result["final_response"]
+
+    adapter.set_message_handler(handler)
+    event = MessageEvent(text="hello", source=source, message_id="789")
+    await adapter._process_message_background(event, session_key)
+
+    assert responses[0]["final_response"] == "done"
+    progress = [item for item in adapter.sent if item["metadata"].get("non_conversational")]
+    assert len(progress) == 1
+    assert all("\n" not in item["content"] for item in progress + adapter.edits)
+    assert progress[0]["metadata"]["thread_id"] == "456"
+    if delivery_ok:
+        await asyncio.wait_for(adapter.deleted_event.wait(), 2)
+        assert adapter.deleted == [{"chat_id": "456", "message_id": progress[0]["message_id"]}]
+    else:
+        assert adapter.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_failed_agent_preserves_status(monkeypatch, tmp_path):
+    adapter = CleanupCaptureAdapter(Platform.DISCORD)
+    runner = _make_runner(adapter)
+    gateway_run = _install_fakes(monkeypatch, FailingAgent, cleanup_on=True)
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {
+        "display": {"platforms": {"discord": {"tool_progress": "status", "cleanup_progress": True}}},
+    })
+    source = SessionSource(platform=Platform.DISCORD, chat_id="123")
+    session_key = "agent:main:discord:channel:123"
+    delivery_event = asyncio.Event()
+    delivery_event._hermes_delivery_outcome = (None, True)
+    adapter._active_sessions[session_key] = delivery_event
+
+    result = await runner._run_agent(
+        message="hello", context_prompt="", history=[], source=source,
+        session_id="failed-status-session", session_key=session_key,
+    )
+
+    assert result["failed"] is True
+    assert len(adapter.sent) == 1
+    callback = adapter.pop_post_delivery_callback(session_key)
+    if callback is not None:
+        await _fire_post_delivery_cb(callback)
+    assert adapter.deleted == []

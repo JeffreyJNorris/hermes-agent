@@ -54,7 +54,8 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "busy_steer_ack_enabled": True,
     # When true, delete tool-progress / "⏳ Working — N min" / status bubbles
     # after the final response lands on platforms that support message
-    # deletion (e.g. Telegram). Off by default — progress is still shown
+    # deletion (e.g. Telegram and Discord). Off globally; Discord opts in.
+    # Progress is still shown
     # live, just cleaned up after success so the chat doesn't fill up with
     # stale breadcrumbs. Failed runs leave bubbles in place as breadcrumbs.
     "cleanup_progress": False,
@@ -135,7 +136,12 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # Discord has a native "subtext" primitive (-# small grey text) that reads
     # as metadata rather than content, so reasoning summaries default to it
     # here instead of the fenced code block used elsewhere.
-    "discord":     {**_TIER_HIGH, "reasoning_style": "subtext"},
+    "discord":     {
+        **_TIER_HIGH,
+        "tool_progress": "status",
+        "cleanup_progress": True,
+        "reasoning_style": "subtext",
+    },
 
     # Tier 2 — edit support, often customer/workspace channels
     # Slack: tool_progress off by default — Bolt posts cannot be edited like CLI;
@@ -265,7 +271,7 @@ def _normalise(setting: str, value: Any) -> Any:
             return "off"
         if val in {"true", "1", "yes", "on"}:
             return "all"
-        return val if val in {"off", "new", "all", "verbose", "log"} else "all"
+        return val if val in {"off", "status", "new", "all", "verbose", "log"} else "all"
     if setting in {
         "show_reasoning",
         "streaming",

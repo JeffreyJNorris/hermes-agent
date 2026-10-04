@@ -552,25 +552,34 @@ See the [Session Model](#session-model-in-discord) section above for the full im
 
 #### `display.tool_progress`
 
-**Type:** string — **Default:** `"all"` — **Values:** `off`, `new`, `all`, `verbose`
+**Type:** string — **Default (Discord):** `"status"` — **Values:** `off`, `status`, `new`, `all`, `verbose`, `log`
 
-Controls whether the bot sends progress messages in the chat while processing (e.g., "Reading file...", "Running terminal command..."). This is a global gateway setting that applies to all platforms.
+Discord defaults to one editable plain-text activity line (e.g., "Reading file" or "Searching files"). Each update replaces the previous activity, without emojis, arguments, paths, or call counters. The line is deleted after the final response is successfully delivered; failed runs keep it for context.
+
+Set this per platform to select Discord's behavior. Explicit global or platform settings override the built-in default, so existing `all` or `new` configurations retain their mode:
 
 ```yaml
 display:
-  tool_progress: "all"    # off | new | all | verbose
+  platforms:
+    discord:
+      tool_progress: status
+      cleanup_progress: true  # Discord default; false keeps progress after success
 ```
 
 - `off` — no progress messages
-- `new` — only show the first tool call per turn
+- `status` — one editable line showing the latest activity (gateway-only); ignores `tool_progress_grouping`
+- `new` — show an update when the tool changes
 - `all` — show all tool calls (truncated to 40 characters in gateway messages)
 - `verbose` — show full tool call details (can produce long messages)
+- `log` — no progress messages; tool calls are written to `~/.hermes/logs/tool_calls.log`
+
+Natural-language assistant updates are controlled separately by `interim_assistant_messages`.
 
 #### `display.tool_progress_command`
 
 **Type:** boolean — **Default:** `false`
 
-When enabled, makes the `/verbose` slash command available in the gateway, letting you cycle through tool progress modes (`off → new → all → verbose → off`) without editing config.yaml.
+When enabled, makes the `/verbose` slash command available in the gateway, letting you cycle through tool progress modes (`off → status → new → all → verbose → log → off`) without editing config.yaml. The selection is saved for the current platform. The CLI's mode cycle does not include `status`.
 
 ```yaml
 display:
@@ -921,5 +930,4 @@ Leave `everyone` and `roles` at `false` unless you know exactly why you need the
 :::
 
 For more information on securing your Hermes Agent deployment, see the [Security Guide](../security.md).
-
 

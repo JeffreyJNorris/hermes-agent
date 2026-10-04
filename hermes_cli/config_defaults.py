@@ -1198,6 +1198,9 @@ DEFAULT_CONFIG = {
         # only visible when show_reasoning is enabled.
         "show_commentary": True,
         "tool_progress_command": False,  # Enable /verbose command in messaging gateway
+        # Gateway tool_progress also accepts "status": one editable plain-text
+        # activity line, without arguments. Discord defaults to "status" and
+        # cleanup_progress: true; explicit global/per-platform settings win.
         # NOTE: display.tool_progress_overrides is deprecated and no longer
         # seeded here — use display.platforms. A user-set value is still
         # honored at runtime (gateway display_config back-compat read) and
@@ -1221,7 +1224,8 @@ DEFAULT_CONFIG = {
         # How gateway tool-progress is grouped on platforms that support message
         # editing: "accumulate" (default) edits one bubble in place; "separate"
         # sends one message per tool (the pre-v0.9 behavior, noisier). Only
-        # applies where tool_progress is already enabled. Per-platform override
+        # applies to history modes (new/all/verbose); "status" always edits one
+        # current-activity line. Per-platform override
         # via display.platforms.<platform>.tool_progress_grouping.
         "tool_progress_grouping": "accumulate",
         # Optional custom phrases for generic long-running status messages.
@@ -4271,7 +4275,7 @@ OPTIONAL_ENV_VARS = {
         "category": "setting",
     },
     # HERMES_TOOL_PROGRESS_MODE is deprecated — tool progress is configured via
-    # display.tool_progress in config.yaml (off|new|all|verbose|log). The
+    # display.tool_progress in config.yaml (off|new|all|verbose|log; gateway also status). The
     # gateway still falls back to HERMES_TOOL_PROGRESS_MODE for backward
     # compatibility, so it lives in _EXTRA_ENV_KEYS (known to reload and
     # compatibility paths) but is intentionally NOT listed here:

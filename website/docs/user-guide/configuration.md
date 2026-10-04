@@ -1603,7 +1603,7 @@ This controls both the `text_to_speech` tool and spoken replies in voice mode (`
 
 ```yaml
 display:
-  tool_progress: all      # off | new | all | verbose
+  tool_progress: all      # off | new | all | verbose | log; gateway also accepts status
   tool_progress_command: false  # Enable /verbose slash command in messaging gateway
   focus_view: false       # CLI focus view (/focus) — reduced output, display-only
   platforms: {}           # Per-platform display overrides (see below)
@@ -1704,11 +1704,15 @@ display:
 | Mode | What you see |
 |------|-------------|
 | `off` | Silent — just the final response |
+| `status` | Gateway-only: one editable plain-text line with the latest activity; no emojis, arguments, paths, or counters |
 | `new` | Tool indicator only when the tool changes |
 | `all` | Every tool call with a short preview (default) |
 | `verbose` | Full args, results, and debug logs |
+| `log` | Silent in chat; tool calls saved to `~/.hermes/logs/tool_calls.log` |
 
-In the CLI, cycle through these modes with `/verbose`. To use `/verbose` in messaging platforms (Telegram, Discord, Slack, etc.), set `tool_progress_command: true` in the `display` section above. The command will then cycle the mode and save to config.
+In the CLI, `/verbose` cycles `off → new → all → verbose → off`. To use `/verbose` in messaging platforms (Telegram, Discord, Slack, etc.), set `tool_progress_command: true` in the `display` section above. The gateway cycle is `off → status → new → all → verbose → log → off`, saved for the current platform.
+
+Discord defaults to `status` with `cleanup_progress: true`, deleting temporary activity messages after the final response is successfully delivered. Failed runs retain them. Explicit global or platform settings override these defaults. Set `display.platforms.discord.tool_progress: status` to switch an existing Discord configuration. `status` ignores `tool_progress_grouping`; natural-language assistant updates remain controlled by `interim_assistant_messages`.
 
 Tool progress requires a gateway adapter that can display progress updates safely. Platforms without message editing support, including Signal, suppress tool-progress bubbles even if `/verbose` saves a non-`off` mode.
 

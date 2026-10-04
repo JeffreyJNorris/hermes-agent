@@ -434,14 +434,30 @@ Control how much tool activity is displayed in `~/.hermes/config.yaml`:
 
 ```yaml
 display:
-  tool_progress: all    # off | new | all | verbose | log
+  tool_progress: all    # off | status (gateway-only) | new | all | verbose | log
   tool_progress_command: false  # set to true to enable /verbose in messaging
   # How progress is grouped on platforms that support message editing:
   #   accumulate (default) — edit one bubble in place as tools run
   #   separate             — send one message per tool (pre-v0.9 style; noisier)
-  # Only applies where tool_progress is already enabled.
+  # Applies to new/all/verbose; status always uses one editable line.
   tool_progress_grouping: accumulate   # accumulate | separate
 ```
+
+### `status` mode — one current activity line
+
+`status` shows the latest activity in one editable plain-text message, such as "Searching files". Updates replace the previous text, without emojis, arguments, paths, or repeated-call counters. This mode is gateway-only and ignores `tool_progress_grouping`.
+
+Discord defaults to `status` with `cleanup_progress: true`: the activity line disappears after the final answer is successfully delivered. Failed runs keep progress for context. Explicit global or per-platform settings still take precedence; to switch an existing Discord configuration:
+
+```yaml
+display:
+  platforms:
+    discord:
+      tool_progress: status
+      cleanup_progress: true
+```
+
+Natural-language assistant updates remain controlled separately by `interim_assistant_messages`.
 
 ### `log` mode — audit file instead of chat messages
 
@@ -755,7 +771,7 @@ display:
       long_running_notifications: false
 ```
 
-### Progress bubble cleanup (opt-in)
+### Progress bubble cleanup
 
 Tool-progress messages, the "still working…" heartbeat, and status-callback bubbles can also be auto-deleted after the final response lands. Enable per-platform via `display.platforms.<platform>.cleanup_progress`:
 
@@ -768,7 +784,7 @@ display:
       cleanup_progress: true
 ```
 
-Defaults to `false`. Only platforms whose adapter implements `delete_message` honor the setting (currently Telegram and Discord). Failed runs **skip** cleanup so the bubbles remain as breadcrumbs.
+Defaults to `true` on Discord and `false` elsewhere. Set `cleanup_progress: false` to retain Discord progress after success. Only platforms whose adapter implements `delete_message` honor the setting (currently Telegram and Discord). Failed runs **skip** cleanup so the bubbles remain as breadcrumbs.
 
 ## Next Steps
 

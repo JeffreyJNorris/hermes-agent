@@ -89,6 +89,12 @@ class TestYAMLNormalisation:
         config = {"display": {"tool_progress": False}}
         assert resolve_display_setting(config, "telegram", "tool_progress") == "off"
 
+    def test_status_mode_normalises_for_platform_override(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"platforms": {"discord": {"tool_progress": " STATUS "}}}}
+        assert resolve_display_setting(config, "discord", "tool_progress") == "status"
+
 
     def test_only_long_running_visibility_accepts_generic_mode(self):
         from gateway.display_config import resolve_display_setting
@@ -123,13 +129,21 @@ class TestPlatformDefaults:
     """Built-in defaults reflect platform capability tiers."""
 
     def test_high_tier_platforms(self):
-        """Discord defaults to 'all'; Telegram defaults quiet for mobile."""
+        """Discord has one status line; Telegram defaults quiet for mobile."""
         from gateway.display_config import resolve_display_setting
 
         # Telegram: tier_high transport, but quiet mobile default.
         assert resolve_display_setting({}, "telegram", "tool_progress") == "off"
-        # Discord: pure tier_high.
-        assert resolve_display_setting({}, "discord", "tool_progress") == "all"
+        assert resolve_display_setting({}, "discord", "tool_progress") == "status"
+
+    def test_discord_explicit_progress_settings_override_status_default(self):
+        from gateway.display_config import resolve_display_setting
+
+        for mode in ("off", "new", "all", "verbose", "log"):
+            config = {"display": {"tool_progress": mode}}
+            assert resolve_display_setting(config, "discord", "tool_progress") == mode
+            config["display"]["platforms"] = {"discord": {"tool_progress": mode}}
+            assert resolve_display_setting(config, "discord", "tool_progress") == mode
 
 
     def test_low_tier_platforms(self):
@@ -231,14 +245,23 @@ class TestStreamingPerPlatform:
 # ---------------------------------------------------------------------------
 
 class TestCleanupProgress:
-    """``cleanup_progress`` is off by default and resolvable per-platform."""
+    """Discord cleans up temporary status; other platforms opt in."""
 
-    def test_default_off_for_all_platforms(self):
-        """No config set → cleanup_progress resolves to False everywhere."""
+    def test_discord_cleanup_default_does_not_affect_other_platforms(self):
         from gateway.display_config import resolve_display_setting
 
-        for plat in ("telegram", "discord", "slack", "email"):
+        assert resolve_display_setting({}, "discord", "cleanup_progress") is True
+        for plat in ("telegram", "slack", "email"):
             assert resolve_display_setting({}, plat, "cleanup_progress") is False
+
+    def test_discord_cleanup_can_be_disabled(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {"display": {"cleanup_progress": False}}
+        assert resolve_display_setting(config, "discord", "cleanup_progress") is False
+        config["display"]["cleanup_progress"] = True
+        config["display"]["platforms"] = {"discord": {"cleanup_progress": False}}
+        assert resolve_display_setting(config, "discord", "cleanup_progress") is False
 
 
     def test_yaml_true_string_normalises_to_true(self):
@@ -300,5 +323,4 @@ class TestLiveStatusSetting:
         from gateway.display_config import resolve_display_setting
 
         assert resolve_display_setting({}, "slack", "live_status") == "full"
-
 

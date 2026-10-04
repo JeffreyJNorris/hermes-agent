@@ -5861,6 +5861,7 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        processing_ok = False
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -6416,6 +6417,7 @@ class BasePlatformAdapter(ABC):
                 return  # Drain task owns the session now.
                 
         except asyncio.CancelledError:
+            processing_ok = False
             current_task = asyncio.current_task()
             outcome = ProcessingOutcome.CANCELLED
             if current_task is None or current_task not in self._expected_cancelled_tasks:
@@ -6423,6 +6425,7 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, outcome)
             raise
         except Exception as e:
+            processing_ok = False
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
@@ -6445,6 +6448,20 @@ class BasePlatformAdapter(ABC):
                     self.name, notify_err, exc_info=True,
                 )  # Last resort — don't let error reporting crash the handler
         finally:
+            # Progress cleanup must distinguish a delivered answer from an
+            # agent that finished but could not deliver it. Keep that outcome
+            # on the existing turn guard, scoped to its run generation. Other
+            # post-delivery callbacks still run after failures/cancellation.
+            # Snapshot before awaits: a queued successor can reuse this guard
+            # and bind its own generation while typing cleanup is in flight.
+            _callback_generation = getattr(
+                interrupt_event,
+                "_hermes_run_generation",
+                None,
+            )
+            interrupt_event._hermes_delivery_outcome = (
+                _callback_generation, processing_ok,
+            )
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.
@@ -6452,19 +6469,14 @@ class BasePlatformAdapter(ABC):
             # Fire any one-shot post-delivery callback registered for this
             # session (e.g. deferred background-review notifications).
             #
-            # Snapshot the callback generation HERE (after the agent has run),
-            # not at the top of this task.  _hermes_run_generation is set on
+            # The callback generation was captured above after the agent ran,
+            # not at the top of this task. _hermes_run_generation is set on
             # the interrupt event by GatewayRunner._bind_adapter_run_generation
             # during _handle_message_with_agent — which happens DURING the
             # self._message_handler(event) await above.  Snapshotting earlier
             # always captured None, which bypassed the generation-ownership
             # check in pop_post_delivery_callback and let stale runs fire a
             # fresher run's callbacks.
-            _callback_generation = getattr(
-                interrupt_event,
-                "_hermes_run_generation",
-                None,
-            )
             if hasattr(self, "pop_post_delivery_callback"):
                 _post_cb = self.pop_post_delivery_callback(
                     session_key,

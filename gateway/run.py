@@ -3552,6 +3552,7 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
 # Max seconds between platform reconnect retries (primary watcher and
 # secondary-profile reconnects share this policy — tune in one place).
 _RECONNECT_BACKOFF_CAP = 300
+_PROGRESS_EDIT_INTERVAL = 1.5
 
 
 def _reconnect_backoff(attempt: int) -> int:
@@ -3655,8 +3656,13 @@ class TurnRunner:
             if not ctx._thinking_enabled:
                 return
             thinking_text = preview if tool_name == "_thinking" else tool_name
-            msg = f"💬 {thinking_text}" if thinking_text else None
+            msg = (
+                "Thinking..." if ctx.progress_mode == "status"
+                else f"💬 {thinking_text}"
+            ) if thinking_text else None
             if msg:
+                if ctx.progress_mode == "status":
+                    ctx.last_progress_msg[0] = msg
                 ctx.progress_queue.put(msg)
             return
 
@@ -3700,6 +3706,16 @@ class TurnRunner:
         if ctx.progress_mode == "new" and tool_name == ctx.last_tool[0]:
             return
         ctx.last_tool[0] = tool_name
+
+        # Status mode only exposes the current activity, never arguments,
+        # commands, plugin identifiers, emojis, or repeat counters.
+        if ctx.progress_mode == "status":
+            from agent.display import get_tool_verb
+            msg = f"{get_tool_verb(tool_name) or 'Working'}..."
+            if msg != ctx.last_progress_msg[0]:
+                ctx.last_progress_msg[0] = msg
+                ctx.progress_queue.put(msg)
+            return
 
         # Build progress message with primary argument preview
         from agent.display import get_tool_emoji
@@ -3860,11 +3876,14 @@ class TurnRunner:
                     break
             return
 
+        if ctx.progress_mode == "status":
+            await self._send_status_message(adapter)
+            return
+
         progress_lines = []      # Accumulated tool lines for the CURRENT editable bubble
         progress_msg_id = None   # ID of the current progress message to edit
         can_edit = ctx.progress_grouping != "separate"  # "separate" = one message per tool (pre-v0.9 behavior)
         _last_edit_ts = 0.0      # Throttle edits to avoid Telegram flood control
-        _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
 
         _progress_len_fn = (
             adapter.message_len_fn
@@ -4191,6 +4210,80 @@ class TurnRunner:
                 logger.error("Progress message error: %s", e)
                 await asyncio.sleep(1)
 
+    async def _send_status_message(self, adapter):
+        """Replace one status message, retaining its identity across narration."""
+        ctx = self._ctx
+        latest = None
+        sent_text = None
+        message_id = None
+        can_edit = True
+        last_update = 0.0
+        edit_params = inspect.signature(adapter.edit_message).parameters
+        edit_metadata = (
+            "metadata" in edit_params
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in edit_params.values())
+        )
+
+        def current():
+            agent = ctx.agent_holder[0] if ctx.agent_holder else None
+            return ctx._run_still_current() and not getattr(agent, "is_interrupted", False)
+
+        def drain():
+            nonlocal latest
+            while True:
+                try:
+                    item = ctx.progress_queue.get_nowait()
+                except queue.Empty:
+                    return
+                # Narration reset markers keep the same status message.
+                if isinstance(item, str):
+                    latest = item
+
+        async def render():
+            nonlocal message_id, sent_text, can_edit
+            if not current() or not latest or latest == sent_text or not can_edit:
+                return
+            try:
+                if message_id:
+                    kwargs = {"metadata": ctx._progress_metadata} if edit_metadata else {}
+                    result = await adapter.edit_message(
+                        ctx.source.chat_id, message_id, latest, **kwargs
+                    )
+                else:
+                    result = await adapter.send(
+                        chat_id=ctx.source.chat_id,
+                        content=latest,
+                        reply_to=ctx._progress_reply_to,
+                        metadata=ctx._progress_metadata,
+                    )
+                    if result.success and result.message_id:
+                        message_id = str(result.message_id)
+                        if ctx._cleanup_progress:
+                            ctx._cleanup_msg_ids.append(message_id)
+                if result.success:
+                    sent_text = latest
+                elif message_id and not result.retryable:
+                    # Keep the original message when editing is unavailable;
+                    # sending replacements would recreate the progress spam.
+                    can_edit = False
+            except Exception as error:
+                logger.debug("Status message update failed: %s", error)
+
+        try:
+            while current():
+                drain()
+                now = time.monotonic()
+                if latest != sent_text and now - last_update >= _PROGRESS_EDIT_INTERVAL:
+                    await render()
+                    last_update = now
+                await asyncio.sleep(0.3)
+        except asyncio.CancelledError:
+            # Flush only an existing message. Do not create a status after
+            # the run has finished, or update a stopped/superseded run.
+            drain()
+            if message_id:
+                await render()
+
     def voice_ack_callback(self, call_id, tool_name, args):
         """tool_start_callback: speak a one-time ack in the voice channel."""
         ctx = self._ctx
@@ -4265,6 +4358,21 @@ class TurnRunner:
                 event_type,
                 _redact_gateway_user_facing_secrets(str(message or ""))[:160],
             )
+            return
+        if (
+            ctx.progress_mode == "status"
+            and ctx.progress_queue is not None
+            and (
+                event_type == "compacted"
+                or (event_type == "lifecycle" and _COMPRESSION_PROGRESS_STATUS_RE.search(prepared_message))
+            )
+        ):
+            msg = (
+                "Updating context..." if event_type == "lifecycle"
+                else "Working..."
+            )
+            ctx.last_progress_msg[0] = msg
+            ctx.progress_queue.put(msg)
             return
         _fut = safe_schedule_threadsafe(
             _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared_message, ctx._status_thread_metadata),
@@ -24352,6 +24460,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if needs_progress_queue else None
+        if progress_mode == "status" and progress_queue is not None:
+            progress_queue.put("Working...")
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
@@ -24896,6 +25006,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ):
                     break
                 _elapsed_mins = int((time.time() - _notify_start) // 60)
+                if progress_mode == "status" and progress_queue is not None:
+                    # Keep long-running heartbeats in the same plain status
+                    # message instead of creating a second progress bubble.
+                    last_progress_msg[0] = "Still working..."
+                    progress_queue.put(last_progress_msg[0])
+                    continue
                 # Include agent activity context if available. Default
                 # heartbeat is terse: elapsed + current tool. Verbose
                 # iteration counter is gated on busy_ack_detail so users
@@ -25883,27 +25999,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and hasattr(_cleanup_adapter, "register_post_delivery_callback")
         ):
             _ids_snapshot = list(_cleanup_msg_ids)
-            _chat_id_snapshot = source.chat_id
+            # Discord threads are separate message channels; Telegram topics
+            # still delete messages through their parent chat.
+            _chat_id_snapshot = (
+                source.thread_id if source.platform == Platform.DISCORD and source.thread_id
+                else source.chat_id
+            )
             _adapter_snapshot = _cleanup_adapter
-            _loop_snapshot = asyncio.get_running_loop()
+            _delivery_event = getattr(_adapter_snapshot, "_active_sessions", {}).get(session_key)
 
-            def _cleanup_temp_bubbles() -> None:
-                async def _delete_all() -> None:
-                    for _mid in _ids_snapshot:
-                        try:
-                            await _adapter_snapshot.delete_message(
-                                _chat_id_snapshot, _mid
-                            )
-                        except Exception:
-                            pass
-                try:
-                    safe_schedule_threadsafe(
-                        _delete_all(), _loop_snapshot,
-                        logger=logger,
-                        log_message="Temp bubble cleanup scheduling error",
-                    )
-                except Exception:
-                    pass
+            async def _cleanup_temp_bubbles() -> None:
+                # Post-delivery callbacks also run on failures/cancellation.
+                # Delete only after this generation's final delivery succeeded.
+                if getattr(_delivery_event, "_hermes_delivery_outcome", None) != (run_generation, True):
+                    return
+                for _mid in _ids_snapshot:
+                    try:
+                        await _adapter_snapshot.delete_message(_chat_id_snapshot, _mid)
+                    except Exception:
+                        pass
 
             try:
                 _cleanup_adapter.register_post_delivery_callback(
