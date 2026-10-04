@@ -100,7 +100,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, args_hint="[all] [reason]", busy_policy="dispatch",
                desktop="messaging"),
     CommandDef("request", "Respond to a durable request", "Session",
-               gateway_only=True, args_hint="respond <request-id> <number>",
+               gateway_only=True, args_hint="respond <request-id> <number[,number...]>",
                busy_policy="dispatch", desktop="messaging"),
     CommandDef("bg", "Run a prompt in a separate background session", "Session",
                args_hint="<prompt>", busy_policy="dispatch"),

@@ -39,6 +39,8 @@ from gateway.interactive import (
     MAX_PROMPT_OPTION_ID_LENGTH,
     MAX_PROMPT_OPTION_LABEL_LENGTH,
     MAX_PROMPT_OPTIONS,
+    MAX_MULTI_SELECT_OPTIONS,
+    validate_selection_bounds,
     MAX_PROMPT_TITLE_LENGTH,
     MAX_PROVIDER_COMPONENT_ID_LENGTH,
     MAX_RENDERED_PROMPT_LENGTH,
@@ -164,6 +166,9 @@ class DurableRequestSpec:
     options: tuple[DurableRequestOption, ...]
     ttl_seconds: float = DEFAULT_DURABLE_REQUEST_TTL_SECONDS
     reference: str | None = None
+    selection_mode: str = "single"
+    min_selections: int = 1
+    max_selections: int = 1
 
 
 @dataclass(frozen=True)
@@ -217,6 +222,10 @@ class DurableRequest:
     command_response_allowed: bool = False
     text_command_fallback_allowed: bool = False
     resolution_source: DurableRequestResolutionSource | None = None
+    selection_mode: str = "single"
+    min_selections: int = 1
+    max_selections: int = 1
+    selected_option_ids: tuple[str, ...] = ()
 
     @property
     def delivery_channel_id(self) -> str:
@@ -371,10 +380,16 @@ def _validate_ttl(value: object, *, maximum: float) -> float:
     return ttl
 
 
+def _selection_instruction(request: DurableRequest | DurableRequestSpec) -> str:
+    if request.selection_mode == "multi":
+        return f"Choose {request.min_selections}–{request.max_selections} options:"
+    return "Choose one option:"
+
+
 def render_durable_request_content(request: DurableRequest | DurableRequestSpec) -> str:
     """Render the complete question and option set as ordinary message text."""
 
-    lines = [f"**{request.title}**", "", request.body, "", "Choose one option:"]
+    lines = [f"**{request.title}**", "", request.body, "", _selection_instruction(request)]
     lines.extend(
         f"{index}. {option.label}"
         for index, option in enumerate(request.options, start=1)
@@ -383,7 +398,8 @@ def render_durable_request_content(request: DurableRequest | DurableRequestSpec)
         lines.extend(
             (
                 "",
-                f"Alternative: /request respond {request.request_id} <number>",
+                f"Alternative: /request respond {request.request_id} "
+                + ("<numbers, comma-separated>" if request.selection_mode == "multi" else "<number>"),
             )
         )
     return "\n".join(lines)
@@ -399,7 +415,7 @@ def render_durable_request_text_command_content(request: DurableRequest) -> str:
         "",
         f"Request: {request.request_id}",
         "",
-        "Choose one option:",
+        _selection_instruction(request),
     ]
     lines.extend(
         f"{index}. {option.label}"
@@ -409,7 +425,8 @@ def render_durable_request_text_command_content(request: DurableRequest) -> str:
         (
             "",
             "Respond in this channel with:",
-            f"/request respond {request.request_id} <number>",
+            f"/request respond {request.request_id} "
+            + ("<numbers, comma-separated>" if request.selection_mode == "multi" else "<number>"),
         )
     )
     return "\n".join(lines)
@@ -424,6 +441,23 @@ def make_durable_component_id(request_id: str, slot: int | str) -> str:
     if len(custom_id) > MAX_PROVIDER_COMPONENT_ID_LENGTH:
         raise DurableRequestError("durable request component identifier is too long")
     return custom_id
+
+
+def make_durable_multi_select_component_id(request_id: str) -> str:
+    custom_id = f"drm:{_validate_request_id(request_id)}"
+    if len(custom_id) > MAX_PROVIDER_COMPONENT_ID_LENGTH:
+        raise DurableRequestError("durable request component identifier is too long")
+    return custom_id
+
+
+def parse_durable_multi_select_component_id(custom_id: object) -> str | None:
+    if not isinstance(custom_id, str) or not custom_id.startswith("drm:"):
+        return None
+    try:
+        request_id = _validate_request_id(custom_id[4:])
+        return request_id if len(custom_id) <= MAX_PROVIDER_COMPONENT_ID_LENGTH else None
+    except DurableRequestError:
+        return None
 
 
 def validate_durable_request_spec(
@@ -460,10 +494,26 @@ def validate_durable_request_spec(
 
     if not isinstance(spec.options, tuple):
         raise DurableRequestError("options must be a tuple")
-    if not MIN_DURABLE_OPTIONS <= len(spec.options) <= MAX_PROMPT_OPTIONS:
+    if spec.selection_mode not in ("single", "multi"):
+        raise DurableRequestError("selection_mode must be single or multi")
+    if spec.selection_mode == "single":
+        if (
+            type(spec.min_selections) is not int
+            or type(spec.max_selections) is not int
+            or (spec.min_selections, spec.max_selections) != (1, 1)
+        ):
+            raise DurableRequestError("single requests require min_selections=max_selections=1")
+        option_limit = MAX_PROMPT_OPTIONS
+    else:
+        try:
+            validate_selection_bounds(len(spec.options), spec.min_selections, spec.max_selections)
+        except ValueError as exc:
+            raise DurableRequestError(str(exc)) from exc
+        option_limit = MAX_MULTI_SELECT_OPTIONS
+    if not MIN_DURABLE_OPTIONS <= len(spec.options) <= option_limit:
         raise DurableRequestError(
             f"options must contain between {MIN_DURABLE_OPTIONS} and "
-            f"{MAX_PROMPT_OPTIONS} choices"
+            f"{option_limit} choices"
         )
 
     validated_options: list[DurableRequestOption] = []
@@ -500,6 +550,9 @@ def validate_durable_request_spec(
         options=tuple(validated_options),
         ttl_seconds=ttl,
         reference=reference,
+        selection_mode=spec.selection_mode,
+        min_selections=spec.min_selections,
+        max_selections=spec.max_selections,
     )
     if len(render_durable_request_content(validated)) > MAX_RENDERED_PROMPT_LENGTH:
         raise DurableRequestError("rendered durable request exceeds delivery limits")
@@ -507,8 +560,11 @@ def validate_durable_request_spec(
     # Validate provider IDs up-front for every option.  The canonical option id
     # never appears in the component identifier.
     sample_id = _new_request_id()
-    for slot in range(1, len(validated.options) + 1):
-        make_durable_component_id(sample_id, slot)
+    if validated.selection_mode == "multi":
+        make_durable_multi_select_component_id(sample_id)
+    else:
+        for slot in range(1, len(validated.options) + 1):
+            make_durable_component_id(sample_id, slot)
     return validated
 
 
@@ -561,7 +617,18 @@ class DurableRequestStore:
         self._max_active = max_active
         self._max_terminal = max_terminal
         self._lock = threading.RLock()
+        self._selection_counts = {"submissions": 0, "invalid_sets": 0}
         self._ensure_schema()
+
+    def _record_multi_select(self, event: str) -> None:
+        from gateway.durable_operations import record_durable_multi_select_event
+
+        self._selection_counts[event] += 1
+        record_durable_multi_select_event(event)
+
+    def selection_metrics(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._selection_counts)
 
     @property
     def db_path(self) -> Path:
@@ -724,7 +791,7 @@ class DurableRequestStore:
             terminal_retention_seconds=terminal_retention_seconds,
             retain_origin=True,
         )
-        if tuple(option.id for option in values.spec.options) != (
+        if values.spec.selection_mode != "single" or tuple(option.id for option in values.spec.options) != (
             "approve",
             "reject",
         ):
@@ -742,7 +809,7 @@ class DurableRequestStore:
                         "SELECT * FROM durable_action_tickets WHERE request_id = ?",
                         (existing_request["request_id"],),
                     ).fetchone()
-                    if existing_ticket is None or not self._ticket_matches_action(
+                    if existing_request["selection_mode"] != "single" or existing_ticket is None or not self._ticket_matches_action(
                         existing_ticket,
                         action,
                     ):
@@ -769,7 +836,7 @@ class DurableRequestStore:
                     "SELECT * FROM durable_requests WHERE request_id = ?",
                     (existing_ticket["request_id"],),
                 ).fetchone()
-                if existing_request is None:
+                if existing_request is None or existing_request["selection_mode"] != "single":
                     raise DurableRequestError(
                         "durable action ticket has no matching request"
                     )
@@ -985,8 +1052,9 @@ class DurableRequestStore:
                    text_command_fallback_allowed,
                    wake_requested, wake_status,
                    origin_session_id, origin_ui_session_id, origin_profile,
+                   selection_mode, min_selections, max_selections,
                    delivery_attempts, wake_attempts
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)""",
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0)""",
             (
                 request_id,
                 values.spec.kind,
@@ -1013,6 +1081,9 @@ class DurableRequestStore:
                 values.origin_session_id,
                 values.origin_ui_session_id,
                 values.origin_profile,
+                values.spec.selection_mode,
+                values.spec.min_selections,
+                values.spec.max_selections,
             ),
         )
         row = conn.execute(
@@ -1789,12 +1860,34 @@ class DurableRequestStore:
         message_id: str | None,
         actor_id: str | None,
     ) -> DurableResolveResult:
+        return self._resolve_native(
+            request_id=request_id, option_tokens=(str(option_token),),
+            platform=platform, channel_id=channel_id, message_id=message_id,
+            actor_id=actor_id, selection_mode="single",
+        )
+
+    def resolve_multi_select(
+        self, *, request_id: str, option_tokens: tuple[str, ...] | list[str],
+        platform: str, channel_id: str, message_id: str | None,
+        actor_id: str | None,
+    ) -> DurableResolveResult:
+        return self._resolve_native(
+            request_id=request_id, option_tokens=option_tokens,
+            platform=platform, channel_id=channel_id, message_id=message_id,
+            actor_id=actor_id, selection_mode="multi",
+        )
+
+    def _resolve_native(
+        self, *, request_id: str, option_tokens: tuple[str, ...] | list[str],
+        platform: str, channel_id: str, message_id: str | None,
+        actor_id: str | None, selection_mode: str,
+    ) -> DurableResolveResult:
         try:
             rid = _validate_request_id(request_id)
         except DurableRequestError:
             return DurableResolveResult(DurableResolveStatus.NOT_FOUND)
-        now = float(self._wall_clock())
         with self._lock, self._transaction(immediate=True) as conn:
+            now = float(self._wall_clock())
             row = conn.execute(
                 "SELECT * FROM durable_requests WHERE request_id = ?",
                 (rid,),
@@ -1824,17 +1917,22 @@ class DurableRequestStore:
             ):
                 return DurableResolveResult(DurableResolveStatus.SCOPE_MISMATCH)
 
-            token = str(option_token)
-            if not token.isdigit():
+            if row["selection_mode"] != selection_mode or row["delivery_mode"] != "native":
                 return DurableResolveResult(DurableResolveStatus.INVALID_OPTION)
-            slot = int(token)
-            return self._resolve_selected_slot_locked(
-                conn,
-                row=row,
-                slot=slot,
+            if not isinstance(option_tokens, (tuple, list)) or any(
+                not isinstance(token, str) or re.fullmatch(r"[0-9]+", token) is None
+                or len(token) > (2 if selection_mode == "multi" else 128)
+                or (selection_mode == "multi" and token != str(int(token)))
+                for token in option_tokens
+            ):
+                if row["selection_mode"] == "multi":
+                    self._record_multi_select("submissions")
+                    self._record_multi_select("invalid_sets")
+                return DurableResolveResult(DurableResolveStatus.INVALID_OPTION)
+            return self._resolve_selected_slots_locked(
+                conn, row=row, slots=tuple(int(token) for token in option_tokens),
                 actor_id=actual_actor_id,
-                source=DurableRequestResolutionSource.NATIVE,
-                now=now,
+                source=DurableRequestResolutionSource.NATIVE, now=now,
             )
 
     def resolve_command(
@@ -1850,8 +1948,8 @@ class DurableRequestStore:
             rid = _validate_request_id(request_id)
         except DurableRequestError:
             return DurableResolveResult(DurableResolveStatus.NOT_FOUND)
-        now = float(self._wall_clock())
         with self._lock, self._transaction(immediate=True) as conn:
+            now = float(self._wall_clock())
             row = conn.execute(
                 "SELECT * FROM durable_requests WHERE request_id = ?",
                 (rid,),
@@ -1879,41 +1977,40 @@ class DurableRequestStore:
                 return DurableResolveResult(DurableResolveStatus.NOT_DELIVERED)
             if not bool(row["command_response_allowed"]):
                 return DurableResolveResult(DurableResolveStatus.COMMAND_DISABLED)
-            if (
-                not isinstance(option_slots, tuple)
-                or len(option_slots) != 1
-                or type(option_slots[0]) is not int
-                or option_slots[0] <= 0
-            ):
-                return DurableResolveResult(DurableResolveStatus.INVALID_OPTION)
-
-            return self._resolve_selected_slot_locked(
-                conn,
-                row=row,
-                slot=option_slots[0],
-                actor_id=actual_actor_id,
-                source=DurableRequestResolutionSource.COMMAND,
-                now=now,
+            return self._resolve_selected_slots_locked(
+                conn, row=row, slots=option_slots, actor_id=actual_actor_id,
+                source=DurableRequestResolutionSource.COMMAND, now=now,
             )
 
-    def _resolve_selected_slot_locked(
+    def _resolve_selected_slots_locked(
         self,
         conn: sqlite3.Connection,
         *,
         row: sqlite3.Row,
-        slot: int,
+        slots: tuple[int, ...],
         actor_id: str,
         source: DurableRequestResolutionSource,
         now: float,
     ) -> DurableResolveResult:
         options = _deserialize_options(row["options_json"])
-        if slot <= 0 or slot > len(options):
+        if row["selection_mode"] == "multi":
+            self._record_multi_select("submissions")
+        if (
+            not isinstance(slots, tuple)
+            or not row["min_selections"] <= len(slots) <= row["max_selections"]
+            or any(type(slot) is not int or not 1 <= slot <= len(options) for slot in slots)
+            or len(set(slots)) != len(slots)
+        ):
+            if row["selection_mode"] == "multi":
+                self._record_multi_select("invalid_sets")
             return DurableResolveResult(DurableResolveStatus.INVALID_OPTION)
-        selected_option = options[slot - 1]
+        selected_ids = tuple(options[slot - 1].id for slot in sorted(slots))
+        selected_option_id = selected_ids[0] if row["selection_mode"] == "single" else None
+        selected_json = json.dumps(selected_ids) if row["selection_mode"] == "multi" else None
         request_id = row["request_id"]
         updated = conn.execute(
             """UPDATE durable_requests
-               SET status = ?, selected_option_id = ?,
+               SET status = ?, selected_option_id = ?, selected_option_ids_json = ?,
                    resolved_by_actor_id = ?, resolved_at = ?, updated_at = ?,
                    terminal_reason = NULL, resolution_source = ?,
                    wake_status = CASE
@@ -1925,7 +2022,8 @@ class DurableRequestStore:
                WHERE request_id = ? AND status = ?""",
             (
                 DurableRequestStatus.SELECTED.value,
-                selected_option.id,
+                selected_option_id,
+                selected_json,
                 actor_id,
                 now,
                 now,
@@ -1950,7 +2048,7 @@ class DurableRequestStore:
             conn,
             request_id=request_id,
             request_status=DurableRequestStatus.SELECTED,
-            selected_option_id=selected_option.id,
+            selected_option_id=selected_option_id,
             now=now,
         )
         resolved = conn.execute(
@@ -2428,6 +2526,13 @@ class DurableRequestStore:
             origin_profile=row["origin_profile"],
             message_id=row["message_id"],
             selected_option_id=row["selected_option_id"],
+            selection_mode=row["selection_mode"],
+            min_selections=int(row["min_selections"]),
+            max_selections=int(row["max_selections"]),
+            selected_option_ids=(
+                tuple(json.loads(row["selected_option_ids_json"]))
+                if row["selected_option_ids_json"] is not None else ()
+            ),
             resolved_by_actor_id=row["resolved_by_actor_id"],
             resolved_at=(
                 None if row["resolved_at"] is None else float(row["resolved_at"])
@@ -2525,6 +2630,10 @@ CREATE TABLE IF NOT EXISTS durable_requests (
     text_command_fallback_allowed INTEGER NOT NULL DEFAULT 0,
     resolution_source TEXT,
     selected_option_id TEXT,
+    selection_mode TEXT NOT NULL DEFAULT 'single',
+    min_selections INTEGER NOT NULL DEFAULT 1,
+    max_selections INTEGER NOT NULL DEFAULT 1,
+    selected_option_ids_json TEXT,
     resolved_by_actor_id TEXT,
     resolved_at REAL,
     terminal_reason TEXT,
@@ -2556,6 +2665,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_requests_origin_reference
 
 
 _DURABLE_COLUMN_DDL = {
+    "selection_mode": "TEXT NOT NULL DEFAULT 'single'",
+    "min_selections": "INTEGER NOT NULL DEFAULT 1",
+    "max_selections": "INTEGER NOT NULL DEFAULT 1",
+    "selected_option_ids_json": "TEXT",
     "delivery_mode": "TEXT NOT NULL DEFAULT 'native'",
     "command_response_allowed": "INTEGER NOT NULL DEFAULT 0",
     "text_command_fallback_allowed": "INTEGER NOT NULL DEFAULT 0",
@@ -2813,6 +2926,17 @@ def resolve_durable_request(
     )
 
 
+def resolve_durable_multi_select_request(
+    *, request_id: str, option_tokens: tuple[str, ...] | list[str],
+    platform: str, channel_id: str, message_id: str | None,
+    actor_id: str | None,
+) -> DurableResolveResult:
+    return get_durable_request_store().resolve_multi_select(
+        request_id=request_id, option_tokens=option_tokens, platform=platform,
+        channel_id=channel_id, message_id=message_id, actor_id=actor_id,
+    )
+
+
 def resolve_durable_request_command(
     *,
     request_id: str,
@@ -2831,6 +2955,9 @@ def resolve_durable_request_command(
 
 
 __all__ = [
+    "make_durable_multi_select_component_id",
+    "parse_durable_multi_select_component_id",
+    "resolve_durable_multi_select_request",
     "DEFAULT_DURABLE_REQUEST_TTL_SECONDS",
     "DEFAULT_DURABLE_TERMINAL_RETENTION_SECONDS",
     "DELIVERY_CLAIM_STALE_SECONDS",

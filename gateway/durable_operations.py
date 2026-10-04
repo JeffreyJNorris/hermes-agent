@@ -164,6 +164,13 @@ def record_durable_command_response(status: DurableResolveStatus) -> None:
         _DURABLE_EVENT_COUNTS[("command_response", status.value)] += 1
 
 
+def record_durable_multi_select_event(event: str) -> None:
+    if event not in {"submissions", "invalid_sets"}:
+        raise ValueError("unknown multi-select event")
+    with _DURABLE_EVENT_LOCK:
+        _DURABLE_EVENT_COUNTS[("multi_select", event)] += 1
+
+
 def record_durable_delivery_event(event: str, *, count: int = 1) -> None:
     if (
         event not in _DELIVERY_EVENTS
@@ -766,6 +773,19 @@ class DurableOperationsStore:
             )
 
         with closing(self._read_connection()) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(durable_requests)")}
+            if "selection_mode" in columns:
+                active = conn.execute(
+                    "SELECT COUNT(*) FROM durable_requests WHERE selection_mode = 'multi' "
+                    "AND status IN ('pending_delivery', 'open')"
+                ).fetchone()[0]
+                stuck = conn.execute(
+                    "SELECT COUNT(*) FROM durable_requests WHERE selection_mode = 'multi' "
+                    "AND status IN ('pending_delivery', 'open') AND expires_at <= ?",
+                    (current_time,),
+                ).fetchone()[0]
+                add("hermes_durable_multi_select_active", active)
+                add("hermes_durable_multi_select_stuck", stuck)
             for row in conn.execute(
                 """SELECT status, platform, COUNT(*) AS count
                    FROM durable_requests GROUP BY status, platform
@@ -921,6 +941,8 @@ class DurableOperationsStore:
         for (event_type, value), count in event_counts:
             if event_type == "command_response":
                 add("hermes_durable_command_responses", count, result=value)
+            elif event_type == "multi_select":
+                add(f"hermes_durable_multi_select_{value}", count)
             else:
                 add("hermes_durable_delivery_events", count, event=value)
         return tuple(metrics.values())

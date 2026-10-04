@@ -408,3 +408,18 @@ def test_shutdown_marks_schedule_neutral_execution_without_job_status_write(
     assert scheduler.mark_running_jobs_interrupted("shutdown") == ["job-1"]
     assert calls == []
     assert scheduler._is_interrupted("job-1") is True
+
+
+def test_multi_continuation_keeps_canonical_labels_and_current_schedule(monkeypatch):
+    job = _job()
+    original = deepcopy(job)
+    runs = []
+    monkeypatch.setattr(jobs, "get_job", lambda _job_id: job)
+    monkeypatch.setattr(scheduler, "create_triggered_execution", lambda *args, **kwargs: ({"id": "set-continuation"}, True))
+    monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: ImmediatePool())
+    monkeypatch.setattr(scheduler, "run_one_job", lambda continuation, **kwargs: runs.append(continuation) or True)
+    assert _enqueue(selected_index=None, selected_label=None,
+                    selected_indices=[2, 4], selected_labels=["Gas", "Internet"]) == ("accepted", None)
+    assert "Selected options:\n2. Gas\n4. Internet" in runs[0]["prompt"]
+    assert "option_" not in runs[0]["prompt"]
+    assert job == original

@@ -35,7 +35,7 @@ logger = logging.getLogger("tools.tool_search")
 # maps to one gateway request. Describe has no such remote limit.
 _MAX_QUERIES_PER_CALL = 7
 _MAX_DESCRIBE_NAMES_PER_CALL = 10
-_ALWAYS_VISIBLE_BUILTIN_TOOLS = frozenset({"request_decision", "durable_request"})
+_ALWAYS_VISIBLE_BUILTIN_TOOLS = frozenset({"request_decision", "request_multi_select", "durable_request"})
 
 
 @dataclass(frozen=True)

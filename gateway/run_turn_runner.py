@@ -25,6 +25,7 @@ from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.turn_context import TurnContext
+from gateway.run_turn_runner_multi_select import MultiSelectTurnMixin
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
 
@@ -72,7 +73,7 @@ class _ExecApprovalDeclined(RuntimeError):
     """
 
 
-class TurnRunner:
+class TurnRunner(MultiSelectTurnMixin):
     """Per-turn collaborator carrying ``GatewayRunner._run_agent_inner``'s tool-progress callbacks."""
 
     def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
@@ -134,7 +135,7 @@ class TurnRunner:
         # the progress_queue guard because log mode runs without a chat progress queue.
         if ctx.log_queue is not None and event_type == "tool.started" and tool_name and tool_name != "_thinking":
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            preview_str = f' "{preview}"' if preview else ""
+            preview_str = f' "{preview}"' if preview and tool_name != "request_multi_select" else ""
             ctx.log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
         if not ctx.progress_queue or not ctx._run_still_current():
             return
@@ -1118,6 +1119,7 @@ class TurnRunner:
             user_id=src.user_id, user_id_alt=src.user_id_alt, user_name=src.user_name,
             chat_id=src.chat_id, chat_name=src.chat_name, chat_type=src.chat_type, thread_id=src.thread_id,
             gateway_session_key=ctx.session_key,
+            interactive_multi_select_callback=self._multi_select_callback_for_turn(),
             session_db=getattr(runner._session_db, "_db", runner._session_db),
             # Reload from disk — do not reuse the startup snapshot.
             # See #60955.
@@ -1286,6 +1288,7 @@ class TurnRunner:
         agent.memory_notifications = str(mem_notif).lower() if mem_notif else "on"
         agent.clarify_callback = self._clarify_callback_sync
         agent.interactive_prompt_callback = self._interactive_prompt_callback_sync
+        agent.interactive_multi_select_callback = self._multi_select_callback_for_turn()
         # Thinking between tool calls is independent of tool_progress mode (Mattermost opts in
         # per platform so global scratch-text doesn't leak into threads).
         agent.thinking_progress = ctx._thinking_enabled
@@ -1725,11 +1728,13 @@ class TurnRunner:
         from tools.approval_context import reset_current_session_key, set_current_session_key
         from tools.interactive_prompt_context import (
             bind_interactive_prompt_callback, reset_interactive_prompt_callback,
+            bind_interactive_multi_select_callback, reset_interactive_multi_select_callback,
         )
         ctx = self._ctx
         session_key = ctx.session_key or ""
         token = set_current_session_key(session_key)
         interactive_token = bind_interactive_prompt_callback(self._interactive_prompt_callback_sync)
+        multi_select_token = bind_interactive_multi_select_callback(self._multi_select_callback_for_turn())
         register_gateway_notify(session_key, self._approval_notify_sync)
         try:
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
@@ -1761,6 +1766,7 @@ class TurnRunner:
                 return agent.run_conversation(api_message, **kwargs)
         finally:
             unregister_gateway_notify(session_key)
+            reset_interactive_multi_select_callback(multi_select_token)
             reset_interactive_prompt_callback(interactive_token)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
             # run (interrupt, completion, gateway shutdown). Idempotent.

@@ -1,6 +1,9 @@
 # Phase 5B–5D interaction requirements
 
-Status: requirements captured; implementation plans pending.
+Status: Phase 5B implemented and verified locally; see its
+[implementation record](../plans/2026-10-02-phase5b-atomic-multi-select.md).
+Phase 5C and 5D requirements are captured; implementation plans remain pending.
+Production remains on Phase 5A.
 
 Source: the Phase 5 implementation specification supplied for this project.
 Phase 5A has its own [design](../plans/2026-08-31-phase5a-durable-request-command-responses-design.md),

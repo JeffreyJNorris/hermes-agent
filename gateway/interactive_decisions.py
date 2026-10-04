@@ -17,6 +17,9 @@ from typing import Awaitable, Callable, Generic, TypeVar
 
 from gateway.interactive import (
     InteractivePromptSpec,
+    InteractiveMultiSelectSpec,
+    MultiSelectOutcome,
+    validate_selection_bounds,
     PromptOption,
     PromptOutcome,
     PromptOutcomeStatus,
@@ -269,3 +272,83 @@ __all__ = [
     "request_decision",
     "request_decision_async",
 ]
+
+
+@dataclass(frozen=True)
+class MultiDecisionOption(Generic[ValueT]):
+    value: ValueT
+    label: str
+    style: PromptStyle = PromptStyle.SECONDARY
+
+
+@dataclass(frozen=True)
+class MultiDecisionRequest(Generic[ValueT]):
+    kind: str
+    title: str
+    body: str
+    options: tuple[MultiDecisionOption[ValueT], ...]
+    min_selections: int
+    max_selections: int
+    timeout_seconds: float = 60.0
+
+
+@dataclass(frozen=True)
+class MultiDecisionResult(Generic[ValueT]):
+    status: DecisionStatus
+    values: tuple[ValueT, ...] = ()
+    reason: str | None = None
+
+
+def _build_multi_prompt(request: MultiDecisionRequest[ValueT]):
+    if not isinstance(request, MultiDecisionRequest):
+        raise TypeError("request must be a MultiDecisionRequest")
+    validate_selection_bounds(len(request.options), request.min_selections, request.max_selections)
+    options = []
+    values = {}
+    for index, option in enumerate(request.options, start=1):
+        if not isinstance(option, MultiDecisionOption):
+            raise TypeError("request options must be MultiDecisionOption values")
+        option_id = f"decision_{index}"
+        options.append(PromptOption(option_id, option.label, option.style))
+        values[option_id] = option.value
+    return InteractiveMultiSelectSpec(
+        kind=request.kind, title=request.title, body=request.body, options=tuple(options),
+        min_selections=request.min_selections, max_selections=request.max_selections,
+        timeout_seconds=request.timeout_seconds,
+    ), values
+
+
+def _map_multi_outcome(outcome: MultiSelectOutcome, values: dict[str, ValueT],
+                       request: MultiDecisionRequest[ValueT]) -> MultiDecisionResult[ValueT]:
+    if not isinstance(outcome, MultiSelectOutcome):
+        raise TypeError("multi-select callback must return MultiSelectOutcome")
+    status = DecisionStatus(outcome.status.value)
+    if outcome.status is not PromptOutcomeStatus.SELECTED:
+        return MultiDecisionResult(status=status, reason=outcome.reason)
+    ids = outcome.response.option_ids
+    if (not request.min_selections <= len(ids) <= request.max_selections
+        or len(set(ids)) != len(ids) or any(option_id not in values for option_id in ids)):
+        raise RuntimeError("multi-select returned an invalid selection")
+    selected = set(ids)
+    return MultiDecisionResult(status=status, values=tuple(value for key, value in values.items() if key in selected))
+
+
+def request_multi_decision(request: MultiDecisionRequest[ValueT], *, callback=None) -> MultiDecisionResult[ValueT]:
+    prompt, values = _build_multi_prompt(request)
+    if callback is None:
+        from tools.interactive_prompt_context import require_interactive_multi_select_callback
+        callback = require_interactive_multi_select_callback()
+    if not callable(callback):
+        raise TypeError("multi-select callback must be callable")
+    return _map_multi_outcome(callback(prompt), values, request)
+
+
+async def request_multi_decision_async(request: MultiDecisionRequest[ValueT], *, callback) -> MultiDecisionResult[ValueT]:
+    if not callable(callback):
+        raise TypeError("multi-select callback must be callable")
+    prompt, values = _build_multi_prompt(request)
+    return _map_multi_outcome(await callback(prompt), values, request)
+
+
+__all__ += ["MultiDecisionOption", "MultiDecisionRequest", "MultiDecisionResult",
+            "request_multi_decision", "request_multi_decision_async"]

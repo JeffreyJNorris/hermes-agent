@@ -214,6 +214,16 @@ class GatewayDurableMixin:
                 if option.id == selected_option.id
             )
 
+        selected = [
+            (index, option.label)
+            for index, option in enumerate(request.options, start=1)
+            if option.id in request.selected_option_ids
+        ]
+        multi_selection = {
+            "selected_indices": [index for index, _ in selected],
+            "selected_labels": [label for _, label in selected],
+        } if request.selection_mode == "multi" else {}
+
         if request.origin_type == "cron":
             try:
                 from cron.scheduler import enqueue_durable_request_continuation
@@ -231,6 +241,7 @@ class GatewayDurableMixin:
                         None if selected_option is None else selected_option.label
                     ),
                     terminal_reason=request.terminal_reason,
+                    **multi_selection,
                     adapters=adapters,
                     loop=asyncio.get_running_loop(),
                 )
@@ -303,6 +314,7 @@ class GatewayDurableMixin:
             "selected_label": (
                 None if selected_option is None else selected_option.label
             ),
+            **multi_selection,
             "terminal_reason": request.terminal_reason or "",
             "message_id": f"durable-request:{request.request_id}",
         }

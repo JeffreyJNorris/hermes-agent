@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # Interactive / user-facing tools never run concurrently: any of these in a batch is a barrier.
 _NEVER_PARALLEL_TOOLS = frozenset({
-    "clarify", "manage_connections", "manage_catalog", "request_decision", "durable_request",
+    "clarify", "manage_connections", "manage_catalog", "request_decision", "request_multi_select", "durable_request",
 })
 
 # Read-only tools with no shared mutable session state.

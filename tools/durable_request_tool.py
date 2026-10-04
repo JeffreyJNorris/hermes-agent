@@ -32,6 +32,8 @@ from gateway.interactive import (
     MAX_PROMPT_BODY_LENGTH,
     MAX_PROMPT_OPTION_LABEL_LENGTH,
     MAX_PROMPT_OPTIONS,
+    MAX_MULTI_SELECT_OPTIONS,
+    validate_selection_bounds,
     MAX_PROMPT_TITLE_LENGTH,
 )
 from gateway.session_context import get_session_env
@@ -68,6 +70,9 @@ def durable_request_tool(
     expires_in_seconds: Any = None,
     wake_on_terminal: Any = False,
     request_id: Any = None,
+    selection_mode: Any = "single",
+    min_selections: Any = 1,
+    max_selections: Any = 1,
 ) -> str:
     try:
         action_value = _normalize_action(action)
@@ -103,7 +108,19 @@ def durable_request_tool(
                 field="question",
                 maximum=MAX_PROMPT_BODY_LENGTH,
             )
-            labels = _normalize_options(options)
+            if selection_mode not in ("single", "multi"):
+                raise ValueError("selection_mode must be single or multi")
+            labels = _normalize_options(
+                options, maximum=MAX_MULTI_SELECT_OPTIONS if selection_mode == "multi" else MAX_PROMPT_OPTIONS,
+            )
+            if selection_mode == "single":
+                if (
+                    type(min_selections) is not int or type(max_selections) is not int
+                    or (min_selections, max_selections) != (1, 1)
+                ):
+                    raise ValueError("single requests require min_selections=max_selections=1")
+            else:
+                validate_selection_bounds(len(labels), min_selections, max_selections)
             ttl = _normalize_ttl(
                 expires_in_seconds,
                 default=config.default_ttl_seconds,
@@ -123,6 +140,9 @@ def durable_request_tool(
                     ),
                     ttl_seconds=ttl,
                     reference=normalized_reference,
+                    selection_mode=selection_mode,
+                    min_selections=min_selections,
+                    max_selections=max_selections,
                 ),
                 target=config.target,
                 responder_mode=origin.responder_mode,
@@ -218,13 +238,13 @@ def _normalize_optional_text(
     )
 
 
-def _normalize_options(value: Any) -> tuple[str, ...]:
+def _normalize_options(value: Any, *, maximum: int = MAX_PROMPT_OPTIONS) -> tuple[str, ...]:
     if not isinstance(value, list):
         raise ValueError("options must be an array of strings")
-    if not MIN_DURABLE_OPTIONS <= len(value) <= MAX_PROMPT_OPTIONS:
+    if not MIN_DURABLE_OPTIONS <= len(value) <= maximum:
         raise ValueError(
             f"options must contain between {MIN_DURABLE_OPTIONS} and "
-            f"{MAX_PROMPT_OPTIONS} choices"
+            f"{maximum} choices"
         )
     labels: list[str] = []
     normalized_labels: set[str] = set()
@@ -358,19 +378,32 @@ def _serialize_request(request: DurableRequest) -> dict[str, Any]:
         payload["status"] = "pending"
         payload["delivery"] = "delivered"
     elif request.status is DurableRequestStatus.SELECTED:
-        option = request.selected_option
-        if option is None:
-            raise ValueError("selected durable request has no stored option")
-        index = next(
-            index
-            for index, candidate in enumerate(request.options, start=1)
-            if candidate.id == option.id
-        )
-        payload.update(
-            selected_index=index,
-            selected_label=option.label,
-            resolved_at=_format_timestamp(request.resolved_at),
-        )
+        if request.selection_mode == "multi":
+            selected = [
+                (index, option.label)
+                for index, option in enumerate(request.options, start=1)
+                if option.id in request.selected_option_ids
+            ]
+            if not selected:
+                raise ValueError("selected multi request has no stored options")
+            payload.update(
+                selected_indices=[index for index, _ in selected],
+                selected_labels=[label for _, label in selected],
+                resolved_at=_format_timestamp(request.resolved_at),
+            )
+        else:
+            option = request.selected_option
+            if option is None:
+                raise ValueError("selected durable request has no stored option")
+            index = next(
+                index
+                for index, candidate in enumerate(request.options, start=1)
+                if candidate.id == option.id
+            )
+            payload.update(
+                selected_index=index, selected_label=option.label,
+                resolved_at=_format_timestamp(request.resolved_at),
+            )
     elif request.resolved_at is not None:
         payload["resolved_at"] = _format_timestamp(request.resolved_at)
 
@@ -426,9 +459,12 @@ DURABLE_REQUEST_SCHEMA = {
                     "maxLength": MAX_PROMPT_OPTION_LABEL_LENGTH,
                 },
                 "minItems": MIN_DURABLE_OPTIONS,
-                "maxItems": MAX_PROMPT_OPTIONS,
-                "description": "Required for post. Complete one-choice option set.",
+                "maxItems": MAX_MULTI_SELECT_OPTIONS,
+                "description": "Required for post. Complete option set: up to 5 single or 10 multi choices.",
             },
+            "selection_mode": {"type": "string", "enum": ["single", "multi"], "default": "single"},
+            "min_selections": {"type": "integer", "minimum": 1, "maximum": MAX_MULTI_SELECT_OPTIONS, "default": 1},
+            "max_selections": {"type": "integer", "minimum": 1, "maximum": MAX_MULTI_SELECT_OPTIONS, "default": 1},
             "reference": {
                 "type": "string",
                 "minLength": 1,
@@ -476,6 +512,9 @@ registry.register(
         expires_in_seconds=args.get("expires_in_seconds"),
         wake_on_terminal=args.get("wake_on_terminal", False),
         request_id=args.get("request_id"),
+        selection_mode=args.get("selection_mode", "single"),
+        min_selections=args.get("min_selections", 1),
+        max_selections=args.get("max_selections", 1),
     ),
     check_fn=check_durable_request_requirements,
     emoji="📥",

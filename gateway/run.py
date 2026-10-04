@@ -3075,7 +3075,11 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
             f"Title: {evt.get('title', '')}",
             f"Question: {evt.get('question', '')}",
         ))
-        if (label := evt.get("selected_label")) is not None:
+        if labels := evt.get("selected_labels"):
+            indices = evt.get("selected_indices") or []
+            lines.append("Selected options:")
+            lines.extend(f"{index}. {str(label)[:200]}" for index, label in zip(indices[:10], labels[:10]))
+        elif (label := evt.get("selected_label")) is not None:
             index = evt.get("selected_index")
             lines.append(f"Selected option: {f'{index}. ' if index is not None else ''}{label}")
         elif reason := str(evt.get("terminal_reason") or "").strip():

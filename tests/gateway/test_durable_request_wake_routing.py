@@ -269,3 +269,24 @@ def test_terminal_event_formatter_is_self_contained_and_provider_neutral() -> No
     assert "discord-message" not in text
     assert "operator" not in text
     assert "inbox" not in text
+
+
+def test_multi_wake_preserves_canonical_indices_labels_without_option_ids():
+    event = {"type": "durable_request_terminal", "request_id": "drq_test",
+             "status": "selected", "title": "Bills", "question": "Choose bills.",
+             "selected_indices": [1, 3], "selected_labels": ["Electricity", "Water"],
+             "selected_option_ids": ["private_first", "private_third"]}
+    text = _format_gateway_process_notification(event)
+    assert "Selected options:\n1. Electricity\n3. Water" in text
+    assert "private_first" not in text and "private_third" not in text
+    assert "not an authorization token" in text
+
+
+@pytest.mark.parametrize("status", ["expired", "cancelled"])
+def test_unselected_multi_wake_keeps_terminal_reason(status):
+    text = _format_gateway_process_notification({
+        "type": "durable_request_terminal", "status": status, "selected_indices": [],
+        "selected_labels": [], "terminal_reason": "deadline_elapsed",
+    })
+    assert "Reason: deadline_elapsed" in text
+    assert "Selected options:" not in text

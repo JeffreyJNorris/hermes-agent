@@ -158,6 +158,7 @@ TOOLSETS = {
     ),
     "clarify": _ts("Ask the user clarifying questions (multiple-choice or open-ended)", ["clarify"]),
     "decision": _ts("Request one closed finite-choice decision from the active user", ["request_decision"]),
+    "multi_select": _ts("Request one complete set of choices from the active user", ["request_multi_select"]),
     "durable_request": _ts("Post and inspect persisted finite-choice requests", ["durable_request"]),
     "code_execution": _ts("Run Python scripts that call tools programmatically (reduces LLM round trips)", ["execute_code"]),
     "delegation": _ts("Spawn subagents with isolated context for complex subtasks", ["delegate_task"]),
@@ -220,7 +221,7 @@ TOOLSETS = {
     "hermes-discord": _bundle(
         "Discord bot toolset - full access (terminal has safety checks via dangerous "
         "command approval)",
-        ["request_decision", "durable_request", "discord", "discord_admin"],
+        ["request_decision", "request_multi_select", "durable_request", "discord", "discord_admin"],
     ),
     "hermes-whatsapp": _bundle("WhatsApp bot toolset - similar to Telegram (personal messaging, more trusted)"),
     "hermes-slack": _bundle("Slack bot toolset - full access for workspace use (terminal has safety checks)"),

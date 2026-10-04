@@ -55,6 +55,10 @@ _OBSERVABLE_METRIC_NAMES = (
     "hermes_durable_stale_claims", "hermes_durable_unknown_actions", "hermes_durable_reconciliations",
     "hermes_durable_oldest_backlog_seconds", "hermes_durable_command_responses",
     "hermes_durable_delivery_events",
+    "hermes_durable_multi_select_submissions", "hermes_durable_multi_select_invalid_sets",
+    "hermes_durable_multi_select_active", "hermes_durable_multi_select_stuck",
+    "hermes_interactive_multi_select_submissions", "hermes_interactive_multi_select_invalid_sets",
+    "hermes_interactive_multi_select_active", "hermes_interactive_multi_select_stuck",
 )
 
 
@@ -213,6 +217,14 @@ def _read_runtime_snapshot(config: Dict[str, Any]):
         )
     else:
         gateway_snapshot.metrics.extend(durable_snapshot.metrics)
+    try:
+        from gateway.interactive import interactive_multi_select_metrics
+        gateway_snapshot.metrics.extend(
+            GatewayMetric(f"hermes_interactive_multi_select_{name}", value, {})
+            for name, value in interactive_multi_select_metrics().items()
+        )
+    except Exception as exc:
+        logger.warning("interactive health snapshot unavailable (error_type=%s)", type(exc).__name__)
     return gateway_snapshot
 
 

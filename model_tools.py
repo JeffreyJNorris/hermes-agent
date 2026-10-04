@@ -271,7 +271,9 @@ def _tool_defs_cache_key(
         cfg_fp = file_signature(cfg_stat)
     except (FileNotFoundError, OSError, ImportError):
         cfg_fp = None
+    from tools.interactive_prompt_context import get_interactive_multi_select_callback
     return (
+        get_interactive_multi_select_callback() is not None,
         registry.current_scope_key(), frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
         bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
@@ -338,6 +340,9 @@ def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets:
     # disabled toolset are strictly stripped out. See issue #17309.
     if disabled_toolsets:
         _apply_toolset_selection(tools, disabled_toolsets, quiet_mode, disable=True)
+    from tools.interactive_prompt_context import get_interactive_multi_select_callback
+    if get_interactive_multi_select_callback() is None:
+        tools.discard("request_multi_select")
     return tools
 
 

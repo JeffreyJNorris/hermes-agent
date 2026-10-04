@@ -48,6 +48,10 @@ class _FakeButton:
 class _FakeSelect:
     def __init__(self, *_, **kwargs):
         self.options = kwargs.get("options", [])
+        self.custom_id = kwargs.get("custom_id")
+        self.min_values = kwargs.get("min_values", 1)
+        self.max_values = kwargs.get("max_values", 1)
+        self.disabled = False
         self.values = []
         self.callback = None
 
@@ -128,11 +132,13 @@ def discord_adapter_module(monkeypatch):
     view_names = (
         "DurableRequestView",
         "InteractivePromptView",
+        "InteractiveMultiSelectView",
         "ExecApprovalView",
         "SlashConfirmView",
         "UpdatePromptView",
         "ModelPickerView",
         "ClarifyChoiceView",
+        "ChoicePickerView",
     )
     missing = object()
     original_views = {
@@ -626,3 +632,157 @@ async def test_failed_general_authorization_never_reaches_store(
     assert interaction.response.messages == [
         ("You are not authorized to use this control.", True)
     ]
+
+
+@pytest.mark.asyncio
+async def test_multi_native_real_registry_commits_set_before_failed_edit_and_rejects_scope(
+    discord_adapter_module, monkeypatch,
+) -> None:
+    import gateway.interactive as interactive
+
+    module = discord_adapter_module
+    clock = [1_000.0]
+    registry = interactive.InteractivePromptRegistry(clock=lambda: clock[0])
+    monkeypatch.setattr(interactive, "_registry", registry)
+    handle = registry.register_multi_select_prompt(
+        interactive.InteractiveMultiSelectSpec(
+            kind="test.multi", title="Choose bills", body="Select the utility categories.",
+            options=tuple(PromptOption(f"private-{slot}", "L" * 120 if slot == 1 else f"Label {slot}") for slot in range(1, 7)),
+            min_selections=2, max_selections=4, timeout_seconds=60,
+        ),
+        scope=interactive.PromptScope("session", "discord", "10", "11", "42"),
+    )
+    channel = _Channel()
+    adapter = object.__new__(module.DiscordAdapter)
+    adapter._client = _Client(channel)
+    adapter._allowed_user_ids = {"42"}
+    adapter._allowed_role_ids = set()
+    adapter.MAX_MESSAGE_LENGTH = 2000
+    result = await adapter.send_interactive_multi_select_prompt("10", handle.prompt, {"thread_id": "11"})
+    assert result.success and result.message_id == "99"
+    assert registry.bind_delivery(prompt_id=handle.prompt.prompt_id, platform="discord", message_id="99")
+    view = channel.sent[0]["view"]
+    assert len(view.children) == 1
+    control = view.children[0]
+    assert control.custom_id == f"ipm:{handle.prompt.prompt_id}"
+    assert (control.min_values, control.max_values) == (2, 4)
+    assert [option.value for option in control.options] == [str(slot) for slot in range(1, 7)]
+    assert len(control.options[0].label) <= module._DISCORD_SELECT_FIELD_LIMIT
+    assert handle.prompt.options[0].label in channel.sent[0]["content"]
+    assert channel.sent[0]["allowed_mentions"] is _FakeAllowedMentions.sentinel
+
+    def interaction(values=("3", "1"), custom_id=None):
+        value = _interaction([], fail_edit=True)
+        value.data = {"custom_id": custom_id or control.custom_id, "values": list(values)}
+        return value
+
+    monkeypatch.setattr(module, "_component_check_auth", lambda *_: False)
+    denied = interaction()
+    await control.callback(denied)
+    assert "not authorized" in denied.response.messages[0][0]
+    assert not control.disabled
+    monkeypatch.setattr(module, "_component_check_auth", lambda *_: True)
+    for field, bad_value in (("channel_id", 12), ("message", SimpleNamespace(id=100)), ("user", SimpleNamespace(id=43))):
+        mismatch = interaction()
+        setattr(mismatch, field, bad_value)
+        await control.callback(mismatch)
+        assert "does not match" in mismatch.response.messages[0][0]
+        assert not control.disabled
+    for values in (("1", "1"), ("1",), ("1", "7"), ("1", "2", "3", "4", "5")):
+        invalid = interaction(values)
+        await control.callback(invalid)
+        assert "invalid" in invalid.response.messages[0][0]
+        assert not control.disabled
+    wrong_id = interaction(custom_id="ipm:" + "z" * 32)
+    await control.callback(wrong_id)
+    assert "invalid" in wrong_id.response.messages[0][0]
+    assert not control.disabled
+
+    selected = interaction()
+    await control.callback(selected)
+    outcome = registry.wait_for_multi_select(handle)
+    assert outcome.response.option_ids == ("private-1", "private-3")
+    assert control.disabled and selected.response.deferred
+    repeated = interaction(("2", "4"))
+    await control.callback(repeated)
+    assert "already answered" in repeated.response.messages[0][0]
+    assert registry.wait_for_multi_select(handle).response.option_ids == ("private-1", "private-3")
+    # Single entry point cannot silently change a multi prompt into buttons.
+    assert not (await adapter.send_interactive_prompt("10", handle.prompt)).success
+    expiring = registry.register_multi_select_prompt(
+        interactive.InteractiveMultiSelectSpec(
+            kind="test.multi", title="Choose", body="Choose categories.",
+            options=handle.prompt.options, min_selections=1, max_selections=2, timeout_seconds=5,
+        ),
+        scope=interactive.PromptScope("session", "discord", "10", "11", "42"),
+    )
+    expiring_view = module.InteractiveMultiSelectView(expiring.prompt, {"42"})
+    expiring_view._message = _Message()
+    # A provider timeout firing early must not change authoritative state.
+    await expiring_view.on_timeout()
+    assert not expiring_view.children[0].disabled and not expiring_view._message.edits
+    clock[0] += 6
+    await expiring_view.on_timeout()
+    assert registry.wait_for_multi_select(expiring).status is interactive.PromptOutcomeStatus.EXPIRED
+    assert expiring_view.children[0].disabled and expiring_view.stopped
+    assert len(expiring_view._message.edits) == 1
+    await expiring_view.on_timeout()
+    assert len(expiring_view._message.edits) == 1
+
+
+@pytest.mark.asyncio
+async def test_multi_durable_native_restore_and_command_race_preserve_sqlite_set(
+    discord_adapter_module, monkeypatch, tmp_path,
+) -> None:
+    import asyncio
+    from gateway.durable_requests import DurableRequestSpec, DurableRequestStore
+
+    module = discord_adapter_module
+    database = tmp_path / "state.db"
+    store = DurableRequestStore(database, wall_clock=lambda: 1_000.0)
+    request = store.create(
+        DurableRequestSpec(
+            kind="test.multi", title="Choose utilities", body="Choose categories.",
+            options=tuple(DurableRequestOption(f"private-{slot}", f"Label {slot}") for slot in range(1, 7)),
+            ttl_seconds=60, selection_mode="multi", min_selections=2, max_selections=4,
+        ),
+        target=DurableRequestTarget("discord", "10", "11"),
+        responder_mode=DurableResponderMode.INITIATOR, expected_actor_id="42",
+        origin_type="session", origin_id="session", command_response_allowed=True,
+    ).request
+    claim = store.claim_next_pending(["discord"])
+    request = store.bind_delivery(request_id=request.request_id, claim_id=claim.claim_id, platform="discord", message_id="99")
+    # Reopen the ledger, then register the exact stored native message.
+    restarted = DurableRequestStore(database, wall_clock=lambda: 1_000.0)
+    monkeypatch.setattr(module, "get_durable_request_store", lambda: restarted)
+    monkeypatch.setattr(module, "_component_check_auth", lambda *_: True)
+    channel = _Channel()
+    adapter = object.__new__(module.DiscordAdapter)
+    adapter._client = _Client(channel)
+    adapter._allowed_user_ids = {"42"}
+    adapter._allowed_role_ids = set()
+    adapter.MAX_MESSAGE_LENGTH = 2000
+    assert (await adapter.restore_durable_request(request)).success
+    view = adapter._client.views[0][0]
+    control = view.children[0]
+    assert control.custom_id.startswith("drm:") and "private" not in control.custom_id
+    assert len(control.options) == 6 and view.timeout is None
+    native = _interaction([], fail_edit=True)
+    native.data = {"custom_id": control.custom_id, "values": ["3", "1"]}
+
+    command_result, _ = await asyncio.gather(
+        asyncio.to_thread(restarted.resolve_command, request_id=request.request_id, option_slots=(4, 2), platform="discord", channel_id="11", actor_id="42"),
+        control.callback(native),
+    )
+    persisted = restarted.get(request_id=request.request_id)
+    assert persisted.selected_option_id is None
+    assert persisted.selected_option_ids in (("private-1", "private-3"), ("private-2", "private-4"))
+    if command_result.status is DurableResolveStatus.RESOLVED:
+        assert native.response.messages == [("This request was already answered.", True)]
+    else:
+        assert command_result.status is DurableResolveStatus.ALREADY_RESOLVED
+        assert native.response.deferred and control.disabled and not view.stopped
+    repeat = _interaction([])
+    repeat.data = native.data
+    await control.callback(repeat)
+    assert repeat.response.messages == [("This request was already answered.", True)]

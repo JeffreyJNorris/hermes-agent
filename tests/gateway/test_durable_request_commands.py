@@ -38,7 +38,7 @@ def test_request_command_is_gateway_only_and_dispatches_while_busy():
 
     assert command is not None
     assert command.gateway_only is True
-    assert command.args_hint == "respond <request-id> <number>"
+    assert command.args_hint == "respond <request-id> <number[,number...]>"
     assert command.busy_policy == "dispatch"
     runner = _runner()
     assert runner._gateway_plain_command_handlers()["request"] == runner._handle_request_command
@@ -84,7 +84,9 @@ async def test_valid_request_response_uses_actual_scope(monkeypatch):
         f"respond {REQUEST_ID} 0",
         f"respond {REQUEST_ID} approve",
         f"respond {REQUEST_ID} option_internal_id",
-        f"respond {REQUEST_ID} 1,3",
+        f"respond {REQUEST_ID} 1,,3",
+        f"respond {REQUEST_ID} 1-3",
+        f"respond {REQUEST_ID} 1 3",
         f"respond drq_short 1",
         f"respond {REQUEST_ID} 1 trailing",
         f"Respond {REQUEST_ID} 1",
@@ -98,7 +100,7 @@ async def test_malformed_request_commands_return_usage_without_store_lookup(
 
     result = await _runner()._handle_request_command(_event(f"/request {args}".rstrip()))
 
-    assert result == "Usage: /request respond <request-id> <number>"
+    assert result == "Usage: /request respond <request-id> <number[,number...]>"
     resolve.assert_not_awaited()
 
 
@@ -109,7 +111,7 @@ async def test_request_command_rejects_oversized_input_before_parsing(monkeypatc
 
     result = await _runner()._handle_request_command(_event("/request " + "x" * 1000))
 
-    assert result == "Usage: /request respond <request-id> <number>"
+    assert result == "Usage: /request respond <request-id> <number[,number...]>"
     resolve.assert_not_awaited()
 
 
@@ -145,3 +147,15 @@ async def test_request_command_maps_results_without_scope_details(
     assert "channel-1" not in result
     assert "actor-1" not in result
     assert REQUEST_ID not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slots", ["3,1", "3, 1", "1,1"])
+async def test_request_command_passes_complete_numeric_set_to_authoritative_store(monkeypatch, slots):
+    calls = []
+    def resolve(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(status=DurableResolveStatus.RESOLVED)
+    monkeypatch.setattr("gateway.durable_requests.resolve_durable_request_command", resolve)
+    assert await _runner()._handle_request_command(_event(f"/request respond {REQUEST_ID} {slots}")) == "Response recorded."
+    assert calls[0]["option_slots"] == tuple(int(part) for part in slots.split(","))

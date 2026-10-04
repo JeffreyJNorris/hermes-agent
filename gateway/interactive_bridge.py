@@ -22,6 +22,11 @@ from typing import Any, Awaitable, Callable, Protocol
 from agent.async_utils import consume_detached_task_result
 from gateway.interactive import (
     InteractivePromptSpec,
+    InteractiveMultiSelectSpec,
+    MultiSelectHandle,
+    MultiSelectOutcome,
+    MultiSelectResponse,
+    register_multi_select_prompt,
     PromptHandle,
     PromptOutcome,
     PromptOutcomeStatus,
@@ -55,6 +60,10 @@ class _AdapterLike(Protocol):
         chat_id: str,
         prompt: Any,
         metadata: dict | None = None,
+    ) -> _SendResultLike: ...
+
+    async def send_interactive_multi_select_prompt(
+        self, chat_id: str, prompt: Any, metadata: dict | None = None,
     ) -> _SendResultLike: ...
 
     async def send(
@@ -113,6 +122,22 @@ class InteractivePromptBridge:
         self._fallback_sender = fallback_sender
         self._event_loop_thread_id = event_loop_thread_id
 
+    @staticmethod
+    def _outcome_type(handle):
+        return MultiSelectOutcome if isinstance(handle, MultiSelectHandle) else PromptOutcome
+
+    def request_multi_select_sync(self, prompt: InteractiveMultiSelectSpec, *,
+                                  resolver: Callable[[MultiSelectResponse], None] | None = None) -> MultiSelectOutcome:
+        if not isinstance(prompt, InteractiveMultiSelectSpec):
+            raise TypeError("prompt must be an InteractiveMultiSelectSpec")
+        return self.request_sync(prompt, resolver=resolver)
+
+    async def request_multi_select_async(self, prompt: InteractiveMultiSelectSpec, *,
+                                        resolver: Callable[[MultiSelectResponse], None] | None = None) -> MultiSelectOutcome:
+        if not isinstance(prompt, InteractiveMultiSelectSpec):
+            raise TypeError("prompt must be an InteractiveMultiSelectSpec")
+        return await self.request_async(prompt, resolver=resolver)
+
     def request_sync(
         self,
         prompt: InteractivePromptSpec,
@@ -125,11 +150,12 @@ class InteractivePromptBridge:
         the gateway event loop, then this worker blocks on the registry handle.
         """
         self._assert_not_event_loop_thread()
-        handle = register_prompt(prompt, scope=self._scope, resolver=resolver)
+        register = register_multi_select_prompt if isinstance(prompt, InteractiveMultiSelectSpec) else register_prompt
+        handle = register(prompt, scope=self._scope, resolver=resolver)
 
         if self._event_loop.is_closed() or not self._event_loop.is_running():
             cancel_prompt(handle.prompt.prompt_id, reason="gateway_loop_unavailable")
-            return PromptOutcome(
+            return self._outcome_type(handle)(
                 PromptOutcomeStatus.DELIVERY_FAILED,
                 reason="gateway_loop_unavailable",
             )
@@ -165,7 +191,7 @@ class InteractivePromptBridge:
                         "exception_class": type(exc).__name__,
                     },
                 )
-                return PromptOutcome(
+                return self._outcome_type(handle)(
                     PromptOutcomeStatus.DELIVERY_FAILED,
                     reason="delivery_bridge_failed",
                 )
@@ -193,7 +219,8 @@ class InteractivePromptBridge:
             raise RuntimeError(
                 "interactive prompt async request must run on the gateway event loop"
             )
-        handle = register_prompt(prompt, scope=self._scope, resolver=resolver)
+        register = register_multi_select_prompt if isinstance(prompt, InteractiveMultiSelectSpec) else register_prompt
+        handle = register(prompt, scope=self._scope, resolver=resolver)
         prompt_id = handle.prompt.prompt_id
         remaining = max(0.0, handle.deadline - time.monotonic())
         delivery_task = asyncio.create_task(self._deliver_registered(handle))
@@ -224,7 +251,7 @@ class InteractivePromptBridge:
                             "exception_class": type(exc).__name__,
                         },
                     )
-                    return PromptOutcome(
+                    return self._outcome_type(handle)(
                         PromptOutcomeStatus.DELIVERY_FAILED,
                         reason="delivery_bridge_failed",
                     )
@@ -268,7 +295,10 @@ class InteractivePromptBridge:
     ) -> _DeliveryDecision:
         prompt_id = handle.prompt.prompt_id
         try:
-            native_result = await self._adapter.send_interactive_prompt(
+            sender = (self._adapter.send_interactive_multi_select_prompt
+                      if isinstance(handle, MultiSelectHandle)
+                      else self._adapter.send_interactive_prompt)
+            native_result = await sender(
                 chat_id=self._scope.chat_id,
                 prompt=handle.prompt,
                 metadata=self._metadata or None,
@@ -311,7 +341,7 @@ class InteractivePromptBridge:
                     )
                 return _DeliveryDecision(
                     wait_for_resolution=False,
-                    outcome=PromptOutcome(
+                    outcome=self._outcome_type(handle)(
                         PromptOutcomeStatus.DELIVERY_FAILED,
                         reason="delivery_binding_failed",
                     ),
@@ -337,7 +367,7 @@ class InteractivePromptBridge:
                 )
             return _DeliveryDecision(
                 wait_for_resolution=False,
-                outcome=PromptOutcome(
+                outcome=self._outcome_type(handle)(
                     PromptOutcomeStatus.UNSUPPORTED,
                     reason="text_fallback_busy",
                 ),
@@ -377,7 +407,7 @@ class InteractivePromptBridge:
                 )
             return _DeliveryDecision(
                 wait_for_resolution=False,
-                outcome=PromptOutcome(
+                outcome=self._outcome_type(handle)(
                     PromptOutcomeStatus.UNSUPPORTED,
                     reason="text_fallback_unsupported",
                 ),
@@ -431,7 +461,7 @@ class InteractivePromptBridge:
             )
         return _DeliveryDecision(
             wait_for_resolution=False,
-            outcome=PromptOutcome(
+            outcome=self._outcome_type(handle)(
                 PromptOutcomeStatus.DELIVERY_FAILED,
                 reason=reason,
             ),

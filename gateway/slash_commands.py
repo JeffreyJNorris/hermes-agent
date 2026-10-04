@@ -87,9 +87,9 @@ with open(exit_code_path, "w", encoding="utf-8") as f:
 # its worker thread. (#35994)
 _RESET_CLEANUP_TIMEOUT_S = 30.0
 _REQUEST_COMMAND_MAX_LENGTH = 256
-_REQUEST_COMMAND_USAGE = "Usage: /request respond <request-id> <number>"
+_REQUEST_COMMAND_USAGE = "Usage: /request respond <request-id> <number[,number...]>"
 _REQUEST_RESPOND_RE = re.compile(
-    r"respond\s+(drq_[A-Za-z0-9_-]+)\s+([1-9][0-9]*)\s*"
+    r"respond\s+(drq_[A-Za-z0-9_-]+)\s+(.+)"
 )
 
 
@@ -213,7 +213,7 @@ class GatewaySlashCommandsMixin(
         return (entry[0] if entry else None) if isinstance(entry, (tuple, list)) else entry or None
 
     async def _handle_request_command(self, event: MessageEvent) -> str:
-        """Resolve one durable request option from an explicit receipt."""
+        """Resolve a complete durable selection from an explicit receipt."""
         from gateway.durable_requests import (
             DurableRequestError,
             DurableResolveStatus,
@@ -231,7 +231,12 @@ class GatewaySlashCommandsMixin(
         match = _REQUEST_RESPOND_RE.fullmatch(args)
         if match is None:
             return _REQUEST_COMMAND_USAGE
-        request_id, raw_slot = match.groups()
+        from gateway.interactive import parse_selection_slots
+
+        request_id, raw_slots = match.groups()
+        slots = parse_selection_slots(raw_slots)
+        if slots is None or "0" in slots:
+            return _REQUEST_COMMAND_USAGE
         try:
             _validate_request_id(request_id)
         except DurableRequestError:
@@ -241,7 +246,7 @@ class GatewaySlashCommandsMixin(
         result = await asyncio.to_thread(
             resolve_durable_request_command,
             request_id=request_id,
-            option_slots=(int(raw_slot),),
+            option_slots=tuple(int(slot) for slot in slots),
             platform=source.platform.value,
             channel_id=str(source.thread_id or source.chat_id),
             actor_id=source.user_id,

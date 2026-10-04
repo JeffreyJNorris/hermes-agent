@@ -1119,10 +1119,19 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     except Exception:
         agent._tool_snapshot_generation = 0
     import model_tools
-    agent.tools = model_tools.get_tool_definitions(
-        enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
-        quiet_mode=agent.quiet_mode,
+    from tools.interactive_prompt_context import (
+        bind_interactive_multi_select_callback, reset_interactive_multi_select_callback,
     )
+    callback_token = bind_interactive_multi_select_callback(
+        getattr(agent, "interactive_multi_select_callback", None)
+    )
+    try:
+        agent.tools = model_tools.get_tool_definitions(
+            enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
+            quiet_mode=agent.quiet_mode,
+        )
+    finally:
+        reset_interactive_multi_select_callback(callback_token)
     # A finite -q run has no later session to learn for: no skill authoring tool (agent/oneshot_footprint.py).
     from agent.oneshot_footprint import prune_oneshot_tools
     agent.tools = prune_oneshot_tools(agent.tools or [])
@@ -2353,7 +2362,7 @@ _GATEWAY_IDENTITY_PARAMS = (
 )
 _CALLBACK_PARAMS = (
     "tool_progress_callback", "tool_start_callback", "tool_complete_callback",
-    "tool_result_metadata_callback",
+    "tool_result_metadata_callback", "interactive_multi_select_callback",
     "thinking_callback", "reasoning_callback", "clarify_callback",
     "read_terminal_callback", "read_preview_callback", "drive_preview_callback",
     "read_window_below_callback", "connection_callback", "tour_callback",
@@ -2400,6 +2409,7 @@ def init_agent(
     requested_provider: str = None, capabilities: Optional[Dict[str, bool]] = None, cwd: Optional[str] = None,
     side_agent: bool = False, memory_manager=None,
     tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
+    interactive_multi_select_callback: callable = None,
 ):
     _install_safe_stdio()
 

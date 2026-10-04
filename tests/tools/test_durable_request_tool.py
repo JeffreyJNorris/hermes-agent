@@ -620,3 +620,46 @@ def test_invalid_wake_flag_uses_standard_tool_error(
         clear_session_vars(tokens)
 
     assert payload == {"error": "wake_on_terminal must be a boolean"}
+
+
+def test_registry_multi_post_and_status_keep_canonical_set(configured_home: Path) -> None:
+    tokens = _bind_live_session()
+    try:
+        posted = json.loads(registry.dispatch("durable_request", {
+            "action": "post", "title": "Bills", "question": "Choose available bills.",
+            "options": ["Electricity", "Gas", "Water", "Internet", "Other", "Waste"],
+            "selection_mode": "multi", "min_selections": 2, "max_selections": 4,
+        }))
+        store = get_durable_request_store()
+        claim = store.claim_next_pending(["discord"])
+        assert claim is not None and claim.request.max_selections == 4
+        assert store.bind_delivery(request_id=posted["request_id"], claim_id=claim.claim_id,
+                                   platform="discord", message_id="multi-message") is not None
+        selected = store.resolve_multi_select(request_id=posted["request_id"], option_tokens=("6", "2"),
+            platform="discord", channel_id="123456789012345679", message_id="multi-message", actor_id="42")
+        assert selected.request is not None
+        payload = json.loads(registry.dispatch("durable_request", {"action": "status", "request_id": posted["request_id"]}))
+    finally:
+        clear_session_vars(tokens)
+    assert payload["selected_indices"] == [2, 6]
+    assert payload["selected_labels"] == ["Gas", "Waste"]
+    assert "selected_index" not in payload and "option_ids" not in payload
+
+
+@pytest.mark.parametrize("policy", [
+    {"selection_mode": "single", "max_selections": 2},
+    {"selection_mode": "multi", "min_selections": 0},
+    {"selection_mode": "multi", "min_selections": True},
+    {"selection_mode": "multi", "max_selections": 3},
+    {"selection_mode": []},
+])
+def test_registry_rejects_conflicting_selection_policy(configured_home: Path, policy) -> None:
+    tokens = _bind_live_session()
+    try:
+        result = json.loads(registry.dispatch("durable_request", {
+            "action": "post", "title": "Choose", "question": "Which?", "options": ["A", "B"], **policy,
+        }))
+        assert "error" in result
+        assert get_durable_request_store().count_by_status().get(DurableRequestStatus.PENDING_DELIVERY, 0) == 0
+    finally:
+        clear_session_vars(tokens)

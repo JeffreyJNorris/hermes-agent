@@ -282,6 +282,8 @@ _UNAUTHORIZED = unauthorized_action_notice(Platform.DISCORD)
 
 from gateway.interactive import (  # HERMES_INTERACTIVE_PROMPTS_V1_DISCORD
     InteractivePrompt,
+    InteractiveMultiSelectPrompt,
+    MAX_MULTI_SELECT_OPTIONS,
     MAX_PROMPT_OPTIONS,
     PromptStyle,
     ResolveStatus,
@@ -296,6 +298,9 @@ from gateway.durable_requests import (
     DurableResolveStatus,
     get_durable_request_store,
     make_durable_component_id,
+    make_durable_multi_select_component_id,
+    parse_durable_multi_select_component_id,
+    DurableResolveResult,
     render_durable_request_content,
     render_durable_request_text_command_content,
 )
@@ -5600,16 +5605,32 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         prompt: InteractivePrompt,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Render a registered prompt as Discord buttons and return its message ID."""
+        if not isinstance(prompt, InteractivePrompt) or isinstance(prompt, InteractiveMultiSelectPrompt):
+            return SendResult(success=False, error="Invalid interactive prompt", error_kind="bad_format")
+        return await self._send_interactive_prompt_native(chat_id, prompt, metadata)
+
+    async def send_interactive_multi_select_prompt(
+        self,
+        chat_id: str,
+        prompt: InteractiveMultiSelectPrompt,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        if not isinstance(prompt, InteractiveMultiSelectPrompt):
+            return SendResult(success=False, error="Invalid multi-select prompt", error_kind="bad_format")
+        return await self._send_interactive_prompt_native(chat_id, prompt, metadata)
+
+    async def _send_interactive_prompt_native(
+        self,
+        chat_id: str,
+        prompt: InteractivePrompt | InteractiveMultiSelectPrompt,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Render every option with native controls and return its message ID."""
         if not self._client or not DISCORD_AVAILABLE:
             return SendResult(success=False, error="Not connected")
-        if not isinstance(prompt, InteractivePrompt):
-            return SendResult(
-                success=False,
-                error="Invalid interactive prompt",
-                error_kind="bad_format",
-            )
-        if not prompt.options or len(prompt.options) > MAX_PROMPT_OPTIONS:
+        multi = isinstance(prompt, InteractiveMultiSelectPrompt)
+        limit = MAX_MULTI_SELECT_OPTIONS if multi else MAX_PROMPT_OPTIONS
+        if not prompt.options or len(prompt.options) > limit or (multi and len(prompt.options) < 2):
             return SendResult(
                 success=False,
                 error="Unsupported interactive prompt option count",
@@ -5639,7 +5660,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     error="Interactive prompt exceeds Discord message limit",
                     error_kind="too_long",
                 )
-            view = InteractivePromptView(
+            view_type = InteractiveMultiSelectView if multi else InteractivePromptView
+            view = view_type(
                 prompt=prompt,
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
@@ -5681,7 +5703,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 error="Invalid durable request",
                 error_kind="bad_format",
             )
-        if not request.options or len(request.options) > MAX_PROMPT_OPTIONS:
+        limit = MAX_MULTI_SELECT_OPTIONS if request.selection_mode == "multi" else MAX_PROMPT_OPTIONS
+        if not request.options or len(request.options) > limit:
             return SendResult(
                 success=False,
                 error="Unsupported durable request option count",
@@ -6584,7 +6607,7 @@ def _resolve_exec_approval_admin_gate(config_extra: Optional[dict]) -> Tuple[boo
 def _define_discord_view_classes() -> None:
     """Register Discord UI view classes as module globals.
     Called at module load and after a lazy install so the classes exist whenever DISCORD_AVAILABLE."""
-    global DurableRequestView, InteractivePromptView, ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+    global DurableRequestView, InteractivePromptView, InteractiveMultiSelectView, ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
 
     class _HermesView(discord.ui.View):
         """Shared plumbing for Hermes component views: allowlist auth, single-use
@@ -6663,6 +6686,21 @@ def _define_discord_view_classes() -> None:
             self._store = store or get_durable_request_store()
             self._message = None
 
+            self._multi = request.selection_mode == "multi"
+            if self._multi:
+                from .adapter_interactive import make_multi_select_control
+                control = make_multi_select_control(
+                    discord, request.options,
+                    make_durable_multi_select_component_id(request.request_id),
+                    request.min_selections, request.max_selections,
+                )
+
+                async def _multi_callback(interaction):
+                    await self._resolve(interaction, "")
+
+                control.callback = _multi_callback
+                self.add_item(control)
+                return
             if len(request.options) > MAX_PROMPT_OPTIONS:
                 raise ValueError("durable request has too many options")
             for slot, option in enumerate(request.options, 1):
@@ -6723,14 +6761,24 @@ def _define_discord_view_classes() -> None:
             actor = getattr(interaction, "user", None)
             actor_id = getattr(actor, "id", None)
 
-            result = self._store.resolve(
-                request_id=self.request_id,
-                option_token=slot,
+            metadata = dict(
                 platform="discord",
                 channel_id=str(channel_id) if channel_id is not None else "",
                 message_id=str(message_id) if message_id is not None else None,
                 actor_id=str(actor_id) if actor_id is not None else None,
             )
+            if self._multi:
+                data = interaction.data if isinstance(getattr(interaction, "data", None), dict) else {}
+                values = data.get("values")
+                if (parse_durable_multi_select_component_id(data.get("custom_id")) != self.request_id
+                        or not isinstance(values, list) or not all(isinstance(value, str) for value in values)):
+                    result = DurableResolveResult(DurableResolveStatus.INVALID_OPTION)
+                else:
+                    result = self._store.resolve_multi_select(
+                        request_id=self.request_id, option_tokens=tuple(values), **metadata,
+                    )
+            else:
+                result = self._store.resolve(request_id=self.request_id, option_token=slot, **metadata)
             if result.status is DurableResolveStatus.RESOLVED:
                 # The transaction commits before presentation is edited.
                 for child in self.children:
@@ -6873,9 +6921,8 @@ def _define_discord_view_classes() -> None:
             actor = getattr(interaction, "user", None)
             actor_id = getattr(actor, "id", None)
 
-            result = resolve_prompt(
-                prompt_id=self.prompt_id,
-                option_token=slot,
+            result = self._resolve_selection(
+                interaction, slot,
                 platform="discord",
                 channel_id=str(channel_id) if channel_id is not None else "",
                 message_id=str(message_id) if message_id is not None else None,
@@ -6921,10 +6968,16 @@ def _define_discord_view_classes() -> None:
                 stale_messages.get(result.status, "This prompt cannot be answered."),
             )
 
+        def _resolve_selection(self, interaction, slot, **metadata):
+            return resolve_prompt(prompt_id=self.prompt_id, option_token=slot, **metadata)
+
+        def _expire_prompt(self):
+            return expire_prompt(self.prompt_id)
+
         async def on_timeout(self):
             # The registry deadline is authoritative.  Do nothing destructive
             # when another path already resolved or cancelled the prompt.
-            if not expire_prompt(self.prompt_id):
+            if not self._expire_prompt():
                 return
             for child in self.children:
                 child.disabled = True
@@ -6942,6 +6995,9 @@ def _define_discord_view_classes() -> None:
                             "exception_class": type(exc).__name__,
                         },
                     )
+    from .adapter_interactive import define_multi_select_view
+    InteractiveMultiSelectView = define_multi_select_view(discord, InteractivePromptView)
+
     class ExecApprovalView(_HermesView):
         """Allow Once / Allow Session / Always Allow / Deny buttons for a dangerous command.
         Clicks call ``resolve_gateway_approval()`` — the same mechanism as the text ``/approve`` flow."""

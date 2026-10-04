@@ -2882,6 +2882,19 @@ class BasePlatformAdapter(ABC):
             error_kind="unsupported",
         )
 
+    async def send_interactive_multi_select_prompt(
+        self,
+        chat_id: str,
+        prompt: "InteractiveMultiSelectPrompt",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Deliver one complete selection set; registry owns its resolution."""
+        return SendResult(
+            success=False,
+            error="Interactive multi-select prompts are not supported",
+            error_kind="unsupported",
+        )
+
     async def send_durable_request(
         self,
         chat_id: str,

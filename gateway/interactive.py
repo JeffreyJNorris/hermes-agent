@@ -34,6 +34,8 @@ MAX_PROMPT_KIND_LENGTH = 64
 MAX_PROMPT_TITLE_LENGTH = 256
 MAX_PROMPT_BODY_LENGTH = 1_200
 MAX_PROMPT_OPTIONS = 5
+MIN_MULTI_SELECT_OPTIONS = 2
+MAX_MULTI_SELECT_OPTIONS = 10
 MAX_PROMPT_OPTION_ID_LENGTH = 128
 MAX_PROMPT_OPTION_LABEL_LENGTH = 200
 MAX_PROMPT_SCOPE_VALUE_LENGTH = 512
@@ -78,6 +80,29 @@ class InteractivePrompt:
     body: str
     options: tuple[PromptOption, ...]
     timeout_seconds: float
+
+
+@dataclass(frozen=True)
+class InteractiveMultiSelectSpec(InteractivePromptSpec):
+    min_selections: int
+    max_selections: int
+
+
+@dataclass(frozen=True)
+class InteractiveMultiSelectPrompt(InteractivePrompt):
+    min_selections: int
+    max_selections: int
+
+
+@dataclass(frozen=True)
+class MultiSelectResponse:
+    prompt_id: str
+    option_ids: tuple[str, ...]
+    platform: str
+    chat_id: str
+    thread_id: str | None
+    message_id: str | None
+    actor_id: str | None
 
 
 @dataclass(frozen=True)
@@ -126,6 +151,11 @@ class PromptOutcome:
             raise ValueError("Only SELECTED outcomes may contain a response")
 
 
+@dataclass(frozen=True)
+class MultiSelectOutcome(PromptOutcome):
+    response: MultiSelectResponse | None = None
+
+
 class ResolveStatus(str, Enum):
     RESOLVED = "resolved"
     ALREADY_RESOLVED = "already_resolved"
@@ -141,7 +171,7 @@ class ResolveStatus(str, Enum):
 @dataclass(frozen=True)
 class ResolveResult:
     status: ResolveStatus
-    response: PromptResponse | None = None
+    response: PromptResponse | MultiSelectResponse | None = None
 
     def __post_init__(self) -> None:
         if self.status is ResolveStatus.RESOLVED:
@@ -163,7 +193,7 @@ class _PromptState(str, Enum):
 @dataclass
 class _HandleState:
     event: threading.Event
-    outcome: PromptOutcome | None = None
+    outcome: PromptOutcome | MultiSelectOutcome | None = None
 
 
 class PromptHandle:
@@ -204,9 +234,14 @@ class PromptHandle:
         )
 
 
+class MultiSelectHandle(PromptHandle):
+    """Opaque multi-select handle sharing the registry lifecycle."""
+    __slots__ = ()
+
+
 @dataclass
 class _PromptEntry:
-    prompt: InteractivePrompt
+    prompt: InteractivePrompt | InteractiveMultiSelectPrompt
     scope: PromptScope
     deadline: float
     state: _PromptState
@@ -260,7 +295,13 @@ def _normalize_choice(value: str) -> str:
 
 def render_text_fallback(prompt: InteractivePrompt) -> str:
     """Serialize a prompt deterministically without dropping any option."""
-    lines = [prompt.title, "", prompt.body, "", "Reply with one option:"]
+    instruction = "Reply with one option:"
+    if isinstance(prompt, InteractiveMultiSelectPrompt):
+        instruction = (
+            f"Reply with {prompt.min_selections}–{prompt.max_selections} option numbers "
+            "separated by commas:"
+        )
+    lines = [prompt.title, "", prompt.body, "", instruction]
     lines.extend(
         f"{slot}. {option.label}"
         for slot, option in enumerate(prompt.options, start=1)
@@ -309,6 +350,46 @@ def parse_component_id(component_id: str) -> tuple[str, str] | None:
     return prompt_id, slot
 
 
+def validate_selection_bounds(option_count: int, minimum: int, maximum: int) -> None:
+    if not MIN_MULTI_SELECT_OPTIONS <= option_count <= MAX_MULTI_SELECT_OPTIONS:
+        raise ValueError("multi-select requires between 2 and 10 options")
+    if any(isinstance(value, bool) or not isinstance(value, int)
+           for value in (minimum, maximum)):
+        raise ValueError("selection bounds must be integers")
+    if not 1 <= minimum <= maximum <= min(option_count, MAX_MULTI_SELECT_OPTIONS):
+        raise ValueError("invalid selection bounds")
+
+
+def parse_selection_slots(text: str) -> tuple[str, ...] | None:
+    """Recognize only ASCII numeric slots separated by commas, retaining duplicates."""
+    if not isinstance(text, str):
+        return None
+    candidate = text.strip()
+    if re.fullmatch(r"[0-9]+(?:, *[0-9]+)*", candidate) is None:
+        return None
+    # Avoid converting unbounded inbound integers. At most ten short slot values
+    # can resolve; long values remain recognizable but invalid server-side.
+    return tuple(part.strip().lstrip("0") or "0" for part in candidate.split(","))
+
+
+def make_multi_select_component_id(prompt_id: str) -> str:
+    component_id = f"ipm:{_validate_prompt_id(prompt_id)}"
+    if len(component_id) > MAX_PROVIDER_COMPONENT_ID_LENGTH:
+        raise ValueError("multi-select component ID exceeds provider limit")
+    return component_id
+
+
+def parse_multi_select_component_id(component_id: str) -> str | None:
+    if not isinstance(component_id, str) or not component_id.startswith("ipm:"):
+        return None
+    if len(component_id) > MAX_PROVIDER_COMPONENT_ID_LENGTH:
+        return None
+    try:
+        return _validate_prompt_id(component_id[4:])
+    except ValueError:
+        return None
+
+
 class InteractivePromptRegistry:
     """Thread-safe in-memory authority for one-shot finite-choice prompts."""
 
@@ -351,6 +432,8 @@ class InteractivePromptRegistry:
         self._platform_index: dict[str, set[str]] = {}
         self._text_by_session: dict[str, str] = {}
         self._tombstones: OrderedDict[str, _Tombstone] = OrderedDict()
+        self._multi_submissions = 0
+        self._multi_invalid_sets = 0
 
     def register(
         self,
@@ -365,11 +448,16 @@ class InteractivePromptRegistry:
         if resolver is not None and not callable(resolver):
             raise ValueError("resolver must be callable")
 
-        now = self._clock()
         with self._lock:
+            now = self._clock()
             self._prune_tombstones_locked(now)
             prompt_id = self._new_unique_prompt_id_locked()
-            registered = InteractivePrompt(
+            multi = isinstance(prompt, InteractiveMultiSelectSpec)
+            prompt_type = InteractiveMultiSelectPrompt if multi else InteractivePrompt
+            bounds = ({"min_selections": prompt.min_selections,
+                       "max_selections": prompt.max_selections} if multi else {})
+            registered = prompt_type(
+                **bounds,
                 prompt_id=prompt_id,
                 kind=prompt.kind,
                 title=prompt.title,
@@ -380,8 +468,11 @@ class InteractivePromptRegistry:
 
             # Prove that every option can be represented before the entry is
             # visible. No adapter may silently trim the option set later.
-            for slot in range(1, len(registered.options) + 1):
-                make_component_id(prompt_id, slot)
+            if multi:
+                make_multi_select_component_id(prompt_id)
+            else:
+                for slot in range(1, len(registered.options) + 1):
+                    make_component_id(prompt_id, slot)
             if len(render_text_fallback(registered)) > MAX_RENDERED_PROMPT_LENGTH:
                 raise ValueError("rendered text fallback exceeds delivery budget")
             if len(render_native_prompt_content(registered)) > MAX_RENDERED_PROMPT_LENGTH:
@@ -406,7 +497,8 @@ class InteractivePromptRegistry:
             self._active[prompt_id] = entry
             self._session_index.setdefault(scope.session_key, set()).add(prompt_id)
             self._platform_index.setdefault(scope.platform, set()).add(prompt_id)
-            handle = PromptHandle(
+            handle_type = MultiSelectHandle if multi else PromptHandle
+            handle = handle_type(
                 prompt=registered,
                 deadline=deadline,
                 entry_identity=entry_identity,
@@ -437,8 +529,8 @@ class InteractivePromptRegistry:
         if not prompt_id or not platform or not message_id:
             return False
 
-        now = self._clock()
         with self._lock:
+            now = self._clock()
             self._prune_tombstones_locked(now)
             entry = self._active.get(prompt_id)
             if entry is None:
@@ -480,8 +572,8 @@ class InteractivePromptRegistry:
         """Atomically reserve the session's sole text-fallback slot."""
         if not isinstance(prompt_id, str):
             return False
-        now = self._clock()
         with self._lock:
+            now = self._clock()
             self._prune_tombstones_locked(now)
             entry = self._active.get(prompt_id)
             if entry is None:
@@ -532,11 +624,36 @@ class InteractivePromptRegistry:
         )
         return True
 
-    def resolve(
+    def register_multi_select_prompt(self, prompt: InteractiveMultiSelectSpec, *,
+                                     scope: PromptScope, resolver=None) -> MultiSelectHandle:
+        if not isinstance(prompt, InteractiveMultiSelectSpec):
+            raise TypeError("prompt must be an InteractiveMultiSelectSpec")
+        return self.register(prompt, scope=scope, resolver=resolver)
+
+    def resolve(self, *, prompt_id: str, option_token: str, platform: str,
+                channel_id: str, message_id: str | None, actor_id: str | None,
+                source: str) -> ResolveResult:
+        if not isinstance(option_token, str):
+            return ResolveResult(ResolveStatus.SCOPE_MISMATCH)
+        return self._resolve(prompt_id=prompt_id, option_tokens=(option_token,), multi=False,
+                             platform=platform, channel_id=channel_id, message_id=message_id,
+                             actor_id=actor_id, source=source)
+
+    def resolve_multi_select_prompt(self, *, option_tokens: tuple[str, ...],
+                                    **metadata) -> ResolveResult:
+        return self._resolve(option_tokens=option_tokens, multi=True, **metadata)
+
+    def wait_for_multi_select(self, handle: MultiSelectHandle) -> MultiSelectOutcome:
+        if not isinstance(handle, MultiSelectHandle):
+            raise TypeError("handle must be a MultiSelectHandle")
+        return self.wait(handle)
+
+    def _resolve(
         self,
         *,
         prompt_id: str,
-        option_token: str,
+        option_tokens: tuple[str, ...],
+        multi: bool,
         platform: str,
         channel_id: str,
         message_id: str | None,
@@ -548,15 +665,17 @@ class InteractivePromptRegistry:
             raise ValueError("source must be 'native' or 'text'")
         if not all(
             isinstance(value, str)
-            for value in (prompt_id, option_token, platform, channel_id)
+            for value in (prompt_id, platform, channel_id)
         ):
             return ResolveResult(ResolveStatus.SCOPE_MISMATCH)
 
         callback: Callable[[PromptResponse], None] | None = None
         response: PromptResponse | None = None
-        now = self._clock()
         with self._lock:
+            now = self._clock()
             self._prune_tombstones_locked(now)
+            if multi:
+                self._multi_submissions += 1
             entry = self._active.get(prompt_id)
             if entry is None:
                 return ResolveResult(self._lookup_terminal_status_locked(prompt_id))
@@ -595,13 +714,27 @@ class InteractivePromptRegistry:
             ):
                 return ResolveResult(ResolveStatus.SCOPE_MISMATCH)
 
-            option_id = entry.slot_to_option_id.get(option_token)
-            if option_id is None:
+            is_multi = isinstance(entry.prompt, InteractiveMultiSelectPrompt)
+            if is_multi != multi:
+                return ResolveResult(ResolveStatus.WRONG_DELIVERY_MODE)
+            minimum = entry.prompt.min_selections if is_multi else 1
+            maximum = entry.prompt.max_selections if is_multi else 1
+            if (not isinstance(option_tokens, (tuple, list))
+                or not minimum <= len(option_tokens) <= maximum
+                or any(not isinstance(slot, str) for slot in option_tokens)
+                or len(set(option_tokens)) != len(option_tokens)
+                or any(slot not in entry.slot_to_option_id for slot in option_tokens)):
+                if is_multi:
+                    self._multi_invalid_sets += 1
                 return ResolveResult(ResolveStatus.INVALID_OPTION)
-
-            response = PromptResponse(
+            selected = set(option_tokens)
+            option_ids = tuple(option_id for slot, option_id in entry.slot_to_option_id.items()
+                               if slot in selected)
+            response_type = MultiSelectResponse if is_multi else PromptResponse
+            selection = {"option_ids": option_ids} if is_multi else {"option_id": option_ids[0]}
+            response = response_type(
+                **selection,
                 prompt_id=prompt_id,
-                option_id=option_id,
                 platform=platform,
                 chat_id=entry.scope.chat_id,
                 thread_id=entry.scope.thread_id,
@@ -611,7 +744,7 @@ class InteractivePromptRegistry:
             callback = entry.resolver
             self._terminalize_locked(
                 entry,
-                PromptOutcome(
+                (MultiSelectOutcome if is_multi else PromptOutcome)(
                     PromptOutcomeStatus.SELECTED,
                     response=response,
                 ),
@@ -664,8 +797,8 @@ class InteractivePromptRegistry:
         if not candidate or candidate.startswith(("/", "!")):
             return None
 
-        now = self._clock()
         with self._lock:
+            now = self._clock()
             self._prune_tombstones_locked(now)
             prompt_id = self._text_by_session.get(session_key)
             if prompt_id is None:
@@ -675,7 +808,11 @@ class InteractivePromptRegistry:
                 self._text_by_session.pop(session_key, None)
                 return None
 
-            if candidate.isascii() and candidate.isdigit():
+            if isinstance(entry.prompt, InteractiveMultiSelectPrompt):
+                slots = parse_selection_slots(candidate)
+                if slots is None:
+                    return None
+            elif candidate.isascii() and candidate.isdigit():
                 option_token = str(int(candidate))
             else:
                 normalized = _normalize_choice(candidate)
@@ -691,6 +828,12 @@ class InteractivePromptRegistry:
                 if len(matches) != 1:
                     return ResolveResult(ResolveStatus.INVALID_OPTION)
                 option_token = next(iter(matches))
+
+        if isinstance(entry.prompt, InteractiveMultiSelectPrompt):
+            return self.resolve_multi_select_prompt(
+                prompt_id=prompt_id, option_tokens=slots, platform=platform,
+                channel_id=channel_id, message_id=None, actor_id=actor_id, source="text",
+            )
 
         return self.resolve(
             prompt_id=prompt_id,
@@ -744,8 +887,8 @@ class InteractivePromptRegistry:
             reason = "cancelled"
         if not isinstance(prompt_id, str):
             return False
-        now = self._clock()
         with self._lock:
+            now = self._clock()
             self._prune_tombstones_locked(now)
             entry = self._active.get(prompt_id)
             if entry is None:
@@ -765,14 +908,16 @@ class InteractivePromptRegistry:
         )
         return True
 
-    def expire(self, prompt_id: str) -> bool:
+    def expire(self, prompt_id: str, *, only_if_due: bool = False) -> bool:
         if not isinstance(prompt_id, str):
             return False
-        now = self._clock()
         with self._lock:
+            now = self._clock()
             self._prune_tombstones_locked(now)
             entry = self._active.get(prompt_id)
             if entry is None:
+                return False
+            if only_if_due and now < entry.deadline:
                 return False
             self._terminalize_locked(
                 entry,
@@ -807,8 +952,8 @@ class InteractivePromptRegistry:
         )
 
     def clear_all(self) -> int:
-        now = self._clock()
         with self._lock:
+            now = self._clock()
             self._prune_tombstones_locked(now)
             entries = list(self._active.values())
             for entry in entries:
@@ -824,8 +969,8 @@ class InteractivePromptRegistry:
 
     def remaining_seconds(self, prompt_id: str) -> float | None:
         """Return authoritative remaining duration for provider view timeout."""
-        now = self._clock()
         with self._lock:
+            now = self._clock()
             self._prune_tombstones_locked(now)
             entry = self._active.get(prompt_id)
             if entry is None:
@@ -852,8 +997,8 @@ class InteractivePromptRegistry:
         """
         if not isinstance(session_key, str) or not session_key:
             return False
-        now = self._clock()
         with self._lock:
+            now = self._clock()
             self._prune_tombstones_locked(now)
             prompt_id = self._text_by_session.get(session_key)
             if prompt_id is None:
@@ -873,6 +1018,17 @@ class InteractivePromptRegistry:
                 )
                 return False
             return True
+
+    def selection_metrics(self) -> dict[str, int]:
+        """Content-free process counters and live multi-select lifecycle gauges."""
+        with self._lock:
+            now = self._clock()
+            entries = [entry for entry in self._active.values()
+                       if isinstance(entry.prompt, InteractiveMultiSelectPrompt)]
+            return {"submissions": self._multi_submissions,
+                    "invalid_sets": self._multi_invalid_sets,
+                    "active": len(entries),
+                    "stuck": sum(now >= entry.deadline for entry in entries)}
 
     def _validate_spec(self, prompt: InteractivePromptSpec) -> None:
         if not isinstance(prompt, InteractivePromptSpec):
@@ -898,7 +1054,10 @@ class InteractivePromptRegistry:
             raise ValueError("options must be a tuple")
         if not prompt.options:
             raise ValueError("at least one option is required")
-        if len(prompt.options) > MAX_PROMPT_OPTIONS:
+        multi = isinstance(prompt, InteractiveMultiSelectSpec)
+        if multi:
+            validate_selection_bounds(len(prompt.options), prompt.min_selections, prompt.max_selections)
+        if len(prompt.options) > (MAX_MULTI_SELECT_OPTIONS if multi else MAX_PROMPT_OPTIONS):
             raise ValueError(
                 f"option count exceeds phase-one maximum of {MAX_PROMPT_OPTIONS}"
             )
@@ -989,8 +1148,8 @@ class InteractivePromptRegistry:
     ) -> int:
         if not isinstance(key, str):
             return 0
-        now = self._clock()
         with self._lock:
+            now = self._clock()
             self._prune_tombstones_locked(now)
             prompt_ids = tuple(index.get(key, ()))
             count = 0
@@ -1015,6 +1174,8 @@ class InteractivePromptRegistry:
         outcome: PromptOutcome,
         now: float,
     ) -> None:
+        if isinstance(entry.prompt, InteractiveMultiSelectPrompt) and not isinstance(outcome, MultiSelectOutcome):
+            outcome = MultiSelectOutcome(outcome.status, reason=outcome.reason)
         prompt_id = entry.prompt.prompt_id
         if prompt_id not in self._active:
             return
@@ -1097,6 +1258,23 @@ def register_prompt(
     return _registry.register(prompt, scope=scope, resolver=resolver)
 
 
+def interactive_multi_select_metrics() -> dict[str, int]:
+    return _registry.selection_metrics()
+
+
+def register_multi_select_prompt(prompt: InteractiveMultiSelectSpec, *, scope: PromptScope,
+                                 resolver=None) -> MultiSelectHandle:
+    return _registry.register_multi_select_prompt(prompt, scope=scope, resolver=resolver)
+
+
+def resolve_multi_select_prompt(*, option_tokens: tuple[str, ...], **metadata) -> ResolveResult:
+    return _registry.resolve_multi_select_prompt(option_tokens=option_tokens, **metadata)
+
+
+def wait_for_multi_select(handle: MultiSelectHandle) -> MultiSelectOutcome:
+    return _registry.wait_for_multi_select(handle)
+
+
 def bind_prompt_delivery(
     *,
     prompt_id: str,
@@ -1160,8 +1338,8 @@ def cancel_prompt(prompt_id: str, *, reason: str = "cancelled") -> bool:
     return _registry.cancel(prompt_id, reason=reason)
 
 
-def expire_prompt(prompt_id: str) -> bool:
-    return _registry.expire(prompt_id)
+def expire_prompt(prompt_id: str, *, only_if_due: bool = False) -> bool:
+    return _registry.expire(prompt_id, only_if_due=only_if_due)
 
 
 def remaining_prompt_seconds(prompt_id: str) -> float | None:
@@ -1186,6 +1364,11 @@ def clear_all_interactive_prompts() -> int:
 
 
 __all__ = [
+    "InteractiveMultiSelectSpec", "InteractiveMultiSelectPrompt", "MultiSelectResponse",
+    "MultiSelectOutcome", "MultiSelectHandle", "MIN_MULTI_SELECT_OPTIONS", "MAX_MULTI_SELECT_OPTIONS",
+    "validate_selection_bounds", "parse_selection_slots", "make_multi_select_component_id",
+    "parse_multi_select_component_id", "register_multi_select_prompt",
+    "resolve_multi_select_prompt", "wait_for_multi_select", "interactive_multi_select_metrics",
     "InteractivePrompt",
     "InteractivePromptRegistry",
     "InteractivePromptSpec",

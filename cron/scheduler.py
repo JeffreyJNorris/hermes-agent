@@ -3794,6 +3794,8 @@ def enqueue_durable_request_continuation(
     selected_index: int | None,
     selected_label: str | None,
     terminal_reason: str | None,
+    selected_indices: list[int] | None = None,
+    selected_labels: list[str] | None = None,
     adapters=None,
     loop=None,
     _execution_source: str = "durable_request",
@@ -3870,6 +3872,8 @@ def enqueue_durable_request_continuation(
             selected_index=selected_index,
             selected_label=selected_label,
             terminal_reason=terminal_reason,
+            selected_indices=selected_indices,
+            selected_labels=selected_labels,
         )
     )
 
@@ -3998,6 +4002,8 @@ def _durable_request_continuation_prompt(
     selected_index: int | None,
     selected_label: str | None,
     terminal_reason: str | None,
+    selected_indices: list[int] | None = None,
+    selected_labels: list[str] | None = None,
 ) -> str:
     lines = [
         "[IMPORTANT: A durable request created by this scheduled job reached "
@@ -4013,7 +4019,11 @@ def _durable_request_continuation_prompt(
             f"Question: {question}",
         ]
     )
-    if selected_label is not None:
+    if selected_labels:
+        lines.append("Selected options:")
+        for index, label in zip((selected_indices or [])[:10], selected_labels[:10]):
+            lines.append(f"{index}. {label[:200]}")
+    elif selected_label is not None:
         prefix = f"{selected_index}. " if selected_index is not None else ""
         lines.append(f"Selected option: {prefix}{selected_label}")
     elif terminal_reason:
