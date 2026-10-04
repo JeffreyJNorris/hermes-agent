@@ -1827,6 +1827,7 @@ display:
 
   # Tool progress display level (CLI and gateway)
   #   off:     Silent — no tool activity shown, just the final response
+  #   status:  One editable, emoji-free current activity line (gateway only; Discord default)
   #   new:     Show a tool indicator only when the tool changes (skip repeats)
   #   all:     Show every tool call with a short preview (default)
   #   verbose: Full args, results, and debug logs (same as /verbose)
@@ -1850,20 +1851,21 @@ display:
   # display.platforms.telegram.
 
   # Auto-cleanup of temporary progress bubbles after the final response lands.
-  # On platforms that support message deletion (currently Telegram), this
+  # On platforms that support message deletion (Telegram and Discord), this
   # removes the tool-progress bubble, "⏳ Still working..." notices, and
   # context-pressure status messages once the final reply has been delivered —
   # keeping long-running turns visible live, then tidy afterward. Failed runs
-  # leave the bubbles in place as breadcrumbs. Off by default.
+  # leave the bubbles in place as breadcrumbs. On by default for Discord;
+  # off elsewhere. Leave unset to inherit these platform defaults.
   # Per-platform override: display.platforms.telegram.cleanup_progress
   #   true:  Delete tracked progress/status bubbles on successful turn
-  #   false: Leave everything in place (default)
+  #   false: Leave everything in place
   # Example:
   #   display:
   #     platforms:
   #       telegram:
   #         cleanup_progress: true
-  cleanup_progress: false
+  # cleanup_progress: false
 
   # Natural mid-turn assistant updates.
   # On gateway platforms, when true, completed assistant status messages are

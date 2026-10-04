@@ -3221,10 +3221,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
         try:
-            channel = await self._resolve_channel(chat_id)
+            target_id = (metadata or {}).get("thread_id") or chat_id
+            channel = await self._resolve_channel(target_id)
             msg = channel.get_partial_message(int(message_id))
             formatted = self.format_message(content)
-            _preview_key = (str(chat_id), str(message_id))
+            _preview_key = (str(target_id), str(message_id))
             _saturated_preview = False
             if finalize:
                 # Saturation state is finished — the final edit delivers full content.
@@ -3267,6 +3268,32 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
             return SendResult(success=False, error=str(e))
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a temporary message; an already removed message is success."""
+        if not self._client:
+            return False
+        try:
+            channel = await self._resolve_channel(chat_id)
+            if not channel:
+                return False
+            await channel.get_partial_message(int(message_id)).delete()
+        except discord.NotFound:
+            pass
+        except discord.Forbidden as error:
+            logger.warning(
+                "[%s] Cannot delete Discord message %s: %s",
+                self.name, message_id, error,
+            )
+            return False
+        except Exception as error:
+            logger.warning(
+                "[%s] Failed to delete Discord message %s: %s",
+                self.name, message_id, error,
+            )
+            return False
+        self._last_overflow_preview.pop((str(chat_id), str(message_id)), None)
+        return True
 
     @staticmethod
     def _is_reply_reference_rejected(err: Exception) -> bool:

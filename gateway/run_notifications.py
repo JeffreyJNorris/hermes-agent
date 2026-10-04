@@ -16,7 +16,7 @@ import time
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, cast
+from typing import Any, Awaitable, Callable, Dict, Optional, cast
 
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
 from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
@@ -422,6 +422,7 @@ class GatewayNotificationsMixin:
         metadata: Optional[Dict[str, Any]] = None, event_message_id: Optional[str] = None,
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         session_key: Optional[str] = None, inbound_message_id: Optional[str] = None,
+        on_delivery_confirmed: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> bool:
         """Deliver a queued response using the normal text+attachment split.
 
@@ -434,8 +435,10 @@ class GatewayNotificationsMixin:
         already delivered it, the reconcile edit landed, the send succeeded, or there was nothing
         textual to send. False: the send was REFUSED (flood control, dead transport) — the caller
         must leave the normal completion send as the fallback, or the user gets nothing. A connector
-        DECLINE returns True: that destination is not approved and must not be re-sent."""
+        DECLINE returns True: that destination is not approved and must not be re-sent.
+        ``on_delivery_confirmed`` runs only after actual accepted delivery, never a DECLINE."""
         from gateway.run import _strip_response_attachments_for_direct_send
+        confirmed = text_already_delivered
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
@@ -454,6 +457,7 @@ class GatewayNotificationsMixin:
                         )
                         if getattr(_edit_res, "success", False):
                             _reconciled = True
+                            confirmed = True
                             logger.info(
                                 "Queued-lane final reconciled by editing message %s in place (no duplicate send).",
                                 _sc_msg_id,
@@ -482,14 +486,16 @@ class GatewayNotificationsMixin:
                         # the caller's normal completion send replays the whole response (text and
                         # its MEDIA: tags), so uploading here would duplicate every file.
                         return False
+                    confirmed = True
         # Failed turns deliver their (normalized failure) text but must not upload attachments as if
         # they succeeded — mirrors the ``not agent_result.get("failed")`` completed-turn guard.
-        if not deliver_media:
-            return True
-        await self._deliver_media_from_response(
-            response, MessageEvent(text="", source=source, message_id=event_message_id), adapter,
-            thread_metadata=metadata,
-        )
+        if deliver_media:
+            await self._deliver_media_from_response(
+                response, MessageEvent(text="", source=source, message_id=event_message_id), adapter,
+                thread_metadata=metadata,
+            )
+        if confirmed and on_delivery_confirmed is not None:
+            await on_delivery_confirmed()
         return True
 
     async def _send_queued_final_text(

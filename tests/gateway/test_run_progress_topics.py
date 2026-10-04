@@ -1572,6 +1572,7 @@ async def test_run_agent_queued_message_delivers_first_response_media(monkeypatc
         QueuedMediaAgent,
         session_id="sess-queued-media",
         pending_text="queued follow-up",
+        config_data={"display": {"tool_progress": "off"}},
         platform=Platform.DISCORD,
         chat_id="discord-thread",
         chat_type="group",
@@ -1746,9 +1747,11 @@ async def test_base_processing_releases_post_delivery_callback_after_main_send()
 
 @pytest.mark.asyncio
 async def test_base_processing_stops_typing_before_hung_post_delivery_callback(
-    monkeypatch,
+    monkeypatch, tmp_path,
 ):
     """A stuck post-delivery callback must not keep the typing task alive."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text("gateway:\n  delivery_ledger: false\n", encoding="utf-8")
     monkeypatch.setattr(base_platform, "_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS", 0.01)
     adapter = ProgressCaptureAdapter()
     events = []

@@ -61,6 +61,7 @@ def _renders_exec_approval_buttons(adapter_cls: type) -> bool:
 # Rendered on a native clarify card whose wait ended without a click (mirrors the notice the
 # Slack click handler shows on a dead entry).
 _CLARIFY_EXPIRED_NOTICE = "⏳ This prompt expired — please send a new request."
+_PROGRESS_EDIT_INTERVAL = 1.5
 
 
 class _ExecApprovalDeclined(RuntimeError):
@@ -147,7 +148,10 @@ class TurnRunner(MultiSelectTurnMixin):
         if event_type == "_thinking" or tool_name == "_thinking":
             thinking_text = (preview if tool_name == "_thinking" else tool_name) if ctx._thinking_enabled else None
             if thinking_text:
-                ctx.progress_queue.put(f"💬 {thinking_text}")
+                if ctx.progress_mode == "status":
+                    self._queue_status_message("Thinking...")
+                else:
+                    ctx.progress_queue.put(f"💬 {thinking_text}")
             return
         # Native task cards consume the ID-bearing tool_start/tool_complete callbacks instead;
         # name-correlated text events would duplicate cards and mispair concurrent same-tool calls.
@@ -173,9 +177,24 @@ class TurnRunner(MultiSelectTurnMixin):
         if ctx.progress_mode == "new" and tool_name == ctx.last_tool[0]:
             return
         ctx.last_tool[0] = tool_name
+        if ctx.progress_mode == "status":
+            from agent.display import get_tool_verb
+            self._queue_status_message(f"{get_tool_verb(tool_name) or 'Working'}...")
+            return
         msg = self._progress_build_message(tool_name, preview, args)
         if msg is not None:
             self._progress_emit(msg)
+
+    def _queue_status_message(self, message: str) -> None:
+        ctx = self._ctx
+        if (
+            ctx.mute_notification_reply or ctx.scheduled_heartbeat
+            or not ctx._run_still_current() or self._agent_interrupted()
+        ):
+            return
+        if message != ctx.last_progress_msg[0]:
+            ctx.last_progress_msg[0] = message
+            ctx.progress_queue.put(message)
 
     def _progress_subagent_notice(self, preview, kwargs: dict) -> None:
         """Only terminal failure statuses render (same notice rail as credit warnings)."""
@@ -718,9 +737,11 @@ class TurnRunner(MultiSelectTurnMixin):
         if adapter_edit is None or adapter_edit is BasePlatformAdapter.edit_message:
             self._drain_progress_queue()
             return
+        if ctx.progress_mode == "status":
+            await self._send_status_message(adapter)
+            return
         st = self._progress_edit_state(adapter)
         last_edit_ts = 0.0
-        EDIT_INTERVAL = 1.5  # Minimum seconds between edits (Telegram flood control)
         while True:
             try:
                 if not ctx._run_still_current():
@@ -740,7 +761,7 @@ class TurnRunner(MultiSelectTurnMixin):
                     # Throttle edits: batch rapid tool updates into fewer API calls (grammY pattern:
                     # proactively rate-limit rather than react to 429s). Loop back to drain further
                     # queued messages before sending a single batched edit.
-                    remaining = EDIT_INTERVAL - (time.monotonic() - last_edit_ts)
+                    remaining = _PROGRESS_EDIT_INTERVAL - (time.monotonic() - last_edit_ts)
                     if remaining > 0:
                         await asyncio.sleep(remaining)
                         continue
@@ -758,6 +779,76 @@ class TurnRunner(MultiSelectTurnMixin):
             except Exception as e:
                 logger.error("Progress message error: %s", e)
                 await asyncio.sleep(1)
+
+    async def _send_status_message(self, adapter):
+        """Replace one status message, retaining its identity across narration."""
+        ctx = self._ctx
+        latest = None
+        sent_text = None
+        message_id = None
+        can_edit = True
+        last_update = 0.0
+        edit_metadata = _accepts_keyword(adapter.edit_message, "metadata")
+
+        def current():
+            return (
+                not ctx.mute_notification_reply and not ctx.scheduled_heartbeat
+                and ctx._run_still_current() and not self._agent_interrupted()
+            )
+
+        def drain():
+            nonlocal latest
+            while True:
+                try:
+                    item = ctx.progress_queue.get_nowait()
+                except queue.Empty:
+                    return
+                # Narration reset markers keep the same status message.
+                if isinstance(item, str):
+                    latest = item
+
+        async def render():
+            nonlocal message_id, sent_text, can_edit
+            if not current() or not latest or latest == sent_text or not can_edit:
+                return
+            try:
+                if message_id:
+                    kwargs = {"metadata": ctx._progress_metadata} if edit_metadata else {}
+                    if getattr(adapter, "REQUIRES_EDIT_FINALIZE", False):
+                        kwargs["finalize"] = True
+                    result = await adapter.edit_message(
+                        ctx.source.chat_id, message_id, latest, **kwargs,
+                    )
+                else:
+                    result = await adapter.send(
+                        chat_id=ctx.source.chat_id, content=latest,
+                        reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
+                    )
+                    if result.success and result.message_id:
+                        message_id = str(result.message_id)
+                        self._track_progress_result(result)
+                if result.success:
+                    sent_text = latest
+                elif message_id and not result.retryable:
+                    # Keep the original message when editing is unavailable; replacement
+                    # sends would recreate the progress spam.
+                    can_edit = False
+            except Exception as error:
+                logger.debug("Status message update failed: %s", error)
+
+        try:
+            while current():
+                drain()
+                now = time.monotonic()
+                if latest != sent_text and now - last_update >= _PROGRESS_EDIT_INTERVAL:
+                    await render()
+                    last_update = now
+                await asyncio.sleep(0.3)
+        except asyncio.CancelledError:
+            # Flush only an existing message, never a stopped/superseded run.
+            drain()
+            if message_id:
+                await render()
 
     # ── ID-bearing lifecycle callbacks (agent thread) ───────────────────────────────────────
 
@@ -883,7 +974,10 @@ class TurnRunner(MultiSelectTurnMixin):
             logger.debug("Failed to attach session title callback", exc_info=True)
 
     def _status_callback_sync(self, event_type: str, message: str) -> None:
-        from gateway.run import _prepare_gateway_status_message, _redact_gateway_user_facing_secrets, _send_or_update_status_coro
+        from gateway.run import (
+            _COMPRESSION_PROGRESS_STATUS_RE, _prepare_gateway_status_message,
+            _redact_gateway_user_facing_secrets, _send_or_update_status_coro,
+        )
         from gateway.warning_notifications import is_warning_status, render_notification
         ctx = self._ctx
         if ctx.mute_notification_reply or not self._status_live():
@@ -895,6 +989,14 @@ class TurnRunner(MultiSelectTurnMixin):
                 ctx.source.platform.value if ctx.source.platform else "unknown", event_type,
                 _redact_gateway_user_facing_secrets(str(message or ""))[:160],
             )
+            return
+        if (
+            ctx.progress_mode == "status" and ctx.progress_queue is not None
+            and (event_type == "compacted" or (
+                event_type == "lifecycle" and _COMPRESSION_PROGRESS_STATUS_RE.search(prepared)
+            ))
+        ):
+            self._queue_status_message("Updating context..." if event_type == "lifecycle" else "Working...")
             return
         def present():
             fut = self._schedule(

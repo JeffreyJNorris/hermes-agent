@@ -26,7 +26,7 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     "busy_ack_detail": True,
     "busy_steer_ack_enabled": True,  # busy_input_mode=steer echo; the text still lands in the run
     # Delete tool-progress / "⏳ Working" bubbles after a SUCCESSFUL final response where deletion is
-    # supported (Telegram); failed runs keep them as breadcrumbs.
+    # supported (Telegram and Discord); Discord opts in by default. Failed runs keep breadcrumbs.
     "cleanup_progress": False,
     # Working-state text on text-rendering indicators (Slack assistant status): "full"/true = verb +
     # argument preview, "verb" = verb only (keeps paths out of shared channels), "off"/false = static.
@@ -51,7 +51,8 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # Mobile inbox: quiet tool_progress / busy-ack, but keep interim commentary and heartbeats so it
     # doesn't look like "typing..." for 30 minutes.
     "telegram": {**_TIER_HIGH, "tool_progress": "off", "busy_ack_detail": False},
-    "discord": {**_TIER_HIGH, "reasoning_style": "subtext"},  # "-# " subtext reads as metadata
+    "discord": {**_TIER_HIGH, "tool_progress": "status", "cleanup_progress": True,
+                "reasoning_style": "subtext"},  # "-# " subtext reads as metadata
     # Slack: Bolt posts cannot be edited like CLI; "new"/"all" spam permanent lines.
     "slack": {**_TIER_MEDIUM, "tool_progress": "off", "long_running_notifications": False, "busy_ack_detail": False},
     "mattermost": _TIER_MEDIUM,
@@ -183,7 +184,7 @@ def _norm_int(value: Any) -> int:
 
 
 _NORMALISERS: dict[str, Any] = {
-    "tool_progress": _norm_tristate("all", "off", {"off", "new", "all", "verbose", "log"}),
+    "tool_progress": _norm_tristate("all", "off", {"off", "status", "new", "all", "verbose", "log"}),
     "show_reasoning": _norm_bool,
     "streaming": _norm_bool,
     "interim_assistant_messages": _norm_bool,

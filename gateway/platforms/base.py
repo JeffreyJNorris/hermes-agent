@@ -4536,12 +4536,17 @@ class BasePlatformAdapter(ABC):
             text_content=text_content, images=images, media_files=media_files,
             local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)
 
-    async def _fire_post_delivery_callback(self, session_key: str, interrupt_event: asyncio.Event) -> None:
-        """Run the one-shot post-delivery callback (bounded, errors swallowed). The generation is
-        read HERE — stamped on the interrupt event DURING the handler await; an earlier snapshot
-        would let stale runs fire a fresher run's callbacks."""
+    async def _fire_post_delivery_callback(
+        self, session_key: str, interrupt_event: asyncio.Event, *, delivery_outcome=None,
+    ) -> None:
+        """Run the bounded one-shot callback for the completed generation.
+
+        The delivery outcome snapshots the generation after the handler stamps
+        it and before cleanup awaits can hand the guard to a successor.
+        """
         _post_cb = self.pop_post_delivery_callback(
-            session_key, generation=getattr(interrupt_event, "_hermes_run_generation", None))
+            session_key, generation=(delivery_outcome[0] if delivery_outcome is not None
+                                     else getattr(interrupt_event, "_hermes_run_generation", None)))
         if callable(_post_cb):
             with contextlib.suppress(asyncio.TimeoutError, Exception):
                 _post_result = _post_cb()
@@ -4575,6 +4580,7 @@ class BasePlatformAdapter(ABC):
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
+        processing_ok = False
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -4584,12 +4590,16 @@ class BasePlatformAdapter(ABC):
         # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
+        callback_generation = None
+        was_interrupted = False
         _thread_metadata = _thread_metadata_for_event(event)
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         try:
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._message_handler(event)
+            callback_generation = getattr(interrupt_event, "_hermes_run_generation", None)
+            was_interrupted = interrupt_event.is_set()
             # A muted diagnostic wake ran for the session; its reply is not presented. The
             # policy read binds the routed profile; delivery itself stays in the launch scope.
             with self._media_delivery_scope(event.source):
@@ -4648,8 +4658,9 @@ class BasePlatformAdapter(ABC):
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery)
-            await self._release_turn_marker(event)
             processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            was_interrupted = was_interrupted or interrupt_event.is_set()
+            await self._release_turn_marker(event)
             # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
                 session_key, getattr(interrupt_event, "_hermes_run_generation", None),
@@ -4671,12 +4682,16 @@ class BasePlatformAdapter(ABC):
                 self._spawn_drain_task(pending_event, session_key, delay=delay)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
+            processing_ok = False
+            callback_generation = getattr(interrupt_event, "_hermes_run_generation", None)
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.CANCELLED if expected else ProcessingOutcome.FAILURE)
             raise
         except BaseException as e:
+            processing_ok = False
+            callback_generation = getattr(interrupt_event, "_hermes_run_generation", None)
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
@@ -4684,12 +4699,22 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            # Snapshot before awaits: a queued successor may reuse this guard.
+            # Other callbacks still run on failure; progress deletion uses the
+            # generation-scoped delivery outcome to require a successful answer.
+            delivery_outcome = (
+                callback_generation,
+                processing_ok and not was_interrupted and not interrupt_event.is_set(),
+            )
+            interrupt_event._hermes_delivery_outcome = delivery_outcome
             await self._release_turn_marker(event)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
-            await self._fire_post_delivery_callback(session_key, interrupt_event)
+            await self._fire_post_delivery_callback(
+                session_key, interrupt_event, delivery_outcome=delivery_outcome,
+            )
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)

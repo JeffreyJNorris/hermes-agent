@@ -3112,6 +3112,12 @@ class GatewayTurnMixin:
         turn_runner = TurnRunner(self, turn_ctx)
         turn_ctx.mute_notification_reply = diagnostic_turn_muted(
             turn_ctx.persist_user_display_metadata, source.platform, turn_ctx.user_config)
+        if (
+            turn_ctx.progress_mode == "status"
+            and turn_ctx.progress_queue is not None
+            and not turn_ctx.mute_notification_reply
+        ):
+            turn_ctx.progress_queue.put("Working...")
         # Agent tool-lifecycle callbacks live on the runner (bound methods, same signatures).
         turn_ctx.progress_callback = turn_runner.progress_callback
         turn_ctx.voice_ack_callback = turn_runner.voice_ack_callback
@@ -3766,6 +3772,9 @@ class GatewayTurnMixin:
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).
                     session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                    on_delivery_confirmed=(
+                        lambda: self._run_agent_delete_progress(adapter, turn_ctx)
+                    ) if not _delivery_result.get("failed") else None,
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
@@ -4102,11 +4111,26 @@ class GatewayTurnMixin:
                 _sk, _streamed, _previewed, _content_delivered, _transformed, len(_final),
             )
 
+    async def _run_agent_delete_progress(self, adapter: Any, turn_ctx: TurnContext) -> None:
+        """Delete this turn's tracked progress after confirmed delivery."""
+        if not turn_ctx._cleanup_progress or adapter is None:
+            return
+        if turn_ctx._run_still_current and not turn_ctx._run_still_current():
+            return
+        delivery_event = getattr(adapter, "_active_sessions", {}).get(turn_ctx.session_key)
+        agent = turn_ctx.agent_holder[0]
+        if (delivery_event is not None and delivery_event.is_set()) or getattr(agent, "is_interrupted", False):
+            return
+        source = turn_ctx.source
+        chat_id = source.thread_id if source.platform == Platform.DISCORD and source.thread_id else source.chat_id
+        for message_id in list(turn_ctx._cleanup_msg_ids):
+            with suppress(Exception):
+                await adapter.delete_message(chat_id, message_id)
+
     def _run_agent_schedule_bubble_cleanup(self, response: Any, _cleanup_adapter: Any, turn_ctx: TurnContext) -> None:
         """Schedule deletion of tracked temporary progress bubbles after the final response lands.
 
         Failed runs keep them as breadcrumbs. Only on adapters with ``delete_message``; failures swallowed."""
-        from gateway.run import safe_schedule_threadsafe
         _cleanup_msg_ids, session_key = turn_ctx._cleanup_msg_ids, turn_ctx.session_key
         if not (
             turn_ctx._cleanup_progress
@@ -4118,20 +4142,12 @@ class GatewayTurnMixin:
             and hasattr(_cleanup_adapter, "register_post_delivery_callback")
         ):
             return
-        _ids_snapshot = list(_cleanup_msg_ids)
-        _chat_id_snapshot = turn_ctx.source.chat_id
-        _loop_snapshot = asyncio.get_running_loop()
+        _delivery_event = getattr(_cleanup_adapter, "_active_sessions", {}).get(session_key)
 
-        def _cleanup_temp_bubbles() -> None:
-            async def _delete_all() -> None:
-                for _mid in _ids_snapshot:
-                    with suppress(Exception):
-                        await _cleanup_adapter.delete_message(_chat_id_snapshot, _mid)
-            with suppress(Exception):
-                safe_schedule_threadsafe(
-                    _delete_all(), _loop_snapshot, logger=logger,
-                    log_message="Temp bubble cleanup scheduling error",
-                )
+        async def _cleanup_temp_bubbles() -> None:
+            if getattr(_delivery_event, "_hermes_delivery_outcome", None) != (turn_ctx.run_generation, True):
+                return
+            await self._run_agent_delete_progress(_cleanup_adapter, turn_ctx)
 
         try:
             _cleanup_adapter.register_post_delivery_callback(
@@ -4189,6 +4205,10 @@ class GatewayTurnMixin:
             ):
                 break
             _elapsed_mins = int((time.time() - _notify_start) // 60)
+            if turn_ctx.progress_mode == "status" and turn_ctx.progress_queue is not None:
+                turn_ctx.last_progress_msg[0] = "Still working..."
+                turn_ctx.progress_queue.put(turn_ctx.last_progress_msg[0])
+                continue
             # Terse heartbeat by default; the iteration counter is gated on busy_ack_detail.
             _status_detail = ""
             _want_iteration_detail = bool(
@@ -4326,6 +4346,11 @@ class GatewayTurnMixin:
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
             if pending_event or pending:
+                # Settle the first turn's status before delivering its final and starting the next.
+                if progress_task:
+                    progress_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await progress_task
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
                 )

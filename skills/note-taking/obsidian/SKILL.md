@@ -11,58 +11,103 @@ metadata:
     related_skills: []
 ---
 
-# Obsidian Vault
+# Obsidian Vault Skill
 
-Use this skill for filesystem-first Obsidian vault work: reading notes, listing notes, searching note files, creating notes, appending content, and adding wikilinks.
+Read, search, create, and edit local Markdown notes. Use the bundled read-only
+helper for topic discovery and unchecked tasks; use file tools for note edits.
+No running Obsidian app, MCP server, or persistent index is required.
 
-## Vault path
+## When to Use
 
-Use a known or resolved vault path before calling file tools.
+Use for vault notes, topic searches, and requests to list unfinished tasks.
+When an exact note path is already known, go directly to `read_file`.
 
-The documented vault-path convention is the `OBSIDIAN_VAULT_PATH` environment variable, for example from `${HERMES_HOME:-~/.hermes}/.env`. If it is unset, use `~/Documents/Obsidian Vault`.
+## Prerequisites
 
-File tools do not expand shell variables. Do not pass paths containing `$OBSIDIAN_VAULT_PATH` to `read_file`, `write_file`, `patch`, or `search_files`; resolve the vault path first and pass a concrete absolute path. Vault paths may contain spaces, which is another reason to prefer file tools over shell commands.
+Resolve the vault path once. Use an already configured `OBSIDIAN_VAULT_PATH`,
+or fall back to `~/Documents/Obsidian Vault`. If unknown, use `terminal` to
+resolve the path or check that the fallback exists.
 
-If the vault path is unknown, `terminal` is acceptable for resolving `OBSIDIAN_VAULT_PATH` or checking whether the fallback path exists. Once the path is known, switch back to file tools.
+File tools do not expand shell variables: pass concrete absolute paths to
+`read_file`, `write_file`, `patch`, and `search_files`. Quote paths in shell
+commands. The helper needs Python 3.11+ and access to the vault filesystem.
 
-## Read a note
+## How to Run
 
-Use `read_file` with the resolved absolute path to the note. Prefer this over `cat` because it provides line numbers and pagination.
+Run `scripts/vault_search.py` through `terminal`. Form its absolute path from
+the `skill_dir` returned by `skill_view`; execute it without loading its source.
+Replace the placeholders below with that directory and the resolved vault path:
 
-## List notes
+```bash
+python3 "<skill_dir>/scripts/vault_search.py" \
+  --vault "<resolved-vault-path>" --query "finance cleanup" --tasks
+```
 
-Use `search_files` with `target: "files"` and the resolved vault path. Prefer this over `find` or `ls`.
+This matches all query words case-insensitively against **full relative paths**,
+including parent folders. It reads those notes and returns nonblank unchecked
+tasks with source paths and line numbers in the same invocation. If no paths
+match, it searches note contents for all the words instead.
 
-- To list all markdown notes, use `pattern: "*.md"` under the vault path.
-- To list a subfolder, search under that subfolder's absolute path.
+Query words are literal topic keywords, not a sentence or regex. For example,
+use `finance cleanup` for "find my finance cleanup tasks".
 
-## Search
+## Quick Reference
 
-Use `search_files` for both filename and content searches. Prefer this over `grep`, `find`, or `ls`.
+| Need | Helper arguments or file tool |
+|---|---|
+| Find topic notes | `--query "finance cleanup"` |
+| List topic tasks | `--query "finance cleanup" --tasks` |
+| Tasks in a known folder or note | `--path "Finance/Cleanup" --tasks` |
+| List notes in a folder | `--path "Finance/Cleanup"` |
+| Next result page | Same arguments, plus `--offset N --limit 100` |
+| Read a known note | `read_file` with its absolute path |
+| Create or replace a note | `write_file` with full Markdown content |
+| Make a focused edit | `patch` after reading the note |
 
-- For filenames, use `search_files` with `target: "files"` and a filename `pattern`.
-- For note contents, use `search_files` with `target: "content"`, the content regex as `pattern`, and `file_glob: "*.md"` when you want to restrict matches to markdown notes.
+Every helper invocation needs `--vault`. `--path` is relative to the vault and
+can name a folder or note. Without a query or path, the helper scans the vault.
 
-## Create a note
+## Procedure
 
-Use `write_file` with the resolved absolute path and the full markdown content. Prefer this over shell heredocs or `echo` because it avoids shell quoting issues and returns structured results.
+1. Resolve the vault and reuse known note/folder paths from the conversation.
+2. For topic discovery or task lists, run the helper once with short topic
+   keywords or a known `--path`. Prefer folder structure over guessing which
+   topic words appear in task text.
+3. For task requests, answer directly from the returned task text and sources.
+   Read a note only when more context is needed or before editing it.
+4. Inspect `matched_by`: `path` means only matching paths were searched;
+   `content` means a whole-scope content fallback; `scope` means no query.
+   These are literal matches, not exhaustive semantic search. If no relevant
+   notes match, try one broader topic query or list notes in the likely folder.
+   Do not cycle through synonym-heavy regex searches across the entire vault.
+5. `total`, `offset`, `limit`, and `truncated` refer to returned notes, or to
+   task rows with `--tasks`. If truncated, fetch the next page at
+   `offset + len(results)` before claiming to list all results. Report
+   incomplete coverage when `skipped_count` is nonzero.
+6. For edits, use `read_file`, then `patch` with stable context. Use
+   `write_file` when a complete rewrite is clearer. For an anchored append,
+   replace the anchor with the anchor plus new content; a simple append without
+   stable context may use `terminal`. Add `[[Note Name]]` wikilinks as needed.
 
-## Append to a note
+## Pitfalls
 
-Prefer a native file-tool workflow when it is not awkward:
+- Folder names are not note content. A subscription list under
+  `Finance/Cleanup` may contain neither word in its text.
+- `search_files` filename patterns do not discover parent folders. If the
+  helper is unavailable on the vault's filesystem, list Markdown notes with
+  `search_files`, `target: "files"`, `pattern: "*.md"`, and the vault path.
+  Inspect returned full paths, then scope content searches to the matching
+  folder. Use `target: "content"` and `file_glob: "*.md"` for content regexes.
+- During discovery, the helper skips hidden descendants and symlinks. Unreadable paths are
+  reported in `skipped_files` (first 20) and `skipped_count`.
+- Task extraction excludes checked/custom-status boxes, empty checkboxes,
+  and fenced code examples. It returns Markdown checkbox tasks, not plugin
+  queries or generated views.
+- If matching paths have no unchecked tasks, the helper keeps that scope;
+  it does not silently widen to unrelated notes.
 
-- Read the target note with `read_file`.
-- Use `patch` for an anchored append when there is stable context, such as adding a section after an existing heading or appending before a known trailing block.
-- Use `write_file` when rewriting the whole note is clearer than constructing a fragile patch.
+## Verification
 
-For an anchored append with `patch`, replace the anchor with the anchor plus the new content.
-
-For a simple append with no stable context, `terminal` is acceptable if it is the clearest safe option.
-
-## Targeted edits
-
-Use `patch` for focused note changes when the current content gives you stable context. Prefer this over shell text rewriting.
-
-## Wikilinks
-
-Obsidian links notes with `[[Note Name]]` syntax. When creating notes, use these to link related content.
+Preserve source paths and line numbers when reporting tasks. Check truncation
+and skipped files before saying the list is complete. After an edit, verify
+the affected note with `read_file`.

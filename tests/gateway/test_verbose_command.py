@@ -85,6 +85,33 @@ class TestVerboseCommand:
         assert saved["display"]["platforms"]["telegram"]["tool_progress"] == "verbose"
 
     @pytest.mark.asyncio
+    async def test_status_cycle_is_saved_only_for_current_platform(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "display:\n  tool_progress_command: true\n  tool_progress: 'off'\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+        runner = _make_runner()
+        event = _make_event(platform=Platform.DISCORD)
+
+        result = await runner._handle_verbose_command(event)
+
+        assert "STATUS" in result
+        assert "⚙" not in result
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert saved["display"]["tool_progress"] == "off"
+        assert saved["display"]["platforms"]["discord"]["tool_progress"] == "status"
+        assert "telegram" not in saved["display"]["platforms"]
+
+        result = await runner._handle_verbose_command(event)
+        assert "NEW" in result
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert saved["display"]["platforms"]["discord"]["tool_progress"] == "new"
+
+    @pytest.mark.asyncio
     async def test_quoted_false_keeps_command_disabled(self, tmp_path, monkeypatch):
         """Quoted false must not enable the /verbose gateway command."""
         hermes_home = tmp_path / "hermes"
@@ -102,5 +129,4 @@ class TestVerboseCommand:
 
         assert "not enabled" in result.lower()
         assert "tool_progress_command" in result
-
 

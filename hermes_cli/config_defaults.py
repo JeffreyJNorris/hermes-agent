@@ -912,6 +912,9 @@ DEFAULT_CONFIG = {
         # updates; false routes it to reasoning (visible only with show_reasoning).
         "show_commentary": True,
         "tool_progress_command": False,  # enable /verbose command in messaging gateway
+        # Gateway tool_progress also accepts "status": one editable plain-text activity line,
+        # without arguments. Discord defaults to "status" and cleanup_progress: true;
+        # explicit global/per-platform settings win.
         # display.tool_progress_overrides is deprecated (use display.platforms); a user-set value is
         # still honored at runtime and folded into platforms by migration.
         "tool_preview_length": 0,  # max chars for tool call previews (0 = no limit)
@@ -924,7 +927,8 @@ DEFAULT_CONFIG = {
         # CLI-only: cumulative turn output tokens on the live spinner ("· ↓ 1.2k tok").
         "spinner_token_flow": True,
         # Gateway tool-progress grouping where edits are supported: "accumulate" edits one bubble |
-        # "separate" one message per tool (noisier). Needs tool_progress enabled. Per-platform:
+        # "separate" one message per tool (noisier). Applies to history modes (new/all/verbose);
+        # "status" always edits one current-activity line. Per-platform:
         # display.platforms.<platform>.tool_progress_grouping.
         "tool_progress_grouping": "accumulate",
         # Custom long-running status phrases. Defaults: gateway/assets/status_phrases.yaml.

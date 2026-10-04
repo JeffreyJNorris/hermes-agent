@@ -186,6 +186,29 @@ def test_send_reports_the_decline(relay):
     assert connector.ops == ["send"]
 
 
+def test_queued_reconcile_decline_never_confirms_delivery(relay):
+    """A declined edit suppresses resending without authorizing progress cleanup."""
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+
+    adapter, connector = relay
+    runner = object.__new__(GatewayRunner)
+    confirmed = []
+
+    async def on_delivery_confirmed():
+        confirmed.append(True)
+
+    result = asyncio.run(runner._deliver_queued_first_response(
+        "Completed answer", source=SessionSource(platform=adapter.platform, chat_id="C1"),
+        adapter=adapter, stream_consumer=SimpleNamespace(message_id="stream-1"),
+        on_delivery_confirmed=on_delivery_confirmed,
+    ))
+
+    assert result is True
+    assert connector.ops == ["edit"]
+    assert confirmed == []
+
+
 def test_media_decline_does_not_fall_back_to_a_text_send(relay):
     """The worst swallow: a refused destination re-addressed by a different op.
 
