@@ -67,6 +67,8 @@ def _bind_live_session(
     session_id: str = "",
     ui_session_id: str = "",
     profile: str = "",
+    chat_id: str = "987654321098765432",
+    thread_id: str = "",
 ):
     return set_session_vars(
         platform="discord",
@@ -75,6 +77,8 @@ def _bind_live_session(
         ui_session_id=ui_session_id,
         profile=profile,
         user_id=actor,
+        chat_id=chat_id,
+        thread_id=thread_id,
         cron_session="",
         cron_job_id="",
     )
@@ -156,8 +160,8 @@ def test_live_post_derives_target_origin_and_actor_from_trusted_context(
     assert payload["created"] is True
     assert request is not None
     assert request.target.platform == "discord"
-    assert request.target.chat_id == "123456789012345678"
-    assert request.target.thread_id == "123456789012345679"
+    assert request.target.chat_id == "987654321098765432"
+    assert request.target.thread_id is None
     assert request.origin_type == "session"
     assert request.origin_id == "discord:guild:user"
     assert request.responder_mode is DurableResponderMode.INITIATOR
@@ -218,6 +222,63 @@ def test_cron_requires_reference_and_is_idempotent(configured_home: Path) -> Non
     assert request.origin_id == "job-17"
     assert request.responder_mode is DurableResponderMode.ANY_AUTHORIZED
     assert request.expected_actor_id is None
+    assert request.target.chat_id == "123456789012345678"
+    assert request.target.thread_id == "123456789012345679"
+
+
+def test_live_thread_post_targets_exact_thread(configured_home: Path) -> None:
+    tokens = _bind_live_session(
+        chat_id="987654321098765433", thread_id="987654321098765433"
+    )
+    try:
+        payload = json.loads(durable_request_tool(
+            action="post", title="Review", question="Continue?", options=["Yes", "No"]
+        ))
+    finally:
+        clear_session_vars(tokens)
+    request = get_durable_request_store().get(request_id=payload["request_id"])
+    assert request.target.chat_id == "987654321098765433"
+    assert request.target.thread_id == "987654321098765433"
+
+
+@pytest.mark.parametrize(
+    ("chat_id", "thread_id"),
+    [("", ""), ("0", ""), ("not-a-channel", ""),
+     ("987654321098765432", "987654321098765433")],
+)
+def test_live_post_without_valid_channel_never_falls_back_to_inbox(
+    configured_home: Path, chat_id: str, thread_id: str
+) -> None:
+    tokens = _bind_live_session(chat_id=chat_id, thread_id=thread_id)
+    try:
+        payload = json.loads(durable_request_tool(
+            action="post", title="Review", question="Continue?", options=["Yes", "No"]
+        ))
+    finally:
+        clear_session_vars(tokens)
+    assert "error" in payload
+    assert get_durable_request_store().claim_next_pending(["discord"]) is None
+
+
+def test_status_and_cancel_do_not_require_current_delivery_channel(
+    configured_home: Path,
+) -> None:
+    tokens = _bind_live_session()
+    try:
+        posted = json.loads(durable_request_tool(
+            action="post", title="Review", question="Continue?", options=["Yes", "No"]
+        ))
+    finally:
+        clear_session_vars(tokens)
+
+    tokens = _bind_live_session(chat_id="")
+    try:
+        status = json.loads(durable_request_tool(action="status", request_id=posted["request_id"]))
+        cancelled = json.loads(durable_request_tool(action="cancel", request_id=posted["request_id"]))
+    finally:
+        clear_session_vars(tokens)
+    assert status["status"] == "pending"
+    assert cancelled["status"] == "cancelled"
 
 
 def test_status_returns_selected_index_and_full_label(configured_home: Path) -> None:
@@ -246,7 +307,7 @@ def test_status_returns_selected_index_and_full_label(configured_home: Path) -> 
             request_id=posted["request_id"],
             option_token="2",
             platform="discord",
-            channel_id="123456789012345679",
+            channel_id="987654321098765432",
             message_id="message-1",
             actor_id="42",
         )
@@ -569,7 +630,7 @@ def test_wake_status_is_structural_and_hides_routing_metadata(
             request_id=posted["request_id"],
             option_token="2",
             platform="discord",
-            channel_id="123456789012345679",
+            channel_id="987654321098765432",
             message_id="message-1",
             actor_id="42",
         ).request is not None
@@ -635,8 +696,15 @@ def test_registry_multi_post_and_status_keep_canonical_set(configured_home: Path
         assert claim is not None and claim.request.max_selections == 4
         assert store.bind_delivery(request_id=posted["request_id"], claim_id=claim.claim_id,
                                    platform="discord", message_id="multi-message") is not None
+        wrong_channel = store.resolve_multi_select(
+            request_id=posted["request_id"], option_tokens=("6", "2"),
+            platform="discord", channel_id="123456789012345679",
+            message_id="multi-message", actor_id="42",
+        )
+        assert wrong_channel.request is None
+        assert wrong_channel.status.value == "scope_mismatch"
         selected = store.resolve_multi_select(request_id=posted["request_id"], option_tokens=("6", "2"),
-            platform="discord", channel_id="123456789012345679", message_id="multi-message", actor_id="42")
+            platform="discord", channel_id=claim.request.target.chat_id, message_id="multi-message", actor_id="42")
         assert selected.request is not None
         payload = json.loads(registry.dispatch("durable_request", {"action": "status", "request_id": posted["request_id"]}))
     finally:

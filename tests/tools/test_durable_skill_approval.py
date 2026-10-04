@@ -223,6 +223,7 @@ def test_complete_review_creates_idempotent_bounded_action(tmp_path, monkeypatch
     monkeypatch.setenv("HERMES_SESSION_KEY", "discord:123")
     monkeypatch.setenv("HERMES_SESSION_USER_ID", "456")
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "789")
     monkeypatch.setenv("HERMES_SESSION_ID", "session-1")
     from gateway.durable_requests import reset_durable_request_store_cache
     from hermes_cli.config import load_config, save_config
@@ -236,7 +237,32 @@ def test_complete_review_creates_idempotent_bounded_action(tmp_path, monkeypatch
     record = wa.stage_skill_write({"action": "create", "name": "demo", "content": VALID}, summary="create", origin="foreground")
     first = wa.create_skill_durable_approval(record); second = wa.create_skill_durable_approval(record)
     assert first == second and first["status"] == "awaiting_approval"
+    from gateway.durable_requests import get_durable_request_store
+    assert get_durable_request_store().get(request_id=first["request_id"]).target.chat_id == "789"
     assert wa.linked_skill_request_id(wa.get_pending(wa.SKILLS, record["id"])) == first["request_id"]
+    reset_durable_request_store_cache()
+
+
+def test_missing_live_channel_keeps_skill_change_manual(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SESSION_KEY", "discord:123")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "456")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.delenv("HERMES_SESSION_CHAT_ID", raising=False)
+    from gateway.durable_requests import get_durable_request_store, reset_durable_request_store_cache
+    from hermes_cli.config import load_config, save_config
+
+    reset_durable_request_store_cache()
+    config = load_config()
+    config["skills"].update(write_approval=True, durable_approval=True)
+    config["durable_approvals"] = {"enabled": True, "allowed_actions": ["skill.apply_pending"]}
+    config["durable_requests"].update(enabled=True, inbox={"platform": "discord", "chat_id": "123"})
+    save_config(config)
+    record = wa.stage_skill_write(
+        {"action": "create", "name": "demo", "content": VALID}, summary="create", origin="foreground"
+    )
+    assert wa.create_skill_durable_approval(record)["reason"] == "inbox_unavailable"
+    assert get_durable_request_store().claim_next_pending(["discord"]) is None
     reset_durable_request_store_cache()
 
 
@@ -255,6 +281,7 @@ def test_real_skill_manage_builds_request_without_content_in_action(tmp_path, mo
     monkeypatch.setenv("HERMES_SESSION_KEY", "discord:123")
     monkeypatch.setenv("HERMES_SESSION_USER_ID", "456")
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "789")
     monkeypatch.setenv("HERMES_SESSION_ID", "session-1")
     from gateway.durable_requests import reset_durable_request_store_cache
     from hermes_cli.config import load_config, save_config
@@ -278,6 +305,7 @@ def test_linked_manual_approve_authorizes_and_reject_cancels(tmp_path, monkeypat
     monkeypatch.setenv("HERMES_SESSION_KEY", "discord:123")
     monkeypatch.setenv("HERMES_SESSION_USER_ID", "456")
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "789")
     monkeypatch.setenv("HERMES_SESSION_ID", "session-1")
     from gateway.durable_requests import reset_durable_request_store_cache
     from gateway.durable_operations import DurableOperationsStore

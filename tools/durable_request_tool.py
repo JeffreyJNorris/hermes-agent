@@ -1,6 +1,6 @@
 """Model-facing persisted finite-choice request tool.
 
-The tool creates and queries detached user requests in the configured inbox.
+The tool creates and queries detached user requests in their trusted destination.
 It is not an authorization primitive and cannot satisfy terminal or application
 approval checks.  Delivery target and responder policy are trusted operator /
 gateway inputs, never model-provided fields.
@@ -21,6 +21,7 @@ from gateway.durable_requests import (
     DurableRequestOption,
     DurableRequestSpec,
     DurableRequestStatus,
+    DurableRequestTarget,
     DurableResponderMode,
     DurableWakeStatus,
     cancel_durable_request,
@@ -52,6 +53,17 @@ class _Origin:
     origin_session_id: str | None = None
     origin_ui_session_id: str | None = None
     origin_profile: str | None = None
+    delivery_target: DurableRequestTarget | None = None
+
+
+def _delivery_target_for_origin(
+    origin: _Origin, configured_inbox: DurableRequestTarget
+) -> DurableRequestTarget:
+    if origin.origin_type == "cron":
+        return configured_inbox
+    if origin.delivery_target is None:
+        raise ValueError("active Discord delivery channel is unavailable")
+    return origin.delivery_target
 
 
 def check_durable_request_requirements() -> bool:
@@ -144,7 +156,7 @@ def durable_request_tool(
                     min_selections=min_selections,
                     max_selections=max_selections,
                 ),
-                target=config.target,
+                target=_delivery_target_for_origin(origin, config.target),
                 responder_mode=origin.responder_mode,
                 expected_actor_id=origin.expected_actor_id,
                 origin_type=origin.origin_type,
@@ -329,6 +341,8 @@ def _current_origin(
     session_id = get_session_env("HERMES_SESSION_ID", "").strip()
     ui_session_id = get_session_env("HERMES_UI_SESSION_ID", "").strip()
     profile = get_session_env("HERMES_SESSION_PROFILE", "").strip()
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "").strip()
     if not session_key or not actor_id or platform != "discord":
         raise ValueError(
             "durable requests require an active Discord gateway session or cron job"
@@ -342,6 +356,14 @@ def _current_origin(
         origin_session_id=session_id or None,
         origin_ui_session_id=ui_session_id or None,
         origin_profile=profile or None,
+        delivery_target=(
+            DurableRequestTarget(platform="discord", chat_id=chat_id,
+                                 thread_id=thread_id or None)
+            if 0 < len(chat_id) <= 20 and chat_id.isascii() and chat_id.isdigit()
+            and chat_id[0] != "0"
+            and (not thread_id or thread_id == chat_id)
+            else None
+        ),
     )
 
 
@@ -424,7 +446,7 @@ DURABLE_REQUEST_SCHEMA = {
     "name": "durable_request",
     "description": (
         "Post, inspect, or cancel a persisted finite-choice request in the "
-        "operator-configured Approvals & Requests inbox. Posting returns "
+        "current Discord conversation (or the configured inbox for scheduled jobs). Posting returns "
         "immediately and the request can be answered after this turn or a "
         "gateway restart. Scheduled jobs should use a stable reference, then "
         "either poll status or opt into a fresh terminal wake turn. This is "
