@@ -32,6 +32,7 @@ durable_requests:
     platform: discord
     chat_id: "999999999999999999"
 durable_approvals:
+  inline_wait_seconds: 0
   enabled: true
   allowed_actions: [terminal.execute, execute_code.execute, host.sudo]
   host_sudo_allowed_users: ["42"]
@@ -637,3 +638,146 @@ def test_unanswered_ticket_does_not_authorize_direct_handler_invocation(profile)
     outcome = _module().execute_durable_execution(_context(pending['request_id']))
     assert outcome.status is DurableActionStatus.INVALIDATED
     assert not marker.exists()
+
+
+def _inline_operator(profile, *, reject=False):
+    """Use real persistence, actor validation and action dispatch in another worker."""
+    import contextvars
+    import threading
+    import time
+    from gateway.durable_actions import DurableActionStore
+    from gateway.durable_action_runner import DurableActionRunner
+    errors = []
+    def operate():
+        try:
+            store = get_durable_request_store()
+            limit = time.monotonic() + 5
+            while time.monotonic() < limit:
+                delivery = store.claim_next_pending(['discord'])
+                if delivery:
+                    break
+                time.sleep(.01)
+            else:
+                raise AssertionError('Approval was not staged')
+            request = delivery.request
+            store.bind_delivery(request_id=request.request_id, claim_id=delivery.claim_id,
+                                platform='discord', message_id='inline-review')
+            result = store.resolve(request_id=request.request_id, option_token='2' if reject else '1',
+                                   platform='discord', channel_id=request.target.delivery_channel_id,
+                                   message_id='inline-review', actor_id='42')
+            assert result.status.value == 'resolved'
+            runner = DurableActionRunner(DurableActionStore(store.db_path), enabled=True,
+                                         allowed_actions=['terminal.execute', 'execute_code.execute'])
+            asyncio.run(runner.process_once())
+        except BaseException as exc:
+            errors.append(exc)
+    context = contextvars.copy_context()
+    worker = threading.Thread(target=lambda: context.run(operate))
+    worker.start()
+    return worker, errors
+
+
+def test_inline_approval_returns_native_result_once_without_a_continuation(profile):
+    from gateway.durable_actions import DurableActionStore
+    path = profile / 'config.yaml'
+    path.write_text(path.read_text().replace('inline_wait_seconds: 0', 'inline_wait_seconds: 2'))
+    target = profile / 'once.txt'
+    worker, errors = _inline_operator(profile)
+    try:
+        result = _stage(f"printf 'once' >> {shlex.quote(str(target))}; printf 'native result'", timeout=5)
+    finally:
+        worker.join(10)
+    assert not worker.is_alive()
+    assert not errors, errors
+    assert result['status'] == 'execution_completed', result
+    assert result['tool_result']['exit_code'] == 0
+    assert result['tool_result']['output'] == 'native result'
+    assert target.read_text() == 'once'
+    assert DurableActionStore(get_durable_request_store().db_path).claim_next_notification() is None
+
+
+def test_inline_rejection_returns_without_execution_or_extra_turn(profile):
+    from gateway.durable_actions import DurableActionStore
+    path = profile / 'config.yaml'
+    path.write_text(path.read_text().replace('inline_wait_seconds: 0', 'inline_wait_seconds: 2'))
+    worker, errors = _inline_operator(profile, reject=True)
+    try:
+        result = _stage('printf should-not-run')
+    finally:
+        worker.join(10)
+    assert not worker.is_alive()
+    assert not errors, errors
+    assert result['status'] == 'execution_completed', result
+    assert result['tool_result']['status'] == 'blocked'
+    assert DurableActionStore(get_durable_request_store().db_path).claim_next_notification() is None
+
+
+def test_inline_wait_expires_into_same_durable_request(profile):
+    from gateway.durable_actions import DurableActionStore
+    path = profile / 'config.yaml'
+    path.write_text(path.read_text().replace('inline_wait_seconds: 0', 'inline_wait_seconds: .03'))
+    result = _stage('printf later')
+    assert result['status'] == 'approval_pending'
+    store = get_durable_request_store()
+    request = store.get(request_id=result['request_id'])
+    assert request.status.value == 'pending_delivery'
+    with sqlite3.connect(store.db_path) as conn:
+        owner, until = conn.execute('SELECT inline_wait_owner, inline_wait_until FROM durable_action_tickets WHERE request_id=?',
+                                    (request.request_id,)).fetchone()
+    assert owner is None and until is None
+
+
+@pytest.mark.parametrize('code', [
+    "import subprocess; subprocess.run(['ssh','hermes-host','sudo -n /usr/bin/id -u'])",
+    "import os; os.system(\"ssh hermes-host 'sudo -n /usr/bin/id -u'\")",
+    "from subprocess import check_output; check_output('sudo -n /usr/bin/id -u',shell=True)",
+])
+def test_visible_code_host_elevation_is_recognized_before_saved_grants(code):
+    assert _module().code_requests_host_sudo(code, 'local')
+
+
+def test_terminal_rpc_code_requests_operator_for_its_reviewed_script():
+    assert _module().code_requests_host_sudo('terminal("ssh hermes-host sudo id")', 'docker')
+    assert not _module().code_requests_host_sudo('print("sudo id")', 'local')
+
+
+def test_ssh_sudo_review_is_operator_only_even_when_scopes_requested(profile):
+    bridge = _module()
+    command = "ssh hermes-host 'sudo -n /usr/bin/id -u'"
+    with bridge.durable_execution_context('terminal.execute', {'command': command}, privileged_host=True):
+        result = bridge.maybe_defer_execution(command, 'host sudo', warnings=[('script', 'script', False)],
+                                             allow_session=True, allow_permanent=True, required=True)
+    request = get_durable_request_store().get(request_id=result['request_id'])
+    assert request.kind == 'tool.durable_approval.host.terminal.execute'
+    assert [option.id for option in request.options] == ['approve', 'reject']
+    payload = json.loads(_context(result['request_id']).payload_json)
+    assert payload['privileged_host'] is True
+
+
+def test_host_sudo_request_from_non_operator_is_blocked(profile):
+    bridge = _module()
+    set_session_vars(user_id='99')
+    with bridge.durable_execution_context('terminal.execute', {'command': 'sudo id'}, privileged_host=True):
+        result = bridge.maybe_defer_execution('sudo id', 'host sudo', required=True)
+    assert result['status'] == 'blocked'
+    assert 'request_id' not in result
+
+
+def test_direct_code_sudo_reaches_operator_before_off_mode(profile, monkeypatch):
+    from tools import code_execution_tool, approval
+    code = "import subprocess; subprocess.run(['ssh', 'hermes-host', 'sudo -n /usr/bin/id -u'])"
+    monkeypatch.setattr(approval, 'check_execute_code_guard', lambda *args, **kwargs:
+                        pytest.fail('ordinary code approval bypassed host operator gate'))
+    result = json.loads(code_execution_tool.execute_code(code, task_id='direct-privileged-code'))
+    assert result['status'] == 'approval_pending', result
+    request = get_durable_request_store().get(request_id=result['request_id'])
+    assert request.kind == 'tool.durable_approval.host.execute_code.execute'
+    assert [option.id for option in request.options] == ['approve', 'reject']
+
+
+
+def test_review_redaction_keeps_multiline_secret_boundaries():
+    secret = 'sk-' + 'a' * 40
+    result = _module().redact_execution_value({'content': 'first line\n' + secret, 'output': ['next\n' + secret]})
+    assert secret not in json.dumps(result)
+    assert result['content'].startswith('first line\n')

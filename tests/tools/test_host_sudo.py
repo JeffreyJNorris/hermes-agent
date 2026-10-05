@@ -38,6 +38,51 @@ def test_only_explicit_request_is_intercepted():
     assert host_sudo.parse_host_sudo_command("hermes host sudo -- /usr/bin/printf '%s' 'two words'") == ['/usr/bin/printf', '%s', 'two words']
 
 
+@pytest.mark.parametrize('command, backend', [
+    ('sudo -n /usr/bin/id -u', 'local'),
+    ('/usr/bin/sudo -n /usr/bin/id -u', 'ssh'),
+    ("ssh -F /root/.hermes/host-access/ssh_config hermes-host 'sudo -n /usr/bin/systemctl --user --machine=jeff@.host show hermes-google-tasks.timer && printf done'", 'docker'),
+    ("ssh -i /root/key jeff@jn-llm001 sudo -n /usr/bin/id -u", 'docker'),
+    ("bash -lc \"ssh -F /root/conf hermes-host 'sudo -n id'\"", 'docker'),
+    ("env CHECK=1 command sudo -n id", 'local'),
+    ("timeout 30 /bin/bash -lc 'sudo -n id'", 'ssh'),
+    ("echo ready\nsudo -n id", 'local'),
+    ("echo ready && /usr/bin/sudo -n id", 'local'),
+    ("echo \"$(sudo -n id)\"", 'local'),
+    ("if true; then sudo -n id; fi", 'local'),
+    ("ssh hermes-host \"bash -lc 'sudo -n id'\"", 'docker'),
+    ("bash --norc -lc 'sudo -n id'", 'local'),
+    ("bash -c -- 'sudo -n id'", 'local'),
+    ("env -S 'sudo -n id'", 'local'),
+    ("ssh hermes-host 'sudo -n id", 'docker'),
+    ("ssh hermes-host <<'EOF'\nsudo -n id\nEOF", 'docker'),
+    ("printf '%s\\n' 'sudo -n id' | ssh hermes-host bash -s", 'docker'),
+])
+def test_host_privilege_paths_require_operator_approval(command, backend):
+    from tools.host_sudo import requires_host_sudo_approval
+    assert requires_host_sudo_approval(command, backend)
+
+
+@pytest.mark.parametrize('command, backend', [
+    ('sudo -n id', 'docker'),
+    ("printf '%s' sudo", 'local'),
+    ("printf '%s' 'sudo -n id'", 'local'),
+    ("printf '%s' '|' sudo", 'local'),
+    ('command -v sudo', 'local'),
+    ("ssh hermes-host 'printf okay'", 'docker'),
+    ("ssh hermes-host 'printf \"sudo -n id\"'", 'docker'),
+    ("bash -lc 'printf okay'", 'local'),
+    ("echo '$(sudo id)'", 'local'),
+    ('echo ready # sudo -n id', 'local'),
+    ("printf '%s\\n' 'sudo is text' | ssh hermes-host cat", 'docker'),
+    ("printf '%s\\n' 'sudo is text' | ssh hermes-host \"bash -c 'cat'\"", 'docker'),
+    ("printf '%s\\n' 'sudo is text' | ssh hermes-host bash -c cat", 'docker'),
+])
+def test_unrelated_shell_and_container_sudo_remain_ordinary(command, backend):
+    from tools.host_sudo import requires_host_sudo_approval
+    assert not requires_host_sudo_approval(command, backend)
+
+
 @pytest.mark.parametrize('command', [
     'hermes host sudo -- id', 'hermes host sudo --',
     'hermes host sudo -- /usr/bin/id && /usr/bin/id',

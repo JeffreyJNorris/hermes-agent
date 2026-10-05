@@ -1001,6 +1001,8 @@ def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *,
         return _ApprovalVerdict(approved_run=True)
     approval = _check_all_guards(command, env_type, has_host_access=_docker_has_host_access(config))
     if not approval["approved"]:
+        if approval.get("status") == "execution_completed" and isinstance(approval.get("tool_result"), dict):
+            raise _Rejected(json.dumps(approval["tool_result"]))
         if approval.get("status") in {"approval_pending", "invalidated"}:
             raise _Rejected(json.dumps({key: value for key, value in approval.items() if key != "approved"}))
         if approval.get("status") == "pending_approval":  # gateway ask mode
@@ -1396,9 +1398,10 @@ def terminal_tool(
                     import shlex
                     host_timeout = timeout if timeout is not None else 180
                     prepared = prepare_host_sudo(host_argv, host_timeout)
-                    return json.dumps(defer_prepared_execution(
+                    decision = defer_prepared_execution(
                         prepared, shlex.join(host_argv), "Run this exact command as root on the host.", required=True,
-                    ))
+                    )
+                    return json.dumps(decision["tool_result"] if decision.get("status") == "execution_completed" else decision)
             except ValueError as exc:
                 return _error_json(str(exc), status="blocked")
         plan = _plan_execution(
@@ -1450,6 +1453,8 @@ def terminal_tool(
         from tools.durable_execution_approval import (
             durable_execution_context, capture_terminal_execution_state, execution_context_matches_consent,
         )
+        from tools.host_sudo import requires_host_sudo_approval
+        privileged_host = requires_host_sudo_approval(command, env_type)
         reviewed_cwd = _resolve_command_cwd(
             workdir=workdir, default_cwd=cwd, session_key=session_key, env_type=env_type,
             mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd, env=env,
@@ -1461,9 +1466,24 @@ def terminal_tool(
             heartbeat=heartbeat, persist_on_release=persist_on_release,
         )
         with durable_execution_context("terminal.execute", execution_args,
-                                       execution_state=capture_terminal_execution_state(env, env_type)):
+                                       execution_state=capture_terminal_execution_state(env, env_type),
+                                       privileged_host=privileged_host):
             if not execution_context_matches_consent():
                 return _error_json("The reviewed execution context changed; the command was not run.", status="invalidated")
+            if privileged_host:
+                from tools.durable_execution_approval import maybe_defer_execution
+                operator = maybe_defer_execution(
+                    command, "Host sudo requires operator approval for this exact command.", required=True,
+                )
+                if operator and operator.get("status") == "execution_completed" and isinstance(operator.get("tool_result"), dict):
+                    raise _Rejected(json.dumps(operator["tool_result"]))
+                if not operator or not operator.get("approved") or not operator.get("user_approved"):
+                    if operator and operator.get("status") in {"approval_pending", "invalidated"}:
+                        raise _Rejected(json.dumps({key: value for key, value in operator.items() if key != "approved"}))
+                    raise _Rejected(_error_json(
+                        operator.get("message", "Explicit operator approval is required for host sudo.")
+                        if operator else "Explicit operator approval is required for host sudo.", status="blocked",
+                    ))
             verdict = _run_approval_guards(command, env_type, plan.config, force=force)
 
         pty_disabled = pty and _command_requires_pipe_stdin(command)

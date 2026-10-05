@@ -127,6 +127,7 @@ def _fake_discord():
         AllowedMentions=_FakeAllowedMentions,
         Interaction=object,
         Embed=lambda **kwargs: SimpleNamespace(**kwargs),
+        File=lambda fp, *, filename: SimpleNamespace(fp=fp, filename=filename),
     )
 
 
@@ -194,9 +195,9 @@ def _request(*, message_id: str | None = None) -> DurableRequest:
 
 
 def _tool_request(action="terminal.execute", *, message_id=None):
-    host = action == "host.sudo"
+    host = action in {"host.sudo", "host.terminal.execute", "host.execute_code.execute"}
     choices = [("approve", "Approve Once" if host else "Allow Once")]
-    if not host:
+    if not host and action not in {"file.write", "file.patch"}:
         choices.extend((("session", "Allow Session"), ("always", "Always Allow")))
     choices.append(("reject", "Deny"))
     return replace(
@@ -209,7 +210,7 @@ def _tool_request(action="terminal.execute", *, message_id=None):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", ["terminal.execute", "execute_code.execute", "host.sudo"])
+@pytest.mark.parametrize("action", ["terminal.execute", "execute_code.execute", "host.sudo", "host.terminal.execute", "host.execute_code.execute", "file.write", "file.patch"])
 async def test_durable_tool_approval_preserves_compact_controls_and_distinct_host_card(
     discord_adapter_module, monkeypatch, action,
 ):
@@ -238,12 +239,17 @@ async def test_durable_tool_approval_preserves_compact_controls_and_distinct_hos
     assert all(ord(char) < 128 for char in sent["content"])
     view = sent["view"]
     assert view.timeout is None
-    if action == "host.sudo":
+    if action in {"host.sudo", "host.terminal.execute", "host.execute_code.execute"}:
         assert sent["embed"].title == "HOST SUDO - elevated privileges"
         assert sent["embed"].color == "red"
         assert [button.label for button in view.children] == ["Approve Once", "Deny"]
         assert [button.style for button in view.children] == ["green", "red"]
         assert "Operator approval is required for every host sudo operation." in sent["content"]
+    elif action in {"file.write", "file.patch"}:
+        assert sent["embed"].title == "Hermes wants to edit files that need your OK"
+        assert sent["embed"].color == "orange"
+        assert [button.label for button in view.children] == ["Allow Once", "Deny"]
+        assert [button.style for button in view.children] == ["green", "red"]
     else:
         assert sent["embed"].title == "Hermes wants to run a command that needs your OK"
         assert sent["embed"].color == "orange"
@@ -252,7 +258,7 @@ async def test_durable_tool_approval_preserves_compact_controls_and_distinct_hos
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", ["terminal.execute", "execute_code.execute", "host.sudo"])
+@pytest.mark.parametrize("action", ["terminal.execute", "execute_code.execute", "host.sudo", "host.terminal.execute", "host.execute_code.execute", "file.write", "file.patch"])
 async def test_durable_tool_approval_restore_retains_controls_and_original_message(
     discord_adapter_module, monkeypatch, action,
 ):
@@ -271,10 +277,10 @@ async def test_durable_tool_approval_restore_retains_controls_and_original_messa
     assert view.timeout is None
     assert message_id == 99
     assert view._message is channel.message
-    assert [button.label for button in view.children] == (
-        ["Approve Once", "Deny"] if action == "host.sudo"
-        else ["Allow Once", "Allow Session", "Always Allow", "Deny"]
-    )
+    expected = (["Approve Once", "Deny"] if action in {"host.sudo", "host.terminal.execute", "host.execute_code.execute"}
+                else ["Allow Once", "Deny"] if action in {"file.write", "file.patch"}
+                else ["Allow Once", "Allow Session", "Always Allow", "Deny"])
+    assert [button.label for button in view.children] == expected
 
 
 @pytest.mark.asyncio
@@ -310,6 +316,14 @@ def test_host_sudo_ui_rejects_persistent_permission_options(discord_adapter_modu
     )
     with pytest.raises(ValueError, match="host sudo"):
         discord_adapter_module.DurableRequestView(request=request, allowed_user_ids={"42"}, store=_Store(None))
+
+
+@pytest.mark.parametrize("action", ["file.write", "file.patch"])
+def test_file_approval_card_retains_scopes_when_native_gate_allows_them(discord_adapter_module, action):
+    request = replace(_tool_request(action), options=_tool_request("terminal.execute").options)
+    view = discord_adapter_module.DurableRequestView(request=request, allowed_user_ids={"42"}, store=_Store(None))
+    assert [button.label for button in view.children] == ["Allow Once", "Allow Session", "Always Allow", "Deny"]
+    assert view.timeout is None
 
 
 @pytest.mark.asyncio
@@ -397,6 +411,96 @@ async def test_fast_execution_result_cannot_be_overwritten_by_queued_decision_ca
     assert (await completion).success
     assert "queued for execution" in interaction.response.edits[0]["embed"].description
     assert channel.message.edits[-1]["embed"].description == "Reviewed operation completed."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["file.write", "file.patch", "terminal.execute", "execute_code.execute", "host.sudo"])
+async def test_omitted_operation_attaches_full_redacted_verified_review(
+    discord_adapter_module, monkeypatch, tmp_path, action,
+):
+    import hashlib
+    import json
+    from gateway.durable_actions import PreparedDurableAction, encode_durable_action_payload
+    from gateway.durable_requests import DurableRequestSpec, DurableRequestStore
+
+    module = discord_adapter_module
+    channel = _Channel()
+    adapter = object.__new__(module.DiscordAdapter)
+    adapter._client = _Client(channel)
+    adapter._allowed_user_ids = {"42"}
+    adapter._allowed_role_ids = set()
+    adapter.MAX_MESSAGE_LENGTH = 2000
+    secret = "sk-abcdefghijklmnopqrstuvwxyz0123456789"
+    content = "Reviewed action detail\n" * 120 + secret
+    arguments = ({"argv": ["/usr/bin/printf", content], "timeout": 30}
+                 if action == "host.sudo" else {"content": content, "path": "AGENTS.md"})
+    payload = arguments if action == "host.sudo" else {"action_type": action, "arguments": arguments,
+                                                         "session_env": {"private_marker": "PRIVATE_CONTEXT"}}
+    encoded = encode_durable_action_payload(payload)
+    fingerprint = hashlib.sha256(encoded.encode()).hexdigest()
+    store = DurableRequestStore(tmp_path / "review.db", wall_clock=lambda: 1.0)
+    template = _tool_request(action)
+    request = store.create_with_action(
+        DurableRequestSpec(kind=template.kind, title="Reviewed operation", options=template.options,
+                           body=f"Preview\n[Remaining content omitted; exact operation SHA-256: {fingerprint}]",
+                           ttl_seconds=1000),
+        action=PreparedDurableAction(action, 1, encoded, fingerprint, "attachment-review"),
+        target=template.target, responder_mode=template.responder_mode, expected_actor_id=None,
+        origin_type="cron", origin_id="attachment-test",
+    ).request
+    monkeypatch.setattr(module, "get_durable_request_store", lambda: store)
+
+    result = await adapter.send_durable_request("10", request, {"thread_id": "11"})
+
+    assert result.success, result.error
+    sent = channel.sent[0]
+    assert "Full reviewed operation is attached." in sent["content"]
+    assert sent["allowed_mentions"] is _FakeAllowedMentions.sentinel
+    attachment = sent["file"]
+    assert attachment.filename == "reviewed-operation.txt"
+    full_review = attachment.fp.getvalue().decode()
+    assert fingerprint in full_review
+    assert "Reviewed action detail" in full_review
+    assert secret not in full_review
+    assert "PRIVATE_CONTEXT" not in full_review
+    assert full_review.count("Reviewed action detail") == 120
+
+
+@pytest.mark.asyncio
+async def test_omitted_review_cannot_deliver_a_tampered_payload(discord_adapter_module, monkeypatch, tmp_path):
+    import hashlib
+    import sqlite3
+    from gateway.durable_actions import PreparedDurableAction, encode_durable_action_payload
+    from gateway.durable_requests import DurableRequestSpec, DurableRequestStore
+
+    module = discord_adapter_module
+    channel = _Channel()
+    adapter = object.__new__(module.DiscordAdapter)
+    adapter.platform = module.Platform.DISCORD
+    adapter._client = _Client(channel)
+    adapter._allowed_user_ids = {"42"}
+    adapter._allowed_role_ids = set()
+    adapter.MAX_MESSAGE_LENGTH = 2000
+    store = DurableRequestStore(tmp_path / "review.db", wall_clock=lambda: 1.0)
+    template = _tool_request("file.write")
+    encoded = encode_durable_action_payload({"arguments": {"path": "AGENTS.md", "content": "reviewed"}})
+    request = store.create_with_action(
+        DurableRequestSpec(kind=template.kind, title="Reviewed operation", options=template.options,
+                           body="[Remaining content omitted; inspect attachment]", ttl_seconds=1000),
+        action=PreparedDurableAction("file.write", 1, encoded, hashlib.sha256(encoded.encode()).hexdigest(), "tamper-test"),
+        target=template.target, responder_mode=template.responder_mode, expected_actor_id=None,
+        origin_type="cron", origin_id="attachment-test",
+    ).request
+    with sqlite3.connect(store.db_path) as connection:
+        connection.execute("UPDATE durable_action_tickets SET payload_json=? WHERE request_id=?",
+                           ('{"arguments":{"content":"unreviewed"}}', request.request_id))
+    monkeypatch.setattr(module, "get_durable_request_store", lambda: store)
+
+    result = await adapter.send_durable_request("10", request, {"thread_id": "11"})
+
+    assert not result.success
+    assert result.error_kind == "bad_format"
+    assert channel.sent == []
 
 
 def test_native_alternative_is_visible_only_when_command_response_allowed() -> None:

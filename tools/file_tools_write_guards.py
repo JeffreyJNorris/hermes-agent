@@ -256,7 +256,7 @@ _APPROVAL_UNAVAILABLE = "requires approval but the approval subsystem is unavail
 _NO_HUMAN = "requires approval but no interactive user or gateway is present to approve it."
 
 
-def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default") -> str | None:
+def _request_protected_instruction_approval(reasons: list[str], task_id: str = "default") -> str | dict | None:
     """Ask the human to approve a write to protected instruction file(s); ``None`` when approved.
 
     Deliberately NOT routed through ``_run_approval_gate`` (honors --yolo and
@@ -278,6 +278,10 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
     denied = blocked.format(why="was denied by the user.")
 
     try:
+        from tools.durable_execution_approval import maybe_defer_execution
+        deferred = maybe_defer_execution(display, description, allow_session=False, allow_permanent=False)
+        if deferred is not None:
+            return None if deferred.get("approved") else deferred
         import tools.approval as _approval
         from tools.approval_context import get_current_session_key
         from tools.approval_gateway_wait import _await_gateway_decision
@@ -387,6 +391,8 @@ def _check_approval_required_write(paths: list[str], task_id: str = "default") -
         no_human_block_message=blocked.format(why=_NO_HUMAN))
     if result.get("approved"):
         return None
+    if result.get("status") in {"approval_pending", "execution_completed", "invalidated"}:
+        return result
     return result.get("message") or blocked.format(why="was denied.")
 
 

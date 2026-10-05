@@ -765,11 +765,20 @@ def execute_code(
     # the session context. A Docker sandbox with host bind mounts gets no container fast-path.
     # See #30882.
     from tools.approval import check_execute_code_guard
-    from tools.durable_execution_approval import durable_execution_context, capture_code_execution_state
+    from tools.durable_execution_approval import (
+        durable_execution_context, capture_code_execution_state, code_requests_host_sudo, maybe_defer_execution,
+    )
     execution_args = dict(code=code, task_id=task_id, enabled_tools=enabled_tools, reset=reset)
+    privileged_host = code_requests_host_sudo(code, env_type)
     with durable_execution_context("execute_code.execute", execution_args,
-                                   execution_state=capture_code_execution_state(execution_args)):
-        _guard = check_execute_code_guard(code, env_type, has_host_access=_docker_has_host_access(_env_config))
+                                   execution_state=capture_code_execution_state(execution_args),
+                                   privileged_host=privileged_host):
+        _guard = (maybe_defer_execution(code, "Host sudo in this script requires operator approval.", required=True)
+                  if privileged_host else None)
+        if _guard is None or _guard.get("approved") and _guard.get("user_approved"):
+            _guard = check_execute_code_guard(code, env_type, has_host_access=_docker_has_host_access(_env_config))
+    if _guard.get("status") == "execution_completed":
+        return json.dumps(_guard["tool_result"])
     if not _guard.get("approved", False):
         if _guard.get("status") in {"approval_pending", "invalidated"}:
             return json.dumps({key: value for key, value in _guard.items() if key != "approved"})

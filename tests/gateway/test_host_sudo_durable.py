@@ -23,6 +23,7 @@ async def test_owner_decision_survives_reopen_and_executes_once(tmp_path, monkey
                         calls.append(argv) or subprocess.CompletedProcess(argv, 0, '0\n', ''))
     try:
         (tmp_path / 'config.yaml').write_text('''durable_approvals:
+  inline_wait_seconds: 0
   enabled: true
   allowed_actions: [host.sudo]
   host_sudo_allowed_users: ["42"]
@@ -99,6 +100,7 @@ durable_requests:
     platform: discord
     chat_id: "999999999999999999"
 durable_approvals:
+  inline_wait_seconds: 0
   enabled: true
   allowed_actions: [host.sudo]
   host_sudo_allowed_users: ["42"]

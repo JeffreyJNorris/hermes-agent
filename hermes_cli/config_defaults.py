@@ -1666,6 +1666,8 @@ DEFAULT_CONFIG = {
         # Deferred terminal/code/host-sudo reviews remain answerable after the
         # turn ends. Bounded by durable_requests.max_ttl_seconds.
         "execution_ttl_seconds": 604800,
+        # Keep the current turn waiting before handing off to durable delivery.
+        "inline_wait_seconds": 300,
         # Discord user IDs permitted to request/approve privileged host argv.
         # No owner listed means host.sudo remains unavailable.
         "host_sudo_allowed_users": [],

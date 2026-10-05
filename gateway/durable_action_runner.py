@@ -45,6 +45,7 @@ class DurableActionRunner:
         allowed_actions: Iterable[str] = (),
         stale_claim_seconds: float = DEFAULT_STALE_CLAIM_SECONDS,
         notification_handler: DurableActionNotificationHandler | None = None,
+        completion_handler: Callable[[object, str], Awaitable[None]] | None = None,
     ) -> None:
         stale_claim_seconds = float(stale_claim_seconds)
         if not math.isfinite(stale_claim_seconds) or stale_claim_seconds <= 0:
@@ -55,6 +56,7 @@ class DurableActionRunner:
         self._stale_claim_seconds = stale_claim_seconds
         self._heartbeat_seconds = stale_claim_seconds / 3
         self._notification_handler = notification_handler
+        self._completion_handler = completion_handler
 
     async def process_once(self) -> bool:
         if not self._enabled:
@@ -146,12 +148,21 @@ class DurableActionRunner:
                 DurableActionStatus.UNKNOWN,
                 reason="invalid_handler_outcome",
             )
-        return await asyncio.to_thread(
+        completed = await asyncio.to_thread(
             self._store.complete,
             context.request_id,
             token,
             outcome,
         )
+        if completed and self._completion_handler is not None:
+            try:
+                await self._completion_handler(context, outcome.status.value)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # Presentation cannot change an already recorded execution.
+                pass
+        return completed
 
     async def _dispatch_notification(self) -> bool:
         if self._notification_handler is None:

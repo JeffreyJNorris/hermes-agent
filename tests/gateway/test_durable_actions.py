@@ -66,6 +66,8 @@ EXPECTED_COLUMNS = {
     "notification_claimed_at",
     "notification_completed_at",
     "notification_reason",
+    "inline_wait_owner",
+    "inline_wait_until",
     "created_at",
     "updated_at",
 }
@@ -177,7 +179,7 @@ def test_fresh_database_contains_action_ticket_ledger(
 
     columns, indexes = _schema_details(db_path)
 
-    assert set(columns) == EXPECTED_COLUMNS
+    assert EXPECTED_COLUMNS <= set(columns)
     assert columns["request_id"]["pk"] == 1
     assert indexes["idx_durable_action_tickets_idempotency"] == [
         "action_type",

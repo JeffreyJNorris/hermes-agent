@@ -72,8 +72,8 @@ _COMPONENT_ID_PREFIX = "dr"
 
 
 def _supports_execution_approval_scopes(action_type: str, kind: str) -> bool:
-    """Scope choices belong only to the native terminal/code approval path."""
-    return (action_type in {"terminal.execute", "execute_code.execute"}
+    """Scope choices belong only to regular native tool approval paths."""
+    return (action_type in {"terminal.execute", "execute_code.execute", "file.write", "file.patch"}
             and kind == "tool.durable_approval." + action_type)
 
 
@@ -777,6 +777,8 @@ class DurableRequestStore:
         terminal_retention_seconds: float = (
             DEFAULT_DURABLE_TERMINAL_RETENTION_SECONDS
         ),
+        inline_wait_owner: str | None = None,
+        inline_wait_until: float | None = None,
     ) -> DurableActionCreateResult:
         if not isinstance(action, PreparedDurableAction):
             raise DurableRequestError("action must be a PreparedDurableAction")
@@ -808,6 +810,13 @@ class DurableRequestStore:
             )
 
         now = float(self._wall_clock())
+        if inline_wait_owner is not None or inline_wait_until is not None:
+            if (type(inline_wait_owner) is not str or not inline_wait_owner.strip()
+                    or len(inline_wait_owner) > 128
+                    or type(inline_wait_until) not in (int, float)
+                    or not math.isfinite(inline_wait_until)
+                    or not now < inline_wait_until <= now + MAX_DURABLE_REQUEST_TTL_SECONDS):
+                raise DurableRequestError("inline result wait requires a bounded owner lease")
         with self._lock, self._transaction(immediate=True) as conn:
             self._prepare_create_locked(conn, values=values, now=now)
             if values.spec.reference is not None:
@@ -860,8 +869,9 @@ class DurableRequestStore:
                 """INSERT INTO durable_action_tickets (
                        request_id, action_type, action_version, payload_json,
                        fingerprint, idempotency_key, status,
-                       notification_status, created_at, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       notification_status, created_at, updated_at,
+                       inline_wait_owner, inline_wait_until
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     request_row["request_id"],
                     action.action_type,
@@ -873,6 +883,8 @@ class DurableRequestStore:
                     DurableActionNotificationStatus.NOT_READY.value,
                     now,
                     now,
+                    inline_wait_owner,
+                    inline_wait_until,
                 ),
             )
             ticket_row = conn.execute(
@@ -887,6 +899,42 @@ class DurableRequestStore:
             )
         self._log_registered(result.request)
         return result
+
+    def consume_inline_result(self, request_id: str, owner: str) -> dict | None:
+        """Atomically give a terminal outcome to its original active tool turn."""
+        if type(owner) is not str or not owner.strip() or len(owner) > 128:
+            raise DurableRequestError("inline wait owner is invalid")
+        with self._lock, self._transaction(immediate=True) as conn:
+            now = float(self._wall_clock())
+            row = conn.execute(
+                "SELECT status, outcome_json, outcome_reason FROM durable_action_tickets "
+                "WHERE request_id=? AND inline_wait_owner=? AND inline_wait_until>? "
+                "AND notification_status=?",
+                (request_id, owner, now, DurableActionNotificationStatus.PENDING.value),
+            ).fetchone()
+            if row is None or row["status"] not in _TERMINAL_ACTION_STATUSES:
+                return None
+            changed = conn.execute(
+                "UPDATE durable_action_tickets SET notification_status=?, notification_completed_at=?, "
+                "notification_reason='consumed_inline', inline_wait_owner=NULL, inline_wait_until=NULL, updated_at=? "
+                "WHERE request_id=? AND inline_wait_owner=? AND notification_status=?",
+                (DurableActionNotificationStatus.DELIVERED.value, now, now, request_id, owner,
+                 DurableActionNotificationStatus.PENDING.value),
+            ).rowcount
+            if changed != 1:
+                return None
+            return {"status": row["status"], "result_json": row["outcome_json"], "reason": row["outcome_reason"]}
+
+    def release_inline_wait(self, request_id: str, owner: str) -> bool:
+        """Leave delivery to the durable notifier when the active turn detaches."""
+        if type(owner) is not str or not owner.strip() or len(owner) > 128:
+            raise DurableRequestError("inline wait owner is invalid")
+        with self._lock, self._transaction(immediate=True) as conn:
+            return conn.execute(
+                "UPDATE durable_action_tickets SET inline_wait_owner=NULL, inline_wait_until=NULL, updated_at=? "
+                "WHERE request_id=? AND inline_wait_owner=?",
+                (float(self._wall_clock()), request_id, owner),
+            ).rowcount == 1
 
     @staticmethod
     def _ticket_matches_action(

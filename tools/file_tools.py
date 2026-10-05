@@ -40,6 +40,8 @@ from tools.file_tools_read_tracking import (
     _mark_full_write_baseline, _mark_verification_stale, _note_read_coverage, _patch_failure_lock,
     _patch_failure_tracker, _read_tracker, _read_tracker_lock, _record_not_found,
     _record_patch_failure, _reset_patch_failures, _task_data, _update_read_timestamp)
+from tools.file_tools_durable import (
+    capture_file_execution_state, durable_file_execution, restore_file_execution_baseline)
 
 logger = logging.getLogger(__name__)
 
@@ -858,6 +860,7 @@ def _whole_file_rewrite_hint(task_id: str, resolved: str | None, new_content: st
     )
 
 
+@durable_file_execution("file.write")
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -878,6 +881,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                "Strip read_file line-number prefixes or reconstruct the intended "
                "file contents before writing.")
     if err:
+        if isinstance(err, dict):
+            return json.dumps(err.get("tool_result", err) if err.get("status") == "execution_completed" else err,
+                              ensure_ascii=False)
         return tool_error(err)
     try:
         # Resolution failure falls back to the legacy unlocked path (the write
@@ -954,6 +960,7 @@ def _collect_v4a_header_paths(patch: str) -> tuple[list[str], list[str], list[st
     return paths, content_paths, entry_paths
 
 
+@durable_file_execution("file.patch")
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
                task_id: str = "default", cross_profile: bool = False,
@@ -975,6 +982,10 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         _entry_paths = collected[2]
     precheck_err = _write_precheck_error(_paths_to_check, _content_write_paths, task_id, cross_profile)
     if precheck_err:
+        if isinstance(precheck_err, dict):
+            return json.dumps(precheck_err.get("tool_result", precheck_err)
+                              if precheck_err.get("status") == "execution_completed" else precheck_err,
+                              ensure_ascii=False)
         return tool_error(precheck_err)
     try:
         # Lock paths in sorted, deduplicated order so concurrent callers with

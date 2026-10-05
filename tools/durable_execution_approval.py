@@ -1,6 +1,6 @@
 """Detach exact Discord tool executions into the existing durable approval outbox.
 
-Only the terminal/code entry points bind operations. The model cannot supply a
+Native terminal, code and file entry points bind operations. The model cannot supply a
 ticket, a destination, a backend override or approval proof. Raw arguments stay
 in the private state database; the Discord review and outcome are redacted.
 """
@@ -11,6 +11,8 @@ import contextvars
 import hashlib
 import json
 import uuid
+import time
+import math
 from contextlib import contextmanager
 
 _operation = contextvars.ContextVar("durable_execution_operation", default=None)
@@ -21,7 +23,19 @@ _SESSION_FIELDS = (
     "session_key", "session_id", "ui_session_id", "message_id", "profile",
     "parent_chat_id", "cron_session", "cron_job_id",
 )
-_ACTION_TYPES = frozenset({"terminal.execute", "execute_code.execute"})
+_ACTION_TYPES = frozenset({"terminal.execute", "execute_code.execute", "file.write", "file.patch"})
+
+
+def redact_execution_value(value):
+    """Redact string leaves before JSON escaping changes token boundaries."""
+    from agent.redact import redact_sensitive_text
+    if isinstance(value, str):
+        return redact_sensitive_text(value, force=True)
+    if isinstance(value, dict):
+        return {key: redact_execution_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_execution_value(item) for item in value]
+    return value
 
 
 def _digest(value):
@@ -57,6 +71,8 @@ def _approval_scope(operation):
 
 
 def _allowed_choices(operation):
+    if operation.get("privileged_host"):
+        return ("approve",)
     scope = _approval_scope(operation)
     return ("approve",) + (("session",) if scope["allow_session"] else ()) + (("always",) if scope["allow_permanent"] else ())
 
@@ -82,7 +98,7 @@ def _configuration_fingerprint(action_type):
 
 
 @contextmanager
-def durable_execution_context(action_type, arguments, *, execution_state=None):
+def durable_execution_context(action_type, arguments, *, execution_state=None, privileged_host=False):
     """Bind the exact operation around a guard, without exposing it to the model."""
     operation = {
         "action_type": action_type,
@@ -91,6 +107,8 @@ def durable_execution_context(action_type, arguments, *, execution_state=None):
         "session_env": _session_values(),
         "configuration_fingerprint": _configuration_fingerprint(action_type),
     }
+    if privileged_host:
+        operation["privileged_host"] = True
     token = _operation.set(operation)
     try:
         yield
@@ -158,15 +176,22 @@ def defer_prepared_execution(prepared, review_command, description, *, required=
         origin = _current_origin(config.scheduled_responder_mode)
         if origin.origin_type != "session" or not origin.origin_session_id:
             return _blocked("Durable executions require the original Discord conversation; the command was not run.")
-        if prepared.action_type == "host.sudo":
+        from gateway.durable_actions import decode_durable_action_payload, INLINE_WAIT_OWNER
+        payload = decode_durable_action_payload(prepared.payload_json)
+        privileged_host = prepared.action_type == "host.sudo" or payload.get("privileged_host") is True
+        if privileged_host:
             from tools.host_sudo import host_sudo_actor_allowed
             if not host_sudo_actor_allowed(origin.expected_actor_id):
                 return _blocked("Privileged host approval is restricted to the configured owner; the command was not run.")
         ttl = policy.get("execution_ttl_seconds", 7 * 86400)
         if type(ttl) not in (int, float) or not 0 < ttl <= 7 * 86400:
             return _blocked("Invalid durable execution approval lifetime; the command was not run.")
+        wait_seconds = inline_wait_seconds(policy)
+        if prepared.action_type in {"file.write", "file.patch"}:
+            review_command = json.dumps(redact_execution_value(payload["arguments"]), ensure_ascii=False, indent=2)
         review = redact_sensitive_text(review_command, force=True)
         reason = redact_sensitive_text(description, force=True)
+        reason = reason.encode("utf-16-le")[:320].decode("utf-16-le", errors="ignore")
         if prepared.action_type in _ACTION_TYPES:
             from gateway.durable_actions import decode_durable_action_payload
             choices = _allowed_choices(decode_durable_action_payload(prepared.payload_json))
@@ -175,14 +200,21 @@ def defer_prepared_execution(prepared, review_command, description, *, required=
             options += (DurableRequestOption("reject", "Deny"),)
         else:
             options = (DurableRequestOption("approve", "Approve Once"), DurableRequestOption("reject", "Deny"))
-        body = f"**Requested command:**\n```\n{review}\n```\n\n**Why it was flagged:** {reason}"
-        if prepared.action_type == "host.sudo":
+        header = "**Requested command:**\n```\n"
+        suffix = f"\n```\n\n**Why it was flagged:** {reason}"
+        if privileged_host:
             import socket
-            body = f"**Host:** {socket.gethostname()}\n\n" + body
+            header = f"**Host:** {socket.gethostname()[:128]}\n\n" + header
+        from gateway.interactive import MAX_PROMPT_BODY_LENGTH
+        budget = min(850, MAX_PROMPT_BODY_LENGTH - len(header) - len(suffix))
+        if len(review.encode("utf-16-le")) // 2 > budget:
+            notice = "\n[Remaining content omitted; full review attached. SHA-256: " + prepared.fingerprint + "]"
+            review = review.encode("utf-16-le")[:2 * (budget - len(notice))].decode("utf-16-le", errors="ignore") + notice
+        body = header + review + suffix
         result = get_durable_request_store().create_with_action(
             DurableRequestSpec(
-                kind="tool.durable_approval." + prepared.action_type,
-                title="HOST SUDO — elevated privileges" if prepared.action_type == "host.sudo" else "Hermes wants to run a command that needs your OK",
+                kind="tool.durable_approval." + ("host." if privileged_host and prepared.action_type != "host.sudo" else "") + prepared.action_type,
+                title="HOST SUDO — elevated privileges" if privileged_host else "Hermes wants to run a command that needs your OK",
                 body=body,
                 options=options,
                 ttl_seconds=min(ttl, config.max_ttl_seconds),
@@ -197,21 +229,29 @@ def defer_prepared_execution(prepared, review_command, description, *, required=
             text_command_fallback_allowed=config.command_responses_enabled and config.allow_text_delivery_fallback,
             maximum_ttl_seconds=config.max_ttl_seconds,
             terminal_retention_seconds=config.terminal_retention_seconds,
+            inline_wait_owner=INLINE_WAIT_OWNER if wait_seconds else None,
+            inline_wait_until=time.time() + wait_seconds if wait_seconds else None,
         )
+        if wait_seconds:
+            completed = _wait_inline(get_durable_request_store(), result.request.request_id, wait_seconds)
+            if completed is not None:
+                return completed
         return {"approved": False, "status": "approval_pending", "approval_pending": True,
                 "request_id": result.request.request_id,
-                "message": "The operation has not run. A durable approval is pending in this conversation. "
+                "message": "The operation is pending approval or execution in this conversation. "
                            "After approval Hermes runs the reviewed operation once and continues here. Do not repeat it."}
     except (ValueError, TypeError):
         return _blocked("Cannot stage durable execution approval; the command was not run.")
 
 
-def maybe_defer_execution(command, description, *, warnings=None, allow_session=False, allow_permanent=False):
+def maybe_defer_execution(command, description, *, warnings=None, allow_session=False, allow_permanent=False, required=False):
     """Used only when the existing approval gate has decided to ask a human."""
     operation = _operation.get()
     if operation is None:
         return None
     consent = _consent.get()
+    if _reviewed_nested_host_command(operation, consent):
+        return {"approved": True, "user_approved": True}
     if consent is not None and consent["action_type"] == operation["action_type"]:
         # Several guard findings may ask about the same command. Consent is
         # scoped to one exact execution, rather than the first guard finding.
@@ -221,10 +261,10 @@ def maybe_defer_execution(command, description, *, warnings=None, allow_session=
         return {"approved": True, "user_approved": True}
     # CLI/other adapters keep their existing approval semantics.
     if operation["session_env"]["platform"] != "discord":
-        return None
+        return _blocked("Host sudo requires explicit operator approval in Discord.") if required else None
     try:
         if _policy_for(operation["action_type"]) is None:
-            return None
+            return _blocked("Required operator approval is not configured.") if required else None
         operation = dict(operation)
         if warnings is not None:
             operation["approval_scope"] = {
@@ -233,9 +273,74 @@ def maybe_defer_execution(command, description, *, warnings=None, allow_session=
             }
         _approval_scope(operation)
         prepared = prepare_durable_execution(operation)
-        return defer_prepared_execution(prepared, command, description)
+        return defer_prepared_execution(prepared, command, description, required=required)
     except (ValueError, TypeError):
         return _blocked("Cannot stage durable execution approval; the command was not run.")
+
+
+def _reviewed_nested_host_command(operation, consent):
+    """A reviewed script's literal host terminal calls share its one-shot consent."""
+    if (not consent or consent["action_type"] != "execute_code.execute"
+            or operation["action_type"] != "terminal.execute" or not operation.get("privileged_host")):
+        return False
+    payload = consent.get("payload", {})
+    context = consent.get("execution_context")
+    if not context or not payload.get("privileged_host"):
+        return False
+    # Resolve the declared backend now; the parent fingerprint pins it.
+    from tools.terminal_tool import _get_env_config
+    commands = reviewed_host_terminal_commands(payload["arguments"]["code"], _get_env_config()["env_type"])
+    from tools.host_sudo import host_sudo_actor_allowed
+    return (operation["arguments"].get("command") in commands
+            and operation["session_env"] == payload["session_env"]
+            and _policy_for(context.action_type) is not None
+            and _configuration_fingerprint(context.action_type) == payload["configuration_fingerprint"]
+            and host_sudo_actor_allowed(payload["session_env"]["user_id"])
+            and _origin_is_current(context, payload))
+
+
+def inline_wait_seconds(policy=None):
+    if policy is None:
+        from hermes_cli.config import load_config_readonly
+        policy = load_config_readonly().get("durable_approvals", {})
+    value = policy.get("inline_wait_seconds", 300)
+    if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 300:
+        raise ValueError("invalid inline approval wait")
+    return float(value)
+
+
+def _wait_inline(store, request_id, seconds):
+    """Return the executed result to this caller; never replay the reviewed call."""
+    from gateway.durable_actions import INLINE_WAIT_OWNER, decode_durable_action_result
+    from contextlib import ExitStack
+    from tools.approval_human_wait import human_wait_window, activity_heartbeat
+    from tools.interrupt import is_interrupted
+    heartbeat = activity_heartbeat("Waiting for tool approval")
+    deadline = time.monotonic() + seconds
+    try:
+        with ExitStack() as human_wait:
+            human_wait.enter_context(human_wait_window())
+            while True:
+                outcome = store.consume_inline_result(request_id, INLINE_WAIT_OWNER)
+                if outcome is not None:
+                    try:
+                        native = decode_durable_action_result(outcome["result_json"]) if outcome.get("result_json") else {
+                            "status": "blocked", "error": "The reviewed operation was not executed: " + str(outcome["status"]),
+                        }
+                    except (TypeError, ValueError):
+                        native = {"status": "unknown", "error": "Recorded execution result is unreadable; inspect its receipt before retrying.",
+                                  "request_id": request_id}
+                    return {"approved": False, "status": "execution_completed", "tool_result": native}
+                request = store.get(request_id=request_id)
+                if request is not None and request.status.value == "selected":
+                    # Execution time is tool work, not time awaiting a human.
+                    human_wait.close()
+                if time.monotonic() >= deadline or is_interrupted():
+                    return None
+                heartbeat()
+                time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+    finally:
+        store.release_inline_wait(request_id, INLINE_WAIT_OWNER)
 
 
 def execute_durable_execution(context):
@@ -256,15 +361,35 @@ def execute_durable_execution(context):
             return DurableActionOutcome(DurableActionStatus.HANDLER_UNAVAILABLE, reason="execution_not_allowlisted")
         if _configuration_fingerprint(context.action_type) != payload["configuration_fingerprint"]:
             return DurableActionOutcome(DurableActionStatus.INVALIDATED, reason="execution_configuration_changed")
+        if payload.get("privileged_host"):
+            from tools.host_sudo import host_sudo_actor_allowed
+            if not host_sudo_actor_allowed(payload["session_env"]["user_id"]):
+                return DurableActionOutcome(DurableActionStatus.INVALIDATED, reason="operator_no_longer_allowed")
+        if context.action_type == "terminal.execute":
+            from tools.host_sudo import requires_host_sudo_approval
+            from tools.terminal_tool import _get_env_config
+            if requires_host_sudo_approval(payload["arguments"]["command"], _get_env_config()["env_type"]) and payload.get("privileged_host") is not True:
+                return DurableActionOutcome(DurableActionStatus.INVALIDATED, reason="host_sudo_requires_new_review")
+        if context.action_type == "execute_code.execute":
+            from tools.terminal_tool import _get_env_config
+            if code_requests_host_sudo(payload["arguments"]["code"], _get_env_config()["env_type"]) and payload.get("privileged_host") is not True:
+                return DurableActionOutcome(DurableActionStatus.INVALIDATED, reason="host_sudo_requires_new_review")
         if not _origin_is_current(context, payload):
             return DurableActionOutcome(DurableActionStatus.INVALIDATED, reason="origin_unavailable")
         tokens = set_session_vars(**payload["session_env"])
         session_token = set_current_session_key(payload["session_env"]["session_key"])
-        proof = _consent.set({"operation_digest": _execution_digest(payload), "action_type": context.action_type})
+        proof = _consent.set({"operation_digest": _execution_digest(payload), "action_type": context.action_type,
+                               "execution_context": context, "payload": payload})
         try:
             if context.action_type == "terminal.execute":
                 from tools.terminal_tool import terminal_tool
                 result = terminal_tool(**payload["arguments"])
+            elif context.action_type in {"file.write", "file.patch"}:
+                from tools.file_tools import restore_file_execution_baseline, write_file_tool, patch_tool
+                if not restore_file_execution_baseline(context.action_type, payload["arguments"], payload["execution_state"]):
+                    return DurableActionOutcome(DurableActionStatus.INVALIDATED, reason="file_target_changed")
+                handler = write_file_tool if context.action_type == "file.write" else patch_tool
+                result = handler(**payload["arguments"])
             else:
                 from tools.code_execution_tool import execute_code
                 if (capture_code_execution_state(payload["arguments"]) != payload["execution_state"]
@@ -279,17 +404,23 @@ def execute_durable_execution(context):
         parsed = json.loads(result)
         if parsed.get("status") not in {"invalidated", "blocked", "approval_pending", "pending_approval", "disabled"}:
             _persist_reviewed_scope(context, payload)
-        output = {"tool": "terminal" if context.action_type == "terminal.execute" else "execute_code",
-                  "output": redact_sensitive_text(str(parsed.get("output", parsed.get("error", ""))), force=True),
-                  "status": str(parsed.get("status", "completed")), "exit_code": parsed.get("exit_code")}
-        for key in ("session_id", "yielded_session_id", "pid", "returncode"):
-            if key in parsed:
-                output[key] = parsed[key]
-        output["output"] = output["output"].encode("utf-8")[-12000:].decode("utf-8", errors="ignore")
-        while len(json.dumps(output, ensure_ascii=False).encode()) > 15000:
-            output["output"] = output["output"][len(output["output"]) // 2:]
+        tool = {"terminal.execute": "terminal", "execute_code.execute": "execute_code",
+                "file.write": "write_file", "file.patch": "patch"}[context.action_type]
+        output = dict(parsed, tool=tool)
+        # Preserve native result fields for the waiting caller, with the same
+        # private outbox size limit and credential redaction as deferred results.
+        output = redact_execution_value(output)
+        for key in ("output", "error", "diff"):
+            if isinstance(output.get(key), str):
+                output[key] = output[key].encode("utf-8")[-12000:].decode("utf-8", errors="ignore")
+        if len(json.dumps(output, ensure_ascii=False).encode()) > 15000:
+            output = {"tool": tool, "status": parsed.get("status", "completed"),
+                      "exit_code": parsed.get("exit_code"), "success": parsed.get("success"),
+                      "output": str(parsed.get("output", parsed.get("error", parsed.get("diff", ""))))[-3000:],
+                      "truncated": True}
+            output["output"] = redact_sensitive_text(output["output"], force=True)
         status = parsed.get("status")
-        failed = status in {"blocked", "error", "approval_pending", "pending_approval", "disabled"} or parsed.get("exit_code") not in (None, 0)
+        failed = status in {"blocked", "error", "approval_pending", "pending_approval", "disabled"} or parsed.get("exit_code") not in (None, 0) or parsed.get("success") is False or bool(parsed.get("error"))
         outcome_status = (DurableActionStatus.INVALIDATED if status == "invalidated" else
                           DurableActionStatus.UNKNOWN if status in {"unknown", "timeout", "interrupted"} or parsed.get("exit_code") in {124, 130} else
                           DurableActionStatus.FAILED if failed else DurableActionStatus.SUCCEEDED)
@@ -381,6 +512,56 @@ def capture_terminal_execution_state(env, env_type):
     if env_type not in {"local", "ssh"}:
         return {"backend": env_type, "instance": id(env)}
     return None
+
+
+def reviewed_host_terminal_commands(code, env_type):
+    """Extract only literal terminal commands from the exact reviewed script."""
+    import ast
+    from tools.host_sudo import requires_host_sudo_approval
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return frozenset()
+    commands = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        if name != "terminal":
+            continue
+        argument = node.args[0] if node.args else next((item.value for item in node.keywords if item.arg == "command"), None)
+        if isinstance(argument, ast.Constant) and isinstance(argument.value, str) and requires_host_sudo_approval(argument.value, env_type):
+            commands.add(argument.value)
+    return frozenset(commands)
+
+
+def code_requests_host_sudo(code, env_type):
+    """Recognize visible direct subprocess elevation before saved code grants."""
+    if reviewed_host_terminal_commands(code, env_type):
+        return True
+    import ast
+    from tools.host_sudo import requires_host_sudo_approval
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    direct_calls = {"run", "Popen", "call", "check_call", "check_output", "system", "popen"}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, "id", "")
+        if name not in direct_calls:
+            continue
+        try:
+            command = ast.literal_eval(node.args[0])
+        except (ValueError, TypeError):
+            continue
+        if isinstance(command, (list, tuple)) and all(isinstance(part, str) for part in command):
+            import shlex
+            command = shlex.join(command)
+        if isinstance(command, str) and requires_host_sudo_approval(command, env_type):
+            return True
+    return False
 
 
 def capture_code_execution_state(arguments):

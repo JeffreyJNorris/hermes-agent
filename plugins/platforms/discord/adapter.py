@@ -13,12 +13,14 @@ import asyncio
 import datetime as dt
 import hashlib
 import inspect
+import io
 import json
 import logging
 import math
 import os
 import re
 import struct
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -312,7 +314,9 @@ def _durable_tool_approval_action(request: DurableRequest) -> Optional[str]:
     prefix = "tool.durable_approval."
     if request.kind.startswith(prefix):
         action = request.kind[len(prefix):]
-        if action in {"terminal.execute", "execute_code.execute", "host.sudo"}:
+        if action in {"host.terminal.execute", "host.execute_code.execute"}:
+            return "host.sudo"
+        if action in {"terminal.execute", "execute_code.execute", "host.sudo", "file.write", "file.patch"}:
             return action
     return None
 
@@ -320,6 +324,8 @@ def _durable_tool_approval_action(request: DurableRequest) -> Optional[str]:
 def _durable_tool_approval_title(request: DurableRequest) -> str:
     if _durable_tool_approval_action(request) == "host.sudo":
         return "HOST SUDO - elevated privileges"
+    if _durable_tool_approval_action(request) in {"file.write", "file.patch"}:
+        return "Hermes wants to edit files that need your OK"
     return EA_HEADER_TEXT
 
 
@@ -333,10 +339,37 @@ def _render_discord_durable_request(request: DurableRequest) -> str:
     )
     # Expiry is the persisted deadline, never a timeout on the Discord view.
     expiry = int(request.expires_at)
+    attachment_notice = ("\n\nFull reviewed operation is attached."
+                         if "[Remaining content omitted;" in request.body else "")
     return (
-        f"**{title}**\n\n{privileged_notice}{request.body}\n\n"
+        f"**{title}**\n\n{privileged_notice}{request.body}{attachment_notice}\n\n"
         f"Approval available until <t:{expiry}:F> (<t:{expiry}:R>)."
     )
+
+
+def _durable_tool_full_review(request: DurableRequest, store) -> bytes:
+    """Read only the immutable action arguments needed for the operator's review."""
+    from gateway.durable_actions import decode_durable_action_payload
+    from agent.redact import redact_sensitive_text
+    from tools.durable_execution_approval import redact_execution_value
+
+    action = request.kind.removeprefix("tool.durable_approval.")
+    if action in {"host.terminal.execute", "host.execute_code.execute"}:
+        action = action.removeprefix("host.")
+    with sqlite3.connect(store.db_path) as connection:
+        row = connection.execute(
+            "SELECT action_type, payload_json, fingerprint FROM durable_action_tickets WHERE request_id=?",
+            (request.request_id,),
+        ).fetchone()
+    if row is None or row[0] != action or hashlib.sha256(row[1].encode()).hexdigest() != row[2]:
+        raise ValueError("Reviewed action fingerprint does not match")
+    payload = decode_durable_action_payload(row[1])
+    arguments = payload if action == "host.sudo" else payload.get("arguments")
+    if not isinstance(arguments, dict):
+        raise ValueError("Reviewed action arguments are unavailable")
+    full_text = (f"Hermes reviewed operation\nAction: {action}\nSHA-256: {row[2]}\n\n"
+                 + json.dumps(redact_execution_value(arguments), ensure_ascii=False, indent=2))
+    return redact_sensitive_text(full_text, force=True).encode("utf-8")
 
 
 def _durable_tool_approval_embed(request: DurableRequest, *, decision=None):
@@ -5847,12 +5880,17 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 error_kind="too_long",
             )
         try:
+            store = get_durable_request_store()
             view = DurableRequestView(
                 request=request,
                 allowed_user_ids=self._allowed_user_ids,
                 allowed_role_ids=self._allowed_role_ids,
-                store=get_durable_request_store(),
+                store=store,
             )
+            attachment = None
+            if _durable_tool_approval_action(request) and "[Remaining content omitted;" in request.body:
+                full_review = await asyncio.to_thread(_durable_tool_full_review, request, store)
+                attachment = discord.File(io.BytesIO(full_review), filename="reviewed-operation.txt")
         except Exception as exc:
             logger.warning(
                 "[%s] durable request view construction failed (%s)",
@@ -5874,6 +5912,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                            "allowed_mentions": discord.AllowedMentions.none()}
             if _durable_tool_approval_action(request):
                 send_kwargs["embed"] = _durable_tool_approval_embed(request)
+            if attachment is not None:
+                send_kwargs["file"] = attachment
             message = await channel.send(
                 **send_kwargs,
             )

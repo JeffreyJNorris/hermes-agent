@@ -9,6 +9,7 @@ import secrets
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -25,6 +26,11 @@ from hermes_state_common import (
 
 if TYPE_CHECKING:
     from gateway.durable_requests import DurableRequest
+
+
+# Inline result consumers are process-bound. A new gateway process must never
+# wait on a dead predecessor's lease before delivering the persisted outcome.
+INLINE_WAIT_OWNER = uuid.uuid4().hex
 
 
 class DurableActionStatus(str, Enum):
@@ -263,7 +269,7 @@ class DurableActionNotificationClaim:
 
 
 def _notification_tool_result(action_type: str, result_json: str | None) -> dict | None:
-    if action_type not in {"terminal.execute", "execute_code.execute", "host.sudo"} or not result_json:
+    if action_type not in {"terminal.execute", "execute_code.execute", "host.sudo", "file.write", "file.patch"} or not result_json:
         return None
     from agent.redact import redact_sensitive_text
 
@@ -276,7 +282,7 @@ def _notification_tool_result(action_type: str, result_json: str | None) -> dict
     return {
         key: (redact_sensitive_text(value, force=True)[:8000] if isinstance(value, str) else value)
         for key, value in result.items()
-        if key in {"tool", "output", "exit_code", "status", "error", "session_id"}
+        if key in {"tool", "output", "exit_code", "status", "error", "session_id", "success", "diff"}
         and (value is None or type(value) in {str, int, bool})
     }
 
@@ -698,6 +704,7 @@ class DurableActionStore:
     def claim_next_notification(self) -> DurableActionNotificationClaim | None:
         token = secrets.token_urlsafe(24)
         with self._lock, self._transaction() as conn:
+            now = self._now()
             row = conn.execute(
                 """SELECT ticket.request_id, ticket.action_type, ticket.status,
                           ticket.outcome_reason, ticket.outcome_json, request.origin_type,
@@ -707,13 +714,14 @@ class DurableActionStore:
                    JOIN durable_requests AS request
                      ON request.request_id = ticket.request_id
                    WHERE ticket.notification_status = ?
+                     AND (ticket.inline_wait_owner IS NULL OR ticket.inline_wait_owner != ?
+                          OR ticket.inline_wait_until IS NULL OR ticket.inline_wait_until <= ?)
                    ORDER BY ticket.completed_at, ticket.request_id
                    LIMIT 1""",
-                (DurableActionNotificationStatus.PENDING.value,),
+                (DurableActionNotificationStatus.PENDING.value, INLINE_WAIT_OWNER, now),
             ).fetchone()
             if row is None:
                 return None
-            now = self._now()
             changed = conn.execute(
                 """UPDATE durable_action_tickets
                    SET notification_status = ?, notification_claim = ?,
@@ -888,7 +896,7 @@ register_durable_action_handler(
     diagnose_unknown=_write_approval.diagnose_durable_skill_pending,
 )
 
-for _action_type in ("terminal.execute", "execute_code.execute"):
+for _action_type in ("terminal.execute", "execute_code.execute", "file.write", "file.patch"):
     register_durable_action_handler(
         _action_type,
         1,

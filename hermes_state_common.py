@@ -358,6 +358,8 @@ CREATE TABLE IF NOT EXISTS durable_action_tickets (
             notification_reason IS NULL
             OR length(notification_reason) <= {MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH}
         ),
+    inline_wait_owner TEXT,
+    inline_wait_until REAL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL
 );
@@ -392,6 +394,9 @@ def reconcile_durable_action_schema(conn) -> None:
             f"CHECK (notification_reason IS NULL OR length(notification_reason) "
             f"<= {MAX_DURABLE_ACTION_OUTCOME_REASON_LENGTH})"
         )
+    for column, kind in (("inline_wait_owner", "TEXT"), ("inline_wait_until", "REAL")):
+        if column not in columns:
+            conn.execute(f"ALTER TABLE durable_action_tickets ADD COLUMN {column} {kind}")
 
 
 

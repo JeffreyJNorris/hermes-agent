@@ -46,9 +46,9 @@ HUMAN_WAIT_MARGIN_S = 60.0
 
 
 def human_wait_ceiling() -> float:
-    """Max seconds a single window may contribute: approvals.timeout + margin.
-    Every legitimate human wait self-terminates at ``approvals.timeout`` (the CLI
-    prompt join and the gateway poll loop both enforce it), so a window that
+    """Max seconds a human window may contribute, plus a bounded margin.
+    Native prompts use ``approvals.timeout``; Discord durable tools may wait at
+    most ``durable_approvals.inline_wait_seconds`` before detaching. A window that
     overstays this ceiling is itself wedged and must not keep extending a batch
     deadline. Also the bound on the authorization gate's serialization-lock
     acquire in agent/tool_executor.py, so the two cannot drift. Never call while
@@ -57,7 +57,20 @@ def human_wait_ceiling() -> float:
     value is always safe for ``Lock.acquire(timeout=...)`` / ``Thread.join(timeout=...)``."""
     from tools import approval_context
     from agent.deadline import MAX_SAFE_TIMEOUT_S
-    return min(MAX_SAFE_TIMEOUT_S, float(approval_context._get_approval_timeout()) + HUMAN_WAIT_MARGIN_S)
+    timeout = float(approval_context._get_approval_timeout())
+    from gateway.session_context import get_session_env
+    if get_session_env("HERMES_SESSION_PLATFORM", "") == "discord":
+        from hermes_cli.config import load_config_readonly
+        import math
+        try:
+            policy = load_config_readonly().get("durable_approvals", {})
+            inline = policy.get("inline_wait_seconds", 300) if isinstance(policy, dict) else None
+            if (isinstance(policy, dict) and policy.get("enabled") is True
+                    and type(inline) in (int, float) and math.isfinite(inline) and 0 <= inline <= 300):
+                timeout = max(timeout, inline)
+        except (OSError, ValueError, TypeError):
+            pass
+    return min(MAX_SAFE_TIMEOUT_S, timeout + HUMAN_WAIT_MARGIN_S)
 
 
 def _clamped_window_seconds(started: float, now: float, ceiling: float) -> float:

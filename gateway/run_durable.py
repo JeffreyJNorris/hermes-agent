@@ -89,11 +89,15 @@ class GatewayDurableMixin:
                                     adapters=_adapters,
                                 )
 
+                            async def _completed(context, status, _adapters=adapters):
+                                await self._edit_durable_execution_result(context.request_id, status, _adapters)
+
                             action_runner = DurableActionRunner(
                                 DurableActionStore(profile_home / "state.db"),
                                 enabled=enabled,
                                 allowed_actions=allowed,
                                 notification_handler=_notify,
+                                completion_handler=_completed,
                             )
                             await action_runner.process_once()
                         except asyncio.CancelledError:
@@ -349,6 +353,25 @@ class GatewayDurableMixin:
             "origin_adapter_unavailable",
         )
 
+    async def _edit_durable_execution_result(self, request_id, status, adapters, adapter=None):
+        from gateway.durable_requests import get_durable_request_store
+        request = await asyncio.to_thread(get_durable_request_store().get, request_id=request_id)
+        if request is None or not request.kind.startswith("tool.durable_approval."):
+            return
+        adapter = adapter or next((item for key, item in adapters.items()
+                        if getattr(key, "value", key) == request.target.platform), None)
+        updater = getattr(type(adapter), "update_durable_execution_result", None)
+        if callable(updater):
+            try:
+                result = await updater(adapter, request, status)
+                if getattr(result, "success", True) is False:
+                    logger.warning("Durable tool approval result edit unavailable", extra={"request_id": request_id})
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Durable tool approval result edit failed",
+                               extra={"request_id": request_id, "exception_class": type(exc).__name__})
+
     async def _dispatch_durable_action_notification(
         self,
         claim,
@@ -437,7 +460,7 @@ class GatewayDurableMixin:
             "profile": event_profile or "",
             "message_id": f"durable-action:{claim.request_id}",
         }
-        if claim.action_type in {"terminal.execute", "execute_code.execute", "host.sudo"}:
+        if claim.action_type in {"terminal.execute", "execute_code.execute", "host.sudo", "file.write", "file.patch"}:
             result = getattr(claim, "tool_result", None)
             if isinstance(result, dict):
                 evt["tool_result"] = result
@@ -453,28 +476,7 @@ class GatewayDurableMixin:
                 DurableActionNotificationDisposition.RETRY,
                 "origin_adapter_unavailable",
             )
-        if claim.action_type in {"terminal.execute", "execute_code.execute", "host.sudo"}:
-            # Edit the persisted review in place; never create a second approval
-            # or let a cosmetic edit failure suppress the actual tool result.
-            updater = getattr(type(adapter), "update_durable_execution_result", None)
-            if callable(updater):
-                try:
-                    from gateway.durable_requests import get_durable_request_store
-                    request = await asyncio.to_thread(
-                        get_durable_request_store().get, request_id=claim.request_id,
-                    )
-                    if request and request.kind == "tool.durable_approval." + claim.action_type:
-                        edited = await updater(adapter, request, claim.action_status.value)
-                        if getattr(edited, "success", True) is False:
-                            logger.warning("Durable tool approval result edit unavailable",
-                                           extra={"request_id": claim.request_id,
-                                                  "error_kind": getattr(edited, "error_kind", None)})
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    logger.warning("Durable tool approval result edit failed",
-                                   extra={"request_id": claim.request_id,
-                                          "exception_class": type(exc).__name__})
+        await self._edit_durable_execution_result(claim.request_id, claim.action_status.value, adapters, adapter)
         from gateway.run import _format_gateway_process_notification
         synth_text = _format_gateway_process_notification(evt)
         if not synth_text:

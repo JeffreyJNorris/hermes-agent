@@ -9,10 +9,136 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import re
 import shlex
 import sqlite3
 import subprocess
 import uuid
+
+
+_SHELLS = frozenset({'sh', 'bash', 'dash', 'zsh', 'ksh', 'ash', 'fish'})
+_SSH_VALUE_OPTIONS = frozenset({'-F', '-i', '-o', '-l', '-p', '-J', '-L', '-R', '-D', '-S',
+                                '-W', '-E', '-b', '-c', '-m', '-O', '-Q', '-w'})
+
+
+def requires_host_sudo_approval(command: str, env_type: str) -> bool:
+    """Classify visible sudo execution, including SSH and explicit shell wrappers.
+
+    This is a command-path guard, not an interpreter sandbox. Code which calls
+    subprocess directly must still be constrained at the Unix privilege boundary.
+    """
+    return _shell_uses_host_sudo(command, env_type in {'local', 'ssh'}, depth=0)
+
+
+def _shell_word(word):
+    decoded = shlex.split(word)
+    return decoded[0] if len(decoded) == 1 else word
+
+
+def _shell_uses_host_sudo(command, host_context, *, depth):
+    if depth > 12:
+        return bool(re.search(r'\bsudo\b', command))
+    try:
+        # Preserve quoted punctuation: `printf '%s' '|' sudo` is data, not a pipe.
+        lexer = shlex.shlex(command, posix=False, punctuation_chars=';&|<>()\n')
+        lexer.whitespace = ' \t\r'
+        lexer.whitespace_split = True
+        words = list(lexer)
+        parts, current, operators = [], [], []
+        for word in words:
+            if word and all(char in ';&|<>()\n' for char in word):
+                operators.append(word)
+                if current:
+                    parts.append(current)
+                    current = []
+            else:
+                current.append(word)
+                # Double-quoted/unquoted substitutions execute in the current
+                # shell. Literal single-quoted examples remain ordinary data.
+                if not word.startswith("'"):
+                    for match in re.finditer(r'\$\((.*?)\)|`([^`]*)`', word, re.DOTALL):
+                        if _shell_uses_host_sudo(match.group(1) or match.group(2) or '', host_context, depth=depth + 1):
+                            return True
+        if current:
+            parts.append(current)
+        if any(_argv_uses_host_sudo(part, host_context, depth=depth) for part in parts):
+            return True
+        # SSH can run a remote login shell from stdin instead of a command argv.
+        # A visible sudo script piped/heredoc'd to it still needs an operator.
+        if re.search(r'\bsudo\b', command) and any(operator == '|' or operator.startswith('<') for operator in operators):
+            for part in parts:
+                decoded = [_shell_word(word) for word in part]
+                if decoded and Path(decoded[0]).name == 'ssh':
+                    remote = _ssh_remote_command(decoded)
+                    shell_stdin = (remote and Path(remote[0]).name in _SHELLS
+                                   and not any(option.startswith('-') and not option.startswith('--')
+                                               and 'c' in option[1:] for option in remote[1:]))
+                    if remote is not None and (not remote or shell_stdin):
+                        return True
+        return False
+    except ValueError:
+        # An ambiguous visible sudo request cannot fall back to a broad grant.
+        return bool(re.search(r'\bsudo\b', command)) and (host_context or bool(re.search(r'\bssh\b', command)))
+
+
+def _argv_uses_host_sudo(raw_words, host_context, *, depth):
+    words = [_shell_word(word) for word in raw_words]
+    while words and (re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*=.*', words[0], re.DOTALL)
+                     or words[0] in {'if', 'then', 'else', 'elif', 'do', 'while', 'until', '!'}):
+        words.pop(0)
+    if not words:
+        return False
+    program = Path(words[0]).name
+    if program == 'sudo':
+        if host_context:
+            return True
+        # Container elevation is ordinary, but it may wrap a host SSH operation.
+        words = words[1:]
+        while words and words[0].startswith('-'):
+            option = words.pop(0)
+            if option in {'-u', '-g', '-h', '-p', '-C', '-T', '-R', '-D'} and words:
+                words.pop(0)
+        return _argv_uses_host_sudo(words, False, depth=depth + 1)
+    if program == 'ssh':
+        # The first positional argument is the remote host. OpenSSH joins the
+        # remaining argv into a remote command interpreted by its login shell.
+        remote = _ssh_remote_command(words)
+        return bool(remote) and _shell_uses_host_sudo(' '.join(remote), True, depth=depth + 1)
+    if program in _SHELLS:
+        for index, option in enumerate(words[1:], 1):
+            if option.startswith('-') and not option.startswith('--') and 'c' in option[1:]:
+                index += 1
+                if index < len(words) and words[index] == '--':
+                    index += 1
+                return index < len(words) and _shell_uses_host_sudo(words[index], host_context, depth=depth + 1)
+        return False
+    if program in {'env', 'command', 'exec', 'nohup', 'timeout'}:
+        if program == 'command' and any(option in {'-v', '-V'} for option in words[1:]):
+            return False
+        index = 1
+        while index < len(words) and (words[index].startswith('-') or '=' in words[index]):
+            option = words[index]
+            index += 1
+            if program == 'env' and option in {'-S', '--split-string'} and index < len(words):
+                return _shell_uses_host_sudo(words[index], host_context, depth=depth + 1)
+            if option in {'-u', '--unset', '-C', '--chdir', '-a', '-k', '--kill-after', '-s', '--signal'}:
+                index += 1
+        if program == 'timeout':
+            index += 1
+        return _argv_uses_host_sudo(words[index:], host_context, depth=depth + 1)
+    return False
+
+
+def _ssh_remote_command(words):
+    index = 1
+    while index < len(words) and words[index].startswith('-'):
+        option = words[index]
+        index += 1
+        if option == '--':
+            break
+        if option in _SSH_VALUE_OPTIONS:
+            index += 1
+    return words[index + 1:] if index < len(words) else None
 
 
 def _validate_argv(argv: list[str]) -> list[str]:
