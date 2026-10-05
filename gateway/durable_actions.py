@@ -259,6 +259,26 @@ class DurableActionNotificationClaim:
     origin_ui_session_id: str | None
     origin_profile: str | None
     token: str
+    tool_result: dict | None = None
+
+
+def _notification_tool_result(action_type: str, result_json: str | None) -> dict | None:
+    if action_type not in {"terminal.execute", "execute_code.execute", "host.sudo"} or not result_json:
+        return None
+    from agent.redact import redact_sensitive_text
+
+    try:
+        result = decode_durable_action_result(result_json)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(result, dict):
+        return None
+    return {
+        key: (redact_sensitive_text(value, force=True)[:8000] if isinstance(value, str) else value)
+        for key, value in result.items()
+        if key in {"tool", "output", "exit_code", "status", "error", "session_id"}
+        and (value is None or type(value) in {str, int, bool})
+    }
 
 
 @dataclass(frozen=True)
@@ -680,7 +700,7 @@ class DurableActionStore:
         with self._lock, self._transaction() as conn:
             row = conn.execute(
                 """SELECT ticket.request_id, ticket.action_type, ticket.status,
-                          ticket.outcome_reason, request.origin_type,
+                          ticket.outcome_reason, ticket.outcome_json, request.origin_type,
                           request.origin_id, request.origin_session_id,
                           request.origin_ui_session_id, request.origin_profile
                    FROM durable_action_tickets AS ticket
@@ -722,6 +742,7 @@ class DurableActionStore:
             origin_ui_session_id=row["origin_ui_session_id"],
             origin_profile=row["origin_profile"],
             token=token,
+            tool_result=_notification_tool_result(row["action_type"], row["outcome_json"]),
         )
 
     def recover_stale_notifications(self, stale_after_seconds: float) -> int:
@@ -842,6 +863,8 @@ __all__ = [
 # and function so importing either module first is circular-safe.
 from cron import jobs as _cron_jobs  # noqa: E402,F401
 from tools import write_approval as _write_approval  # noqa: E402,F401
+from tools import durable_execution_approval as _execution_approval  # noqa: E402
+from tools import host_sudo as _host_sudo  # noqa: E402
 
 _register_cron_resume_builtin(
     prepare=_cron_jobs.prepare_durable_cron_resume,
@@ -863,4 +886,19 @@ register_durable_action_handler(
     prepare=_write_approval.prepare_durable_skill_pending,
     execute=_write_approval.execute_durable_skill_pending,
     diagnose_unknown=_write_approval.diagnose_durable_skill_pending,
+)
+
+for _action_type in ("terminal.execute", "execute_code.execute"):
+    register_durable_action_handler(
+        _action_type,
+        1,
+        prepare=_execution_approval.prepare_durable_execution,
+        execute=_execution_approval.execute_durable_execution,
+    )
+
+register_durable_action_handler(
+    "host.sudo",
+    1,
+    prepare=_host_sudo.prepare_host_sudo,
+    execute=_host_sudo.execute_host_sudo,
 )

@@ -437,6 +437,10 @@ class GatewayDurableMixin:
             "profile": event_profile or "",
             "message_id": f"durable-action:{claim.request_id}",
         }
+        if claim.action_type in {"terminal.execute", "execute_code.execute", "host.sudo"}:
+            result = getattr(claim, "tool_result", None)
+            if isinstance(result, dict):
+                evt["tool_result"] = result
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if source is None:
             return DurableActionNotificationResult(

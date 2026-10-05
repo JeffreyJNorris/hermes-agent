@@ -13,8 +13,14 @@ from gateway.durable_actions import (
 def active_origin(monkeypatch):
     import gateway.durable_requests
     import hermes_state
+    import tools.durable_execution_approval
+    monkeypatch.setattr(tools.durable_execution_approval, 'approved_action_is_executing', lambda context: True)
     monkeypatch.setattr(gateway.durable_requests, 'get_durable_request',
-                        lambda **k: SimpleNamespace(origin_type='session', origin_session_id='session-1'))
+                        lambda **k: SimpleNamespace(origin_type='session', origin_session_id='session-1', expected_actor_id='42', target=SimpleNamespace(platform='discord')))
+    from hermes_cli import config
+    monkeypatch.setattr(config, 'load_config_readonly', lambda: {
+        'durable_approvals': {'enabled': True, 'allowed_actions': ['host.sudo'], 'host_sudo_allowed_users': ['42']},
+    })
     monkeypatch.setattr(hermes_state.SessionDB, 'get_session', lambda *a: {'ended_at': None})
     monkeypatch.setattr(hermes_state.SessionDB, '__init__', lambda *a, **k: None)
     monkeypatch.setattr(hermes_state.SessionDB, 'close', lambda *a: None)
@@ -118,3 +124,16 @@ def test_catastrophic_command_cannot_be_requested():
     from tools import host_sudo
     with pytest.raises(ValueError):
         host_sudo.prepare_host_sudo(['/bin/bash', '-lc', 'rm -rf /'])
+
+
+@pytest.mark.parametrize('owners', [[], ['different-user'], '42', [42]])
+def test_host_sudo_requires_explicit_owner_identity(monkeypatch, owners):
+    from tools import host_sudo
+    from hermes_cli import config
+    monkeypatch.setattr(config, 'load_config_readonly', lambda: {
+        'durable_approvals': {'enabled': True, 'allowed_actions': ['host.sudo'], 'host_sudo_allowed_users': owners},
+    })
+    monkeypatch.setattr(subprocess, 'run', lambda *a, **k: pytest.fail('non-owner executed sudo'))
+    result = host_sudo.execute_host_sudo(context(host_sudo.prepare_host_sudo(['/usr/bin/id'])))
+    assert result.status is DurableActionStatus.INVALIDATED
+    assert result.reason == 'host_actor_not_allowed'

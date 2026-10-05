@@ -96,6 +96,69 @@ def _row(db_path: Path, request_id: str) -> sqlite3.Row:
     return row
 
 
+def test_execution_output_survives_notification_store_restart(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    request_id = _terminal_ticket(db_path)
+    output = {"tool": "terminal", "output": "active\n", "exit_code": 0}
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE durable_action_tickets SET action_type = ?, outcome_json = ? WHERE request_id = ?",
+            ("terminal.execute", durable_actions.encode_durable_action_result(output), request_id),
+        )
+    claim = DurableActionStore(db_path).claim_next_notification()
+    assert claim is not None
+    assert claim.tool_result == output
+
+
+def test_execution_notification_gives_agent_result_without_repeating_command() -> None:
+    text = _format_gateway_process_notification({
+        "type": "durable_action_terminal", "request_id": "test-request",
+        "action_type": "terminal.execute", "action_status": "succeeded",
+        "tool_result": {"tool": "terminal", "output": "active\n", "exit_code": 0},
+    })
+    assert "active" in text
+    assert '"exit_code": 0' in text
+    assert "Do not execute the approved operation again" in text
+
+
+def test_failed_command_notification_does_not_claim_no_changes_were_made() -> None:
+    text = _format_gateway_process_notification({
+        "type": "durable_action_terminal", "request_id": "test-request",
+        "action_type": "host.sudo", "action_status": "failed",
+        "tool_result": {"output": "first step completed; second step failed", "exit_code": 1},
+    })
+    assert "No action was applied" not in text
+    assert "partial changes" in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action_type", ["terminal.execute", "execute_code.execute", "host.sudo"])
+async def test_gateway_continues_execution_with_only_public_result_fields(
+    tmp_path: Path, action_type: str,
+) -> None:
+    claim = _claimed_notification(tmp_path)
+    from dataclasses import replace
+    claim = replace(claim, action_type=action_type, tool_result=durable_actions._notification_tool_result(action_type, durable_actions.encode_durable_action_result({
+        "tool": "terminal", "output": "active\n", "exit_code": 0,
+        "private_args": "NEVER SHOW PRIVATE EXECUTION PAYLOAD",
+    })))
+    runner = object.__new__(GatewayRunner)
+    runner._classify_completion_target = AsyncMock(return_value="deliver")
+    runner._build_process_event_source = MagicMock(return_value=SessionSource(
+        platform=Platform.DISCORD, chat_id="conversation", chat_type="dm", user_id="operator",
+    ))
+    runner._delivery_adapter_for = MagicMock(return_value=object())
+    runner._inject_watch_notification = AsyncMock(return_value=True)
+    result = await runner._dispatch_durable_action_notification(
+        claim, profile_name="operations", adapters={Platform.DISCORD: object()},
+    )
+    assert result.disposition is DurableActionNotificationDisposition.DELIVERED
+    text, event = runner._inject_watch_notification.await_args.args
+    assert event["tool_result"] == {"tool": "terminal", "output": "active\n", "exit_code": 0}
+    assert event["parent_session_id"] == "physical-session"
+    assert "NEVER SHOW" not in text
+
+
 def test_notification_claim_is_bounded_and_acknowledged_once(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     request_id = _terminal_ticket(db_path)

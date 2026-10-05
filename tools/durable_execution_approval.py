@@ -314,9 +314,19 @@ def capture_terminal_execution_state(env, env_type):
 
 
 def capture_code_execution_state(arguments):
-    """Pin existing kernel identities/cell counts; new/reset calls need no lost state."""
+    """Pin working directory and existing kernel state before an approval wait."""
+    from tools import code_execution_tool
+    from tools.terminal_tool import get_session_cwd
+    task_id = arguments.get("task_id") or ""
+    state = {
+        "cwd": code_execution_tool._resolve_child_cwd(
+            code_execution_tool._get_execution_mode(), "", task_id=task_id,
+        ),
+        "terminal_cwd": get_session_cwd(task_id),
+        "kernels": [],
+    }
     if arguments.get("reset"):
-        return []
+        return state
     from tools.code_kernel import _REGISTRY as local, _resolve_owner
     from tools.code_kernel_remote import _REGISTRY as remote
     owner = _resolve_owner(arguments.get("task_id"))
@@ -325,4 +335,5 @@ def capture_code_execution_state(arguments):
         with registry.lock:
             result.extend([name, _kernel_process_generation, repr(key), id(kernel), kernel.execution_count]
                           for key, kernel in registry.kernels.items() if key[0] == owner)
-    return sorted(result, key=repr)
+    state["kernels"] = sorted(result, key=repr)
+    return state

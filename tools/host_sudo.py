@@ -59,6 +59,23 @@ def prepare_host_sudo(argv: list[str], timeout: float = 180):
                                  f'host.sudo:{uuid.uuid4().hex}')
 
 
+def host_sudo_actor_allowed(actor_id: str | None) -> bool:
+    """Elevated host requests require an explicit install-owner allowlist."""
+    from hermes_cli.config import load_config_readonly
+
+    try:
+        policy = load_config_readonly().get('durable_approvals', {})
+        if not isinstance(policy, dict) or policy.get('enabled') is not True:
+            return False
+        actions = policy.get('allowed_actions', [])
+        owners = policy.get('host_sudo_allowed_users', [])
+        return (type(actions) is list and 'host.sudo' in actions
+                and type(owners) is list and all(type(owner) is str and owner.strip() for owner in owners)
+                and bool(actor_id) and actor_id in owners)
+    except (OSError, ValueError, TypeError):
+        return False
+
+
 def execute_host_sudo(context):
     """Run the immutable reviewed argv once on the gateway host, without a shell."""
     from agent.redact import redact_sensitive_text
@@ -69,6 +86,7 @@ def execute_host_sudo(context):
     from gateway.durable_requests import get_durable_request
     from hermes_state import SessionDB
     from tools.approval import _floor_block
+    from tools.durable_execution_approval import approved_action_is_executing
 
     invalid = DurableActionOutcome(DurableActionStatus.INVALIDATED, reason='invalid_payload')
     try:
@@ -85,12 +103,17 @@ def execute_host_sudo(context):
         return invalid
     if _floor_block(shlex.join(argv), sudo_guard=True) is not None:
         return DurableActionOutcome(DurableActionStatus.INVALIDATED, reason='command_blocked')
+    if not approved_action_is_executing(context):
+        return DurableActionOutcome(DurableActionStatus.INVALIDATED, reason='action_not_authorized')
     # Approval belongs to the original conversation. A later /new or deleted
     # source session must not leave a root action runnable in a different turn.
     try:
         request = get_durable_request(request_id=context.request_id)
         if request is None or request.origin_type != 'session' or not request.origin_session_id:
             return DurableActionOutcome(DurableActionStatus.INVALIDATED, reason='origin_unavailable')
+        if (request.target.platform != 'discord'
+                or not host_sudo_actor_allowed(request.expected_actor_id)):
+            return DurableActionOutcome(DurableActionStatus.INVALIDATED, reason='host_actor_not_allowed')
         db = SessionDB()
         try:
             session = db.get_session(request.origin_session_id)

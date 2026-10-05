@@ -229,6 +229,24 @@ def test_code_block_defers_and_executes_after_approval(profile, monkeypatch):
     assert marker.read_text() == 'done'
 
 
+def test_fresh_code_approval_invalidates_if_working_directory_changes(profile, monkeypatch):
+    from tools import code_execution_tool
+    module = _module()
+    current = {'cwd': '/tmp/original-reviewed-directory'}
+    monkeypatch.setattr(code_execution_tool, '_resolve_child_cwd', lambda *a, **k: current['cwd'])
+    args = dict(code='print("reviewed")', task_id='fresh-code', enabled_tools=None, reset=True)
+    state = module.capture_code_execution_state(args)
+    with module.durable_execution_context('execute_code.execute', args, execution_state=state):
+        result = module.maybe_defer_execution(args['code'], 'code script')
+    current['cwd'] = '/tmp/different-directory'
+    calls = []
+    monkeypatch.setattr(code_execution_tool, 'execute_code', lambda **kwargs:
+                        calls.append(kwargs) or json.dumps({'status': 'completed', 'output': 'reviewed'}))
+    ticket = _approve_and_run(result['request_id'], 'execute_code.execute')
+    assert ticket.status is DurableActionStatus.INVALIDATED
+    assert calls == []
+
+
 def test_lost_code_kernel_invalidates_instead_of_replaying(profile):
     from types import SimpleNamespace
     from tools.code_kernel import _REGISTRY, _resolve_owner

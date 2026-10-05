@@ -1660,7 +1660,16 @@ DEFAULT_CONFIG = {
             "allow_text_delivery_fallback": True,
         },
     },
-    "durable_approvals": {"enabled": False, "allowed_actions": []},
+    "durable_approvals": {
+        "enabled": False,
+        "allowed_actions": [],
+        # Deferred terminal/code/host-sudo reviews remain answerable after the
+        # turn ends. Bounded by durable_requests.max_ttl_seconds.
+        "execution_ttl_seconds": 604800,
+        # Discord user IDs permitted to request/approve privileged host argv.
+        # No owner listed means host.sudo remains unavailable.
+        "host_sudo_allowed_users": [],
+    },
 
     # Approvals for dangerous commands.
     # mode: manual (always prompt) | smart (aux LLM auto-approves low-risk) | off (= --yolo)

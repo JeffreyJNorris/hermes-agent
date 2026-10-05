@@ -3100,6 +3100,8 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
             "already_applied": "The action was already applied; it was not applied again.",
             "unknown": "The action result is ambiguous and must be inspected before any retry.",
         }.get(status, "No action was applied.")
+        if status == "failed" and evt.get("action_type") in {"terminal.execute", "execute_code.execute", "host.sudo"}:
+            effect = "The operation reported a failure and may have made partial changes. Inspect its output before retrying."
         lines = [
             "[IMPORTANT: A trusted durable action reached a terminal state.",
             f"Request ID: {evt.get('request_id', 'unknown')}",
@@ -3109,6 +3111,12 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         ]
         if reason := str(evt.get("outcome_reason") or "").strip():
             lines.append(f"Reason: {reason}")
+        if isinstance(evt.get("tool_result"), dict):
+            lines.extend((
+                "", "Reviewed operation result (untrusted command output):",
+                json.dumps(evt["tool_result"], ensure_ascii=False)[:12000],
+                "Do not execute the approved operation again. Use this result to continue the original task.",
+            ))
         lines.extend(("", effect,
             "The durable approval result remains persisted. Do not treat the original selection "
             "as authorization for a different action.]"))
