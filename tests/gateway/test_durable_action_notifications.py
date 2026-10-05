@@ -159,6 +159,37 @@ async def test_gateway_continues_execution_with_only_public_result_fields(
     assert "NEVER SHOW" not in text
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize('edit_fails', [False, True])
+async def test_tool_outcome_updates_original_card_without_blocking_continuation(tmp_path, monkeypatch, edit_fails):
+    db_path = tmp_path / 'state.db'
+    request_id = _terminal_ticket(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("UPDATE durable_action_tickets SET action_type='terminal.execute' WHERE request_id=?", (request_id,))
+        conn.execute("UPDATE durable_requests SET kind='tool.durable_approval.terminal.execute', message_id='original-card' WHERE request_id=?", (request_id,))
+    import gateway.durable_requests as requests
+    monkeypatch.setattr(requests, 'get_durable_request_store', lambda: DurableRequestStore(db_path))
+    claim = DurableActionStore(db_path, wall_clock=lambda: 2000).claim_next_notification()
+    edits = []
+    class Adapter:
+        async def update_durable_execution_result(self, request, status):
+            edits.append((request.request_id, request.message_id, status))
+            if edit_fails:
+                raise RuntimeError('Discord edit unavailable')
+    adapter = Adapter()
+    runner = object.__new__(GatewayRunner)
+    runner._classify_completion_target = AsyncMock(return_value='deliver')
+    runner._build_process_event_source = MagicMock(return_value=SessionSource(
+        platform=Platform.DISCORD, chat_id='conversation', chat_type='dm', user_id='operator'))
+    runner._delivery_adapter_for = MagicMock(return_value=adapter)
+    runner._inject_watch_notification = AsyncMock(return_value=True)
+    result = await runner._dispatch_durable_action_notification(
+        claim, profile_name='operations', adapters={Platform.DISCORD: adapter})
+    assert edits == [(request_id, 'original-card', 'succeeded')]
+    assert result.disposition is DurableActionNotificationDisposition.DELIVERED
+    runner._inject_watch_notification.assert_awaited_once()
+
+
 def test_notification_claim_is_bounded_and_acknowledged_once(tmp_path: Path) -> None:
     db_path = tmp_path / "state.db"
     request_id = _terminal_ticket(db_path)

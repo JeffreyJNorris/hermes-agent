@@ -74,6 +74,10 @@ class _FakeAllowedMentions:
 
 class _FakeColor:
     @staticmethod
+    def orange():
+        return "orange"
+
+    @staticmethod
     def blue():
         return "blue"
 
@@ -122,6 +126,7 @@ def _fake_discord():
         SelectOption=lambda **kwargs: SimpleNamespace(**kwargs),
         AllowedMentions=_FakeAllowedMentions,
         Interaction=object,
+        Embed=lambda **kwargs: SimpleNamespace(**kwargs),
     )
 
 
@@ -186,6 +191,212 @@ def _request(*, message_id: str | None = None) -> DurableRequest:
         reference="release",
         message_id=message_id,
     )
+
+
+def _tool_request(action="terminal.execute", *, message_id=None):
+    host = action == "host.sudo"
+    choices = [("approve", "Approve Once" if host else "Allow Once")]
+    if not host:
+        choices.extend((("session", "Allow Session"), ("always", "Always Allow")))
+    choices.append(("reject", "Deny"))
+    return replace(
+        _request(message_id=message_id),
+        kind="tool.durable_approval." + action,
+        body="**Requested command:**\n```\nid -u\n```\n\n**Why it was flagged:** elevated operation",
+        options=tuple(DurableRequestOption(value, label) for value, label in choices),
+        command_response_allowed=True,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["terminal.execute", "execute_code.execute", "host.sudo"])
+async def test_durable_tool_approval_preserves_compact_controls_and_distinct_host_card(
+    discord_adapter_module, monkeypatch, action,
+):
+    module = discord_adapter_module
+    channel = _Channel()
+    adapter = object.__new__(module.DiscordAdapter)
+    adapter._client = _Client(channel)
+    adapter._allowed_user_ids = {"42"}
+    adapter._allowed_role_ids = set()
+    adapter.MAX_MESSAGE_LENGTH = 2000
+    monkeypatch.setattr(module, "get_durable_request_store", lambda: _Store(None))
+    request = _tool_request(action)
+
+    result = await adapter.send_durable_request("10", request, {"thread_id": "11"})
+
+    assert result.success
+    sent = channel.sent[0]
+    assert "**Requested command:**" in sent["content"]
+    assert "id -u" in sent["content"]
+    assert "**Why it was flagged:**" in sent["content"]
+    assert "<t:10000:F>" in sent["content"]
+    assert "Choose one option" not in sent["content"]
+    assert "1. " not in sent["content"]
+    assert "/request respond" not in sent["content"]
+    assert "1 minute" not in sent["content"]
+    assert all(ord(char) < 128 for char in sent["content"])
+    view = sent["view"]
+    assert view.timeout is None
+    if action == "host.sudo":
+        assert sent["embed"].title == "HOST SUDO - elevated privileges"
+        assert sent["embed"].color == "red"
+        assert [button.label for button in view.children] == ["Approve Once", "Deny"]
+        assert [button.style for button in view.children] == ["green", "red"]
+        assert "Operator approval is required for every host sudo operation." in sent["content"]
+    else:
+        assert sent["embed"].title == "Hermes wants to run a command that needs your OK"
+        assert sent["embed"].color == "orange"
+        assert [button.label for button in view.children] == ["Allow Once", "Allow Session", "Always Allow", "Deny"]
+        assert [button.style for button in view.children] == ["green", "grey", "blurple", "red"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["terminal.execute", "execute_code.execute", "host.sudo"])
+async def test_durable_tool_approval_restore_retains_controls_and_original_message(
+    discord_adapter_module, monkeypatch, action,
+):
+    module = discord_adapter_module
+    channel = _Channel()
+    adapter = object.__new__(module.DiscordAdapter)
+    adapter._client = _Client(channel)
+    adapter._allowed_user_ids = {"42"}
+    adapter._allowed_role_ids = set()
+    monkeypatch.setattr(module, "get_durable_request_store", lambda: _Store(None))
+
+    result = await adapter.restore_durable_request(_tool_request(action, message_id="99"))
+
+    assert result.success
+    view, message_id = adapter._client.views[0]
+    assert view.timeout is None
+    assert message_id == 99
+    assert view._message is channel.message
+    assert [button.label for button in view.children] == (
+        ["Approve Once", "Deny"] if action == "host.sudo"
+        else ["Allow Once", "Allow Session", "Always Allow", "Deny"]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("slot, status", [
+    (1, "Approved once"), (2, "Allowed for this conversation"),
+    (3, "Always allowed for matching rules"), (4, "Denied"),
+])
+async def test_durable_tool_button_updates_status_after_authoritative_resolution(
+    discord_adapter_module, monkeypatch, slot, status,
+):
+    module = discord_adapter_module
+    request = _tool_request(message_id="99")
+    store = _Store(DurableResolveResult(DurableResolveStatus.RESOLVED, request=request))
+    monkeypatch.setattr(module, "_component_check_auth", lambda *_: True)
+    view = module.DurableRequestView(request=request, allowed_user_ids={"42"}, store=store)
+    interaction = _interaction([])
+
+    await view.children[slot - 1].callback(interaction)
+
+    assert store.calls[0]["option_token"] == str(slot)
+    assert status in interaction.response.edits[0]["embed"].description
+    assert all(child.disabled for child in view.children)
+    assert view.stopped
+    if slot != 4:
+        assert "queued for execution" in interaction.response.edits[0]["embed"].description
+
+
+def test_host_sudo_ui_rejects_persistent_permission_options(discord_adapter_module):
+    request = replace(
+        _tool_request("host.sudo"),
+        options=(DurableRequestOption("approve", "Approve Once"),
+                 DurableRequestOption("always", "Always Allow")),
+    )
+    with pytest.raises(ValueError, match="host sudo"):
+        discord_adapter_module.DurableRequestView(request=request, allowed_user_ids={"42"}, store=_Store(None))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["terminal.execute", "host.sudo"])
+@pytest.mark.parametrize("status, description", [
+    ("succeeded", "Reviewed operation completed."),
+    ("failed", "Operation failed. Partial changes may have occurred; do not repeat it automatically."),
+    ("unknown", "Execution outcome is unknown. Partial changes may have occurred; do not repeat it automatically."),
+    ("invalidated", "Approval invalidated because the reviewed context changed. Operation was not run."),
+    ("expired", "Approval expired. Operation was not run."),
+    ("cancelled", "Approval cancelled. Operation was not run."),
+    ("declined", "Denied. Operation was not run."),
+    ("handler_unavailable", "Execution handler unavailable. Operation was not run."),
+])
+async def test_durable_tool_completion_edits_original_card_with_actual_outcome(
+    discord_adapter_module, action, status, description,
+):
+    module = discord_adapter_module
+    channel = _Channel()
+    adapter = object.__new__(module.DiscordAdapter)
+    adapter._client = _Client(channel)
+
+    result = await adapter.update_durable_execution_result(_tool_request(action, message_id="99"), status)
+
+    assert result.success
+    assert result.message_id == "99"
+    assert channel.sent == []
+    assert len(channel.message.edits) == 1
+    edit = channel.message.edits[0]
+    assert edit["view"] is None
+    assert edit["embed"].description == description
+    assert all(ord(char) < 128 for char in description)
+    if action == "host.sudo":
+        assert edit["embed"].title == "HOST SUDO - elevated privileges"
+
+
+@pytest.mark.asyncio
+async def test_durable_tool_completion_rejects_unknown_status_and_generic_request(
+    discord_adapter_module,
+):
+    module = discord_adapter_module
+    channel = _Channel()
+    adapter = object.__new__(module.DiscordAdapter)
+    adapter._client = _Client(channel)
+    for request, status in [(_tool_request(message_id="99"), "arbitrary user text"),
+                            (_request(message_id="99"), "succeeded")]:
+        result = await adapter.update_durable_execution_result(request, status)
+        assert not result.success
+        assert result.error_kind == "bad_format"
+    assert channel.message.edits == []
+
+
+@pytest.mark.asyncio
+async def test_fast_execution_result_cannot_be_overwritten_by_queued_decision_card(
+    discord_adapter_module, monkeypatch,
+):
+    import asyncio
+
+    module = discord_adapter_module
+    request = _tool_request(message_id="99")
+    channel = _Channel()
+    adapter = object.__new__(module.DiscordAdapter)
+    adapter._client = _Client(channel)
+    store = _Store(DurableResolveResult(DurableResolveStatus.RESOLVED, request=request))
+    monkeypatch.setattr(module, "_component_check_auth", lambda *_: True)
+    view = module.DurableRequestView(request=request, allowed_user_ids={"42"}, store=store)
+    interaction = _interaction([])
+    editing_decision = asyncio.Event()
+    release_decision = asyncio.Event()
+
+    async def delayed_decision_edit(**kwargs):
+        editing_decision.set()
+        await release_decision.wait()
+        interaction.response.edits.append(kwargs)
+
+    interaction.response.edit_message = delayed_decision_edit
+    decision = asyncio.create_task(view.children[0].callback(interaction))
+    await editing_decision.wait()
+    completion = asyncio.create_task(adapter.update_durable_execution_result(request, "succeeded"))
+    await asyncio.sleep(0)
+    assert not completion.done()
+    assert channel.message.edits == []
+    release_decision.set()
+    await decision
+    assert (await completion).success
+    assert "queued for execution" in interaction.response.edits[0]["embed"].description
+    assert channel.message.edits[-1]["embed"].description == "Reviewed operation completed."
 
 
 def test_native_alternative_is_visible_only_when_command_response_allowed() -> None:
@@ -388,12 +599,14 @@ class _Response:
         self.fail_edit = fail_edit
         self.messages = []
         self.deferred = False
+        self.edits = []
 
     def is_done(self):
         return False
 
     async def edit_message(self, **kwargs):
         self.events.append("edit")
+        self.edits.append(kwargs)
         if self.fail_edit:
             raise RuntimeError("edit failed")
 

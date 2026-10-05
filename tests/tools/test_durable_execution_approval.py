@@ -41,6 +41,11 @@ durable_approvals:
                      session_key='agent:main:discord:thread:123456789012345678:42',
                      session_id='physical-session', cron_session='')
     from hermes_state import SessionDB
+    import hermes_state
+    # The global test sandbox may have patched this constant before import.
+    # Keep the real session store beside this profile's durable grant rows so
+    # a fresh child process observes the same isolated database.
+    monkeypatch.setattr(hermes_state, 'DEFAULT_DB_PATH', tmp_path / 'state.db')
     db = SessionDB()
     db.create_session('physical-session', 'discord',
                       session_key='agent:main:discord:thread:123456789012345678:42',
@@ -170,7 +175,7 @@ def test_pending_survives_request_store_restart(profile):
     assert request.expires_at - request.created_at >= 86400 - 1
 
 
-def _approve_and_run(request_id, action_type='terminal.execute'):
+def _approve_and_run(request_id, action_type='terminal.execute', option_token='1'):
     from gateway.durable_action_runner import DurableActionRunner
     from gateway.durable_actions import DurableActionStore, _DURABLE_ACTION_HANDLERS
     module = _module()
@@ -179,7 +184,10 @@ def _approve_and_run(request_id, action_type='terminal.execute'):
     delivery = store.claim_next_pending(['discord'])
     assert delivery is not None
     assert store.bind_delivery(request_id=request_id, claim_id=delivery.claim_id, platform='discord', message_id='message')
-    assert store.resolve(request_id=request_id, option_token='1', platform='discord',
+    if not option_token.isdigit():
+        option_token = str(next(index for index, option in enumerate(delivery.request.options, 1)
+                               if option.id == option_token))
+    assert store.resolve(request_id=request_id, option_token=option_token, platform='discord',
                          channel_id='123456789012345678', message_id='message', actor_id='42').status.value == 'resolved'
     runner = DurableActionRunner(DurableActionStore(store.db_path), enabled=True, allowed_actions=[action_type])
     assert asyncio.run(runner.process_once())
@@ -188,6 +196,195 @@ def _approve_and_run(request_id, action_type='terminal.execute'):
         row = conn.execute('SELECT * FROM durable_action_tickets WHERE request_id=?', (request_id,)).fetchone()
     from types import SimpleNamespace
     return SimpleNamespace(status=DurableActionStatus(row['status']), outcome_reason=row['outcome_reason'], outcome_json=row['outcome_json'])
+
+
+def _stage_guarded(command, *, warnings=None, permanent_capable=True, smart_denied=False):
+    from tools import approval
+    module = _module()
+    from tools.terminal_tool import _get_env_config
+    arguments = dict(command=command, background=False, timeout=_get_env_config()['timeout'],
+                     task_id='test-task', session_id=None, workdir='/tmp', pty=False,
+                     notify_on_complete=False, watch_patterns=None, heartbeat=0,
+                     persist_on_release=False)
+    # A real guard is reached after backend initialization has resolved its cwd.
+    from tools.terminal_tool import terminal_tool
+    assert json.loads(terminal_tool(command='true', task_id='test-task', workdir='/tmp'))['exit_code'] == 0
+    warnings = warnings or [('scope-test-pattern', 'test guard', False)]
+    with module.durable_execution_context('terminal.execute', arguments):
+        return approval._human_decision(
+            approval._COMMAND_GATE, command=command, description='test guard',
+            pattern_key=warnings[0][0], pattern_keys=[warning[0] for warning in warnings],
+            warnings=warnings, session_key=module._session_values()['session_key'],
+            approval_callback=None, is_cli=False, is_gateway=True, is_ask=False,
+            permanent_capable=permanent_capable, smart=smart_denied,
+        )
+
+
+def test_native_gate_restores_scoped_durable_choices(profile):
+    pending = _stage_guarded('printf reviewed')
+    request = get_durable_request_store().get(request_id=pending['request_id'])
+    assert [option.id for option in request.options] == ['approve', 'session', 'always', 'reject']
+    payload = json.loads(_context(pending['request_id']).payload_json)
+    assert payload['approval_scope']['warnings'] == [['scope-test-pattern', 'test guard', False]]
+
+
+@pytest.mark.parametrize('choice', ['session', 'always'])
+def test_scoped_choice_executes_then_survives_memory_restart(profile, choice):
+    from tools import approval
+    marker = profile / 'scoped-marker'
+    pending = _stage_guarded(f'printf reviewed > {shlex.quote(str(marker))}')
+    assert _approve_and_run(pending['request_id'], option_token=choice).status is DurableActionStatus.SUCCEEDED
+    assert marker.read_text() == 'reviewed'
+    approval._session_approved.clear()
+    approval._permanent_approved_by_home.clear()
+    assert approval.is_approved(_module()._session_values()['session_key'], 'scope-test-pattern')
+    if choice == 'always':
+        assert 'scope-test-pattern' in approval._read_permanent_allowlist()
+
+
+def test_session_scope_does_not_follow_new_conversation(profile):
+    from tools import approval
+    pending = _stage_guarded('printf reviewed')
+    assert _approve_and_run(pending['request_id'], option_token='session').status is DurableActionStatus.SUCCEEDED
+    assert 'scope-test-pattern' not in approval._session_approved.get(_module()._session_values()['session_key'], set())
+    from hermes_state import SessionDB
+    db = SessionDB()
+    db.end_session('physical-session', 'new')
+    db.create_session('replacement-session', 'discord', session_key=_module()._session_values()['session_key'])
+    db.close()
+    set_session_vars(**{**_module()._session_values(), 'session_id': 'replacement-session'})
+    assert not approval.is_approved(_module()._session_values()['session_key'], 'scope-test-pattern')
+
+
+def test_session_scope_survives_an_actual_python_process_restart(profile):
+    import os
+    import subprocess
+    import sys
+    pending = _stage_guarded('printf reviewed')
+    assert _approve_and_run(pending['request_id'], option_token='session').status is DurableActionStatus.SUCCEEDED
+    identity = _module()._session_values()
+    script = (
+        'from gateway.session_context import set_session_vars; '
+        f'set_session_vars(**{identity!r}); '
+        'from tools.approval import is_approved; '
+        f'print(is_approved({identity["session_key"]!r}, "scope-test-pattern"))'
+    )
+    process = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True,
+                             env={**os.environ, 'HERMES_HOME': str(profile)}, timeout=30)
+    assert process.returncode == 0, process.stderr
+    assert process.stdout.strip() == 'True'
+
+
+def test_conversation_reset_during_execution_never_grants_scope(profile, monkeypatch):
+    from tools import approval, terminal_tool
+    pending = _stage_guarded('printf reviewed')
+    def close_origin(**kwargs):
+        from hermes_state import SessionDB
+        db = SessionDB()
+        db.end_session('physical-session', 'new')
+        db.close()
+        approval.clear_session(_module()._session_values()['session_key'])
+        return json.dumps({'output': 'reviewed', 'exit_code': 0})
+    monkeypatch.setattr(terminal_tool, 'terminal_tool', close_origin)
+    assert _approve_and_run(pending['request_id'], option_token='always').status is DurableActionStatus.SUCCEEDED
+    assert 'scope-test-pattern' not in approval._read_permanent_allowlist()
+    assert not approval.is_approved(_module()._session_values()['session_key'], 'scope-test-pattern')
+
+
+def test_tirith_only_scope_does_not_offer_permanent_choice(profile):
+    pending = _stage_guarded('printf reviewed', warnings=[('tirith:test', 'content guard', True)], permanent_capable=False)
+    request = get_durable_request_store().get(request_id=pending['request_id'])
+    assert [option.id for option in request.options] == ['approve', 'session', 'reject']
+
+
+def test_changed_environment_never_persists_selected_scope(profile):
+    from tools import approval
+    pending = _stage_guarded('printf reviewed')
+    path = profile / 'config.yaml'
+    path.write_text(path.read_text().replace('backend: local', 'backend: ssh'))
+    assert _approve_and_run(pending['request_id'], option_token='always').status is DurableActionStatus.INVALIDATED
+    assert not approval.is_approved(_module()._session_values()['session_key'], 'scope-test-pattern')
+    assert 'scope-test-pattern' not in approval._read_permanent_allowlist()
+
+
+def test_smart_deny_override_keeps_once_only_choices(profile, monkeypatch):
+    from tools import approval
+    monkeypatch.setattr(approval, '_smart_gate', lambda *args, **kwargs: (None, True))
+    pending = _stage_guarded('printf reviewed', smart_denied=True)
+    request = get_durable_request_store().get(request_id=pending['request_id'])
+    assert [option.id for option in request.options] == ['approve', 'reject']
+
+
+def test_mixed_always_keeps_tirith_findings_session_only(profile):
+    from tools import approval
+    pending = _stage_guarded('printf reviewed', warnings=[('scope-test-pattern', 'pattern', False),
+                                                        ('tirith:test', 'content guard', True)])
+    assert _approve_and_run(pending['request_id'], option_token='always').status is DurableActionStatus.SUCCEEDED
+    permanent = approval._read_permanent_allowlist()
+    assert 'scope-test-pattern' in permanent
+    assert 'tirith:test' not in permanent
+    approval._session_approved.clear()
+    assert approval.is_approved(_module()._session_values()['session_key'], 'tirith:test')
+
+
+def test_session_grant_is_actor_bound_and_clear_revokes_it(profile):
+    from tools import approval
+    pending = _stage_guarded('printf reviewed')
+    assert _approve_and_run(pending['request_id'], option_token='session').status is DurableActionStatus.SUCCEEDED
+    key = _module()._session_values()['session_key']
+    identity = _module()._session_values()
+    approval._session_approved.clear()
+    set_session_vars(**{**identity, 'user_id': 'other-person'})
+    assert not approval.is_approved(key, 'scope-test-pattern')
+    set_session_vars(**identity)
+    assert approval.is_approved(key, 'scope-test-pattern')
+    approval.clear_session(key)
+    assert not approval.is_approved(key, 'scope-test-pattern')
+
+
+def test_actual_terminal_session_grant_allows_same_native_pattern(profile, monkeypatch):
+    from tools import approval, terminal_tool
+    monkeypatch.setattr(approval, '_is_gateway_approval_context', lambda: True)
+    marker = profile / 'remove-on-scope'
+    marker.write_text('keep')
+    command = f'rm -rf -- {shlex.quote(str(marker))}'
+    pending = json.loads(terminal_tool.terminal_tool(command, task_id='test-task'))
+    assert pending['status'] == 'approval_pending'
+    assert _approve_and_run(pending['request_id'], option_token='session').status is DurableActionStatus.SUCCEEDED
+    approval._session_approved.clear()
+    marker.write_text('keep')
+    result = json.loads(terminal_tool.terminal_tool(command, task_id='test-task'))
+    assert result.get('status') != 'approval_pending'
+    assert result['exit_code'] == 0
+    assert not marker.exists()
+
+
+def test_actual_code_session_grant_allows_next_cell(profile, monkeypatch):
+    from tools import approval, code_execution_tool
+    monkeypatch.setattr(approval, '_is_gateway_approval_context', lambda: True)
+    marker = profile / 'code-scope'
+    code = f'from pathlib import Path\nPath({str(marker)!r}).write_text("first")'
+    pending = json.loads(code_execution_tool.execute_code(code, task_id='scoped-code', reset=True))
+    assert pending['status'] == 'approval_pending'
+    assert _approve_and_run(pending['request_id'], 'execute_code.execute', option_token='session').status is DurableActionStatus.SUCCEEDED
+    approval._session_approved.clear()
+    result = json.loads(code_execution_tool.execute_code(
+        f'from pathlib import Path\nPath({str(marker)!r}).write_text("second")', task_id='scoped-code', reset=True,
+    ))
+    assert result.get('status') != 'approval_pending'
+    assert marker.read_text() == 'second'
+
+
+def test_code_failure_preserves_explicit_always_allow_policy(profile, monkeypatch):
+    from tools import approval, code_execution_tool
+    monkeypatch.setattr(approval, '_is_gateway_approval_context', lambda: True)
+    pending = json.loads(code_execution_tool.execute_code(
+        'raise RuntimeError("reviewed script failed")', task_id='failed-scoped-code', reset=True))
+    assert pending['status'] == 'approval_pending'
+    ticket = _approve_and_run(pending['request_id'], 'execute_code.execute', option_token='always')
+    assert ticket.status is DurableActionStatus.FAILED
+    # The outcome of one script does not revoke the user's policy choice.
+    assert 'execute_code' in approval._read_permanent_allowlist()
 
 
 def test_original_session_reset_invalidates_before_execution(profile):

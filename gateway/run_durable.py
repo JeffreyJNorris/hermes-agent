@@ -447,11 +447,34 @@ class GatewayDurableMixin:
                 DurableActionNotificationDisposition.DROPPED,
                 "origin_route_missing",
             )
-        if self._delivery_adapter_for(source) is None:
+        adapter = self._delivery_adapter_for(source)
+        if adapter is None:
             return DurableActionNotificationResult(
                 DurableActionNotificationDisposition.RETRY,
                 "origin_adapter_unavailable",
             )
+        if claim.action_type in {"terminal.execute", "execute_code.execute", "host.sudo"}:
+            # Edit the persisted review in place; never create a second approval
+            # or let a cosmetic edit failure suppress the actual tool result.
+            updater = getattr(type(adapter), "update_durable_execution_result", None)
+            if callable(updater):
+                try:
+                    from gateway.durable_requests import get_durable_request_store
+                    request = await asyncio.to_thread(
+                        get_durable_request_store().get, request_id=claim.request_id,
+                    )
+                    if request and request.kind == "tool.durable_approval." + claim.action_type:
+                        edited = await updater(adapter, request, claim.action_status.value)
+                        if getattr(edited, "success", True) is False:
+                            logger.warning("Durable tool approval result edit unavailable",
+                                           extra={"request_id": claim.request_id,
+                                                  "error_kind": getattr(edited, "error_kind", None)})
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning("Durable tool approval result edit failed",
+                                   extra={"request_id": claim.request_id,
+                                          "exception_class": type(exc).__name__})
         from gateway.run import _format_gateway_process_notification
         synth_text = _format_gateway_process_notification(evt)
         if not synth_text:

@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import traceback
+import weakref
 from collections import defaultdict
 from contextlib import suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
@@ -304,6 +305,84 @@ from gateway.durable_requests import (
     render_durable_request_content,
     render_durable_request_text_command_content,
 )
+
+
+def _durable_tool_approval_action(request: DurableRequest) -> Optional[str]:
+    """Choose the tool approval presentation without changing generic requests."""
+    prefix = "tool.durable_approval."
+    if request.kind.startswith(prefix):
+        action = request.kind[len(prefix):]
+        if action in {"terminal.execute", "execute_code.execute", "host.sudo"}:
+            return action
+    return None
+
+
+def _durable_tool_approval_title(request: DurableRequest) -> str:
+    if _durable_tool_approval_action(request) == "host.sudo":
+        return "HOST SUDO - elevated privileges"
+    return EA_HEADER_TEXT
+
+
+def _render_discord_durable_request(request: DurableRequest) -> str:
+    if not _durable_tool_approval_action(request):
+        return render_durable_request_content(request)
+    title = _durable_tool_approval_title(request)
+    privileged_notice = (
+        "Operator approval is required for every host sudo operation.\n\n"
+        if _durable_tool_approval_action(request) == "host.sudo" else ""
+    )
+    # Expiry is the persisted deadline, never a timeout on the Discord view.
+    expiry = int(request.expires_at)
+    return (
+        f"**{title}**\n\n{privileged_notice}{request.body}\n\n"
+        f"Approval available until <t:{expiry}:F> (<t:{expiry}:R>)."
+    )
+
+
+def _durable_tool_approval_embed(request: DurableRequest, *, decision=None):
+    """Small status card; the exact reviewed command remains in message content."""
+    host_sudo = _durable_tool_approval_action(request) == "host.sudo"
+    color = discord.Color.red() if host_sudo else discord.Color.orange()
+    embed = discord.Embed(title=_durable_tool_approval_title(request), color=color)
+    if decision is not None:
+        label = {
+            "approve": "Approved once",
+            "session": "Allowed for this conversation",
+            "always": "Always allowed for matching rules",
+            "reject": "Denied",
+        }[decision]
+        embed.description = (
+            f"{label}; operation will not run."
+            if decision == "reject" else f"{label}; reviewed operation queued for execution."
+        )
+        if not host_sudo:
+            embed.color = discord.Color.red() if decision == "reject" else discord.Color.green()
+    return embed
+
+
+_durable_tool_card_locks = weakref.WeakValueDictionary()
+
+
+def _durable_tool_card_lock(request_id: str) -> asyncio.Lock:
+    # A decision edit and its fast worker result must not overwrite each other.
+    # Views keep the lock alive only while their controls are registered.
+    lock = _durable_tool_card_locks.get(request_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _durable_tool_card_locks[request_id] = lock
+    return lock
+
+
+_DURABLE_TOOL_RESULT_TEXT = {
+    "succeeded": "Reviewed operation completed.",
+    "failed": "Operation failed. Partial changes may have occurred; do not repeat it automatically.",
+    "unknown": "Execution outcome is unknown. Partial changes may have occurred; do not repeat it automatically.",
+    "invalidated": "Approval invalidated because the reviewed context changed. Operation was not run.",
+    "expired": "Approval expired. Operation was not run.",
+    "cancelled": "Approval cancelled. Operation was not run.",
+    "declined": "Denied. Operation was not run.",
+    "handler_unavailable": "Execution handler unavailable. Operation was not run.",
+}
 
 
 async def _read_url_image_with_redirect_guard(
@@ -5760,7 +5839,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 error_kind=classify_send_error(exc),
             )
 
-        content = render_durable_request_content(request)
+        content = _render_discord_durable_request(request)
         if utf16_len(content) > self.MAX_MESSAGE_LENGTH:
             return SendResult(
                 success=False,
@@ -5791,10 +5870,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             )
 
         try:
+            send_kwargs = {"content": content, "view": view,
+                           "allowed_mentions": discord.AllowedMentions.none()}
+            if _durable_tool_approval_action(request):
+                send_kwargs["embed"] = _durable_tool_approval_embed(request)
             message = await channel.send(
-                content=content,
-                view=view,
-                allowed_mentions=discord.AllowedMentions.none(),
+                **send_kwargs,
             )
         except Exception as exc:
             # Once channel.send() has been attempted the provider outcome may
@@ -5816,6 +5897,38 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
         view._message = message
         return SendResult(success=True, message_id=str(message.id))
+
+    async def update_durable_execution_result(
+        self, request: DurableRequest, status: str,
+    ) -> SendResult:
+        """Update the original tool approval card with the persisted action outcome."""
+        if not self._client or not DISCORD_AVAILABLE:
+            return SendResult(success=False, error="Not connected", error_kind="transient")
+        if (not isinstance(request, DurableRequest) or not request.message_id
+                or request.target.platform != "discord" or not _durable_tool_approval_action(request)
+                or not isinstance(status, str) or status not in _DURABLE_TOOL_RESULT_TEXT):
+            return SendResult(success=False, error="Invalid durable execution result", error_kind="bad_format")
+        async with _durable_tool_card_lock(request.request_id):
+            try:
+                channel = self._client.get_channel(int(request.delivery_channel_id))
+                if channel is None:
+                    channel = await self._client.fetch_channel(int(request.delivery_channel_id))
+                if channel is None:
+                    return SendResult(success=False, error="Channel not found", error_kind="not_found")
+                message = await channel.fetch_message(int(request.message_id))
+                embed = _durable_tool_approval_embed(request)
+                embed.description = _DURABLE_TOOL_RESULT_TEXT[status]
+                if _durable_tool_approval_action(request) != "host.sudo":
+                    embed.color = (discord.Color.green() if status == "succeeded"
+                                   else discord.Color.red() if status in {"failed", "unknown"}
+                                   else discord.Color.dark_grey())
+                await message.edit(embed=embed, view=None)
+                return SendResult(success=True, message_id=str(message.id))
+            except Exception as exc:
+                logger.debug("[%s] durable execution result card edit failed (%s)",
+                             self.name, type(exc).__name__, extra={"request_id": request.request_id})
+                return SendResult(success=False, error="Discord execution result edit failed",
+                                  error_kind=classify_send_error(exc))
 
     async def restore_durable_request(
         self,
@@ -6708,12 +6821,22 @@ def _define_discord_view_classes() -> None:
         ):
             super().__init__(timeout=None)
             self.request_id = request.request_id
+            self._request = request
+            self._tool_action = _durable_tool_approval_action(request)
+            self._presentation_lock = _durable_tool_card_lock(request.request_id) if self._tool_action else None
             self.allowed_user_ids = allowed_user_ids
             self.allowed_role_ids = allowed_role_ids or set()
             self._store = store or get_durable_request_store()
             self._message = None
 
             self._multi = request.selection_mode == "multi"
+            if self._tool_action:
+                permitted = ({"approve", "reject"} if self._tool_action == "host.sudo"
+                             else {"approve", "session", "always", "reject"})
+                if (self._multi or len({option.id for option in request.options}) != len(request.options)
+                        or any(option.id not in permitted for option in request.options)):
+                    raise ValueError("invalid host sudo options" if self._tool_action == "host.sudo"
+                                     else "invalid durable tool approval options")
             if self._multi:
                 from .adapter_interactive import make_multi_select_control
                 control = make_multi_select_control(
@@ -6738,9 +6861,18 @@ def _define_discord_view_classes() -> None:
                     PromptStyle.SUCCESS: discord.ButtonStyle.success,
                     PromptStyle.DANGER: discord.ButtonStyle.danger,
                 }.get(option.style, discord.ButtonStyle.secondary)
+                label = option.label
+                if self._tool_action:
+                    label, style = {
+                        "approve": ("Approve Once" if self._tool_action == "host.sudo" else "Allow Once",
+                                    discord.ButtonStyle.green),
+                        "session": ("Allow Session", discord.ButtonStyle.grey),
+                        "always": ("Always Allow", discord.ButtonStyle.blurple),
+                        "reject": ("Deny", discord.ButtonStyle.red),
+                    }[option.id]
                 button = discord.ui.Button(
                     label=_truncate_discord_component_text(
-                        option.label,
+                        label,
                         _DISCORD_BUTTON_LABEL_LIMIT,
                     ),
                     style=style,
@@ -6770,6 +6902,13 @@ def _define_discord_view_classes() -> None:
                 )
 
         async def _resolve(self, interaction: discord.Interaction, slot: str) -> None:
+            if self._presentation_lock is not None:
+                async with self._presentation_lock:
+                    await self._resolve_request(interaction, slot)
+            else:
+                await self._resolve_request(interaction, slot)
+
+        async def _resolve_request(self, interaction: discord.Interaction, slot: str) -> None:
             # General Hermes component authorization is always the first check.
             if not _component_check_auth(
                 interaction,
@@ -6811,7 +6950,13 @@ def _define_discord_view_classes() -> None:
                 for child in self.children:
                     child.disabled = True
                 try:
-                    await interaction.response.edit_message(view=self)
+                    edit_kwargs = {"view": self}
+                    if self._tool_action:
+                        decision = self._request.options[int(slot) - 1].id
+                        edit_kwargs["embed"] = _durable_tool_approval_embed(
+                            self._request, decision=decision,
+                        )
+                    await interaction.response.edit_message(**edit_kwargs)
                 except Exception as exc:
                     logger.debug(
                         "Durable request resolved but Discord edit failed (%s)",

@@ -68,3 +68,52 @@ async def test_owner_decision_survives_reopen_and_executes_once(tmp_path, monkey
     finally:
         reset_durable_request_store_cache()
         reset_hermes_home_override(override)
+
+
+@pytest.mark.parametrize('mode', ['manual', 'off', 'smart'])
+def test_host_request_ignores_all_ordinary_approval_bypasses(tmp_path, monkeypatch, mode):
+    import json
+    from gateway.session_context import set_session_vars, reset_session_vars
+    from tools import approval
+    from tools.approval_context import set_current_session_key, reset_current_session_key
+    from tools.terminal_tool import terminal_tool
+    override = set_hermes_home_override(tmp_path)
+    reset_durable_request_store_cache()
+    session_key = 'discord:owner:parent'
+    session_token = set_current_session_key(session_key)
+    reset_session_vars()
+    set_session_vars(platform='discord', chat_id='123456789012345678',
+                     session_key=session_key, session_id='session-1', user_id='42', cron_session='')
+    monkeypatch.setattr(subprocess, 'run', lambda *a, **k: pytest.fail('sudo ran without operator approval'))
+    monkeypatch.setattr(approval, '_yolo_active', lambda: True)
+    monkeypatch.setattr(approval, 'is_approved', lambda *a: True)
+    try:
+        (tmp_path / 'config.yaml').write_text(f'''approvals:
+  mode: {mode}
+  unattended_mode: approve
+  cron_mode: approve
+command_allowlist: [execute_code]
+durable_requests:
+  enabled: true
+  inbox:
+    platform: discord
+    chat_id: "999999999999999999"
+durable_approvals:
+  enabled: true
+  allowed_actions: [host.sudo]
+  host_sudo_allowed_users: ["42"]
+''')
+        db = SessionDB(); db.create_session('session-1', 'discord'); db.close()
+        result = json.loads(terminal_tool(command='hermes host sudo -- /usr/bin/id -u', force=True))
+        assert result['status'] == 'approval_pending'
+        store = DurableRequestStore(tmp_path / 'state.db')
+        request = store.get(request_id=result['request_id'])
+        assert tuple(option.id for option in request.options) == ('approve', 'reject')
+        assert request.target.delivery_channel_id == '123456789012345678'
+        assert execute_host_sudo(DurableActionExecutionContext(
+            request.request_id, 'host.sudo', 1, '{}', 'not-a-ticket', 'not-a-ticket')).status is DurableActionStatus.INVALIDATED
+    finally:
+        reset_current_session_key(session_token)
+        reset_session_vars()
+        reset_durable_request_store_cache()
+        reset_hermes_home_override(override)

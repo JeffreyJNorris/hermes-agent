@@ -295,6 +295,7 @@ def clear_session(session_key: str) -> None:
             # the prompt was withdrawn, nobody denied it.
             entry.cancelled = "the session ended before the prompt was answered"
             entry.event.set()
+    _clear_durable_session_approvals(session_key)
     _release_permission_mode_dependents(session_key)
     # Session-persistent code kernels (local and remote) share this owner key and die at the same boundary so a
     # finished conversation cannot leak a live interpreter.
@@ -353,7 +354,8 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
     aliases = _approval_key_aliases(pattern_key)
     with _lock:
         approved = _permanent_set() | _session_approved.get(session_key, set())
-    return any(alias in approved for alias in aliases)
+    return (any(alias in approved for alias in aliases)
+            or _durable_session_approved(session_key, aliases))
 
 
 def _is_permanently_approved(pattern_key: str) -> bool:
@@ -377,19 +379,88 @@ def load_permanent(patterns: set):
         governing.update(patterns)
 
 
-def _persist_choice(session_key: str, choice: str, warnings: list[tuple]) -> None:
+def _persist_choice(session_key: str, choice: str, warnings: list[tuple], *,
+                    session_identity=None, durable_request_id=None) -> None:
     """Persist a human ``session``/``always`` choice for each ``(key, _, is_tirith)``. Tirith
     findings are session-max by design (no broad permanent allowlisting of content-level
     findings), so ``always`` downgrades them to session. ``once`` persists nothing."""
+    if choice in ("session", "always") and session_identity is not None:
+        _save_durable_session_approvals(session_key, warnings, session_identity, durable_request_id)
     for key, _, is_tirith in warnings:
         if choice not in ("session", "always"):
             continue
-        approve_session(session_key, key)
+        if session_identity is None:
+            approve_session(session_key, key)
         if choice == "always" and not is_tirith:
             approve_permanent(key)
             with _lock:
                 snapshot = set(_permanent_set())
             save_permanent_allowlist(snapshot)
+
+
+def _save_durable_session_approvals(session_key, warnings, identity, request_id):
+    """Keep the native session grant across restart, bound to its physical conversation."""
+    import sqlite3
+    from gateway.durable_requests import get_durable_request_store
+    if (identity.get("platform") != "discord" or identity.get("session_key") != session_key
+            or not identity.get("session_id") or not identity.get("user_id") or not request_id):
+        raise ValueError("durable session approval requires its reviewed origin")
+    with sqlite3.connect(get_durable_request_store().db_path, timeout=10) as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS durable_session_approvals (
+            session_id TEXT NOT NULL, session_key TEXT NOT NULL, actor_id TEXT NOT NULL,
+            pattern_key TEXT NOT NULL, request_id TEXT NOT NULL,
+            PRIMARY KEY (session_id, session_key, actor_id, pattern_key))""")
+        conn.executemany("INSERT OR REPLACE INTO durable_session_approvals VALUES (?, ?, ?, ?, ?)",
+                         [(identity["session_id"], session_key, identity["user_id"], key, request_id)
+                          for key, _, _ in warnings])
+
+
+def _durable_session_approved(session_key, aliases):
+    import sqlite3
+    from gateway.session_context import get_session_env
+    if get_session_env("HERMES_SESSION_PLATFORM", "") != "discord":
+        return False
+    session_id = get_session_env("HERMES_SESSION_ID", "")
+    actor_id = get_session_env("HERMES_SESSION_USER_ID", "")
+    if (not session_id or not actor_id
+            or get_session_env("HERMES_SESSION_KEY", "") != session_key):
+        return False
+    try:
+        from hermes_constants import get_hermes_home
+        from pathlib import Path
+        path = Path(get_hermes_home()) / "state.db"
+        if not path.is_file():
+            return False
+        with sqlite3.connect(path, timeout=10) as conn:
+            rows = conn.execute("SELECT pattern_key FROM durable_session_approvals "
+                                "WHERE session_id=? AND session_key=? AND actor_id=?",
+                                (session_id, session_key, actor_id)).fetchall()
+        if not any(row[0] in aliases for row in rows):
+            return False
+        from hermes_state import SessionDB
+        db = SessionDB()
+        try:
+            session = db.get_session(session_id)
+        finally:
+            db.close()
+        return session is not None and session.get("ended_at") is None
+    except (sqlite3.Error, OSError, ValueError):
+        return False
+
+
+def _clear_durable_session_approvals(session_key):
+    import sqlite3
+    try:
+        from hermes_constants import get_hermes_home
+        from pathlib import Path
+        path = Path(get_hermes_home()) / "state.db"
+        if not path.is_file():
+            return
+        with sqlite3.connect(path, timeout=10) as conn:
+            conn.execute("DELETE FROM durable_session_approvals WHERE session_key=?", (session_key,))
+    except (sqlite3.Error, OSError, ValueError):
+        # The table is absent until the first durable scoped grant.
+        pass
 
 
 # --- Config persistence for permanent allowlist ---------------------------------------------------------------------
@@ -855,7 +926,10 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         # Durable Discord approvals release the worker instead of timing out
         # while the owner is away; other tools/adapters keep the existing flow.
         from tools.durable_execution_approval import maybe_defer_execution
-        deferred = maybe_defer_execution(command, description)
+        deferred = maybe_defer_execution(
+            command, description, warnings=warnings,
+            allow_session=not smart_denied, allow_permanent=allow_permanent,
+        )
         if deferred is not None:
             return deferred
         # Redacted copies for user-visible rendering only (the gateway paints them into Discord/Slack); the raw

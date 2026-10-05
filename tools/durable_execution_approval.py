@@ -29,6 +29,38 @@ def _digest(value):
                                      ensure_ascii=False, default=str).encode()).hexdigest()
 
 
+def _execution_digest(operation):
+    # Guard policy is private approval metadata, not part of the operation the
+    # terminal/code entry point reconstructs when the reviewed call is replayed.
+    return _digest({key: value for key, value in operation.items() if key != "approval_scope"})
+
+
+def _approval_scope(operation):
+    scope = operation.get("approval_scope")
+    if scope is None:
+        return {"warnings": [], "allow_session": False, "allow_permanent": False}
+    if (not isinstance(scope, dict) or type(scope.get("allow_session")) is not bool
+            or type(scope.get("allow_permanent")) is not bool
+            or not isinstance(scope.get("warnings"), list)):
+        raise ValueError("invalid approval scope")
+    for warning in scope["warnings"]:
+        if (not isinstance(warning, (list, tuple)) or len(warning) != 3
+                or type(warning[0]) is not str or not warning[0]
+                or warning[1] is not None and type(warning[1]) is not str
+                or type(warning[2]) is not bool):
+            raise ValueError("invalid approval warning")
+    if ((scope["allow_session"] or scope["allow_permanent"]) and not scope["warnings"]
+            or scope["allow_permanent"] and (not scope["allow_session"]
+                                               or all(warning[2] for warning in scope["warnings"]))):
+        raise ValueError("unsupported approval scope")
+    return scope
+
+
+def _allowed_choices(operation):
+    scope = _approval_scope(operation)
+    return ("approve",) + (("session",) if scope["allow_session"] else ()) + (("always",) if scope["allow_permanent"] else ())
+
+
 def _session_values():
     from gateway.session_context import get_session_env
     names = {name: "HERMES_SESSION_" + name.upper() for name in _SESSION_FIELDS}
@@ -102,7 +134,7 @@ def durable_execution_active():
 def execution_context_matches_consent():
     operation, consent = _operation.get(), _consent.get()
     return (consent is None or operation is None or consent["action_type"] != operation["action_type"]
-            or _digest(operation) == consent["operation_digest"])
+            or _execution_digest(operation) == consent["operation_digest"])
 
 
 def defer_prepared_execution(prepared, review_command, description, *, required=False):
@@ -135,14 +167,24 @@ def defer_prepared_execution(prepared, review_command, description, *, required=
             return _blocked("Invalid durable execution approval lifetime; the command was not run.")
         review = redact_sensitive_text(review_command, force=True)
         reason = redact_sensitive_text(description, force=True)
-        body = f"{reason}\n\n```\n{review}\n```\n\nApprove runs this exact operation once. Reject leaves it unexecuted."
+        if prepared.action_type in _ACTION_TYPES:
+            from gateway.durable_actions import decode_durable_action_payload
+            choices = _allowed_choices(decode_durable_action_payload(prepared.payload_json))
+            labels = {"approve": "Allow Once", "session": "Allow Session", "always": "Always Allow"}
+            options = tuple(DurableRequestOption(choice, labels[choice]) for choice in choices)
+            options += (DurableRequestOption("reject", "Deny"),)
+        else:
+            options = (DurableRequestOption("approve", "Approve Once"), DurableRequestOption("reject", "Deny"))
+        body = f"**Requested command:**\n```\n{review}\n```\n\n**Why it was flagged:** {reason}"
+        if prepared.action_type == "host.sudo":
+            import socket
+            body = f"**Host:** {socket.gethostname()}\n\n" + body
         result = get_durable_request_store().create_with_action(
             DurableRequestSpec(
                 kind="tool.durable_approval." + prepared.action_type,
-                title="Run privileged host command?" if prepared.action_type == "host.sudo" else "Run this operation?",
+                title="HOST SUDO — elevated privileges" if prepared.action_type == "host.sudo" else "Hermes wants to run a command that needs your OK",
                 body=body,
-                options=(DurableRequestOption("approve", "Approve once"),
-                         DurableRequestOption("reject", "Reject")),
+                options=options,
                 ttl_seconds=min(ttl, config.max_ttl_seconds),
                 reference="durable-execution:" + prepared.idempotency_key,
             ),
@@ -164,7 +206,7 @@ def defer_prepared_execution(prepared, review_command, description, *, required=
         return _blocked("Cannot stage durable execution approval; the command was not run.")
 
 
-def maybe_defer_execution(command, description):
+def maybe_defer_execution(command, description, *, warnings=None, allow_session=False, allow_permanent=False):
     """Used only when the existing approval gate has decided to ask a human."""
     operation = _operation.get()
     if operation is None:
@@ -173,7 +215,7 @@ def maybe_defer_execution(command, description):
     if consent is not None and consent["action_type"] == operation["action_type"]:
         # Several guard findings may ask about the same command. Consent is
         # scoped to one exact execution, rather than the first guard finding.
-        if _digest(operation) != consent["operation_digest"]:
+        if _execution_digest(operation) != consent["operation_digest"]:
             return {"approved": False, "status": "invalidated",
                     "message": "The reviewed execution context changed; the operation was not run."}
         return {"approved": True, "user_approved": True}
@@ -183,6 +225,13 @@ def maybe_defer_execution(command, description):
     try:
         if _policy_for(operation["action_type"]) is None:
             return None
+        operation = dict(operation)
+        if warnings is not None:
+            operation["approval_scope"] = {
+                "warnings": [list(warning) for warning in warnings],
+                "allow_session": allow_session, "allow_permanent": allow_permanent,
+            }
+        _approval_scope(operation)
         prepared = prepare_durable_execution(operation)
         return defer_prepared_execution(prepared, command, description)
     except (ValueError, TypeError):
@@ -211,7 +260,7 @@ def execute_durable_execution(context):
             return DurableActionOutcome(DurableActionStatus.INVALIDATED, reason="origin_unavailable")
         tokens = set_session_vars(**payload["session_env"])
         session_token = set_current_session_key(payload["session_env"]["session_key"])
-        proof = _consent.set({"operation_digest": _digest(payload), "action_type": context.action_type})
+        proof = _consent.set({"operation_digest": _execution_digest(payload), "action_type": context.action_type})
         try:
             if context.action_type == "terminal.execute":
                 from tools.terminal_tool import terminal_tool
@@ -228,6 +277,8 @@ def execute_durable_execution(context):
             for token in reversed(tokens):
                 token.var.reset(token)
         parsed = json.loads(result)
+        if parsed.get("status") not in {"invalidated", "blocked", "approval_pending", "pending_approval", "disabled"}:
+            _persist_reviewed_scope(context, payload)
         output = {"tool": "terminal" if context.action_type == "terminal.execute" else "execute_code",
                   "output": redact_sensitive_text(str(parsed.get("output", parsed.get("error", ""))), force=True),
                   "status": str(parsed.get("status", "completed")), "exit_code": parsed.get("exit_code")}
@@ -250,13 +301,13 @@ def execute_durable_execution(context):
         return DurableActionOutcome(DurableActionStatus.UNKNOWN, reason="execution_exception")
 
 
-def approved_action_is_executing(context):
+def approved_action_is_executing(context, *, allowed_options=("approve",)):
     """Require the persisted human decision and the exact claimed action."""
     from gateway.durable_requests import get_durable_request_store, DurableRequestStatus
     store = get_durable_request_store()
     request = store.get(request_id=context.request_id)
     if (request is None or request.status is not DurableRequestStatus.SELECTED
-            or request.selected_option_id != "approve"):
+            or request.selected_option_id not in allowed_options):
         return False
     import sqlite3
     with sqlite3.connect(store.db_path) as conn:
@@ -266,10 +317,29 @@ def approved_action_is_executing(context):
                    context.action_version, context.idempotency_key)
 
 
+def _persist_reviewed_scope(context, payload):
+    from gateway.durable_requests import get_durable_request_store
+    from tools.approval import _persist_choice
+    request = get_durable_request_store().get(request_id=context.request_id)
+    choice = request.selected_option_id
+    if choice not in {"session", "always"}:
+        return
+    if not _origin_is_current(context, payload):
+        # A long-running command can finish after /new. Its reviewed result may
+        # be reported, but it must not grant permissions to the replacement.
+        return
+    if not approved_action_is_executing(context, allowed_options=_allowed_choices(payload)):
+        raise ValueError("scope persistence requires its executing human decision")
+    _persist_choice(
+        payload["session_env"]["session_key"], choice, _approval_scope(payload)["warnings"],
+        session_identity=payload["session_env"], durable_request_id=context.request_id,
+    )
+
+
 def _origin_is_current(context, payload):
     from gateway.durable_requests import get_durable_request_store
     from hermes_state import SessionDB
-    if not approved_action_is_executing(context):
+    if not approved_action_is_executing(context, allowed_options=_allowed_choices(payload)):
         return False
     request = get_durable_request_store().get(request_id=context.request_id)
     session_env = payload["session_env"]

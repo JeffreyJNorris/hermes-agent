@@ -71,6 +71,12 @@ _OPTION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
 _COMPONENT_ID_PREFIX = "dr"
 
 
+def _supports_execution_approval_scopes(action_type: str, kind: str) -> bool:
+    """Scope choices belong only to the native terminal/code approval path."""
+    return (action_type in {"terminal.execute", "execute_code.execute"}
+            and kind == "tool.durable_approval." + action_type)
+
+
 class DurableRequestStatus(str, Enum):
     PENDING_DELIVERY = "pending_delivery"
     OPEN = "open"
@@ -791,12 +797,14 @@ class DurableRequestStore:
             terminal_retention_seconds=terminal_retention_seconds,
             retain_origin=True,
         )
-        if values.spec.selection_mode != "single" or tuple(option.id for option in values.spec.options) != (
-            "approve",
-            "reject",
-        ):
+        choices = tuple(option.id for option in values.spec.options)
+        allowed_choices = {("approve", "reject")}
+        if _supports_execution_approval_scopes(action.action_type, values.spec.kind):
+            allowed_choices.update({("approve", "session", "reject"),
+                                    ("approve", "session", "always", "reject")})
+        if values.spec.selection_mode != "single" or choices not in allowed_choices:
             raise DurableRequestError(
-                "action approvals require exactly approve and reject options"
+                "action approvals require approve and reject options; scoped choices are limited to native tool executions"
             )
 
         now = float(self._wall_clock())
@@ -2303,11 +2311,20 @@ class DurableRequestStore:
         selected_option_id: str | None = None,
     ) -> None:
         if request_status is DurableRequestStatus.SELECTED:
+            ticket = conn.execute(
+                """SELECT a.action_type, r.kind FROM durable_action_tickets a
+                   JOIN durable_requests r ON r.request_id=a.request_id
+                   WHERE a.request_id=?""", (request_id,),
+            ).fetchone()
+            scoped_approval = (selected_option_id in {"session", "always"}
+                               and ticket is not None
+                               and _supports_execution_approval_scopes(ticket[0], ticket[1]))
             action_status, reason = {
                 "approve": (DurableActionStatus.READY, None),
                 "reject": (DurableActionStatus.DECLINED, "rejected"),
             }.get(
                 selected_option_id,
+                (DurableActionStatus.READY, None) if scoped_approval else
                 (DurableActionStatus.ABANDONED, "invalid_decision"),
             )
         else:
