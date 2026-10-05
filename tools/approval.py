@@ -849,7 +849,15 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
 
     # Gateway/async approval: block the agent thread until /approve or /deny, mirroring the CLI's synchronous input()
     # flow. The agent never sees "approval_required" here — it gets output or a definitive BLOCKED.
-    if is_gateway or is_ask:
+    from tools.durable_execution_approval import durable_execution_active
+    if is_gateway or is_ask or durable_execution_active():
+        # Terminal/code bind private exact arguments before reaching this gate.
+        # Durable Discord approvals release the worker instead of timing out
+        # while the owner is away; other tools/adapters keep the existing flow.
+        from tools.durable_execution_approval import maybe_defer_execution
+        deferred = maybe_defer_execution(command, description)
+        if deferred is not None:
+            return deferred
         # Redacted copies for user-visible rendering only (the gateway paints them into Discord/Slack); the raw
         # command still executes after approval and persistence keys off pattern_key.
         display_command = redact_sensitive_text(command)

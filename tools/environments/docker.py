@@ -1043,6 +1043,11 @@ class DockerEnvironment(BaseEnvironment):
         """Execute a command; if the container was removed out-of-band (idle reaper,
         docker prune, OOM, daemon restart) recreate it and retry once."""
         result = super().execute(command, cwd, **kwargs)
+        from tools.durable_execution_approval import durable_execution_active
+        if durable_execution_active():
+            # An approved execution is pinned to this container. Recovery
+            # must not move it to a fresh container or replay an ambiguous run.
+            return result
         if (
             result.get("returncode", 0) != 0
             and self._is_container_gone(result.get("output", ""))

@@ -765,8 +765,14 @@ def execute_code(
     # the session context. A Docker sandbox with host bind mounts gets no container fast-path.
     # See #30882.
     from tools.approval import check_execute_code_guard
-    _guard = check_execute_code_guard(code, env_type, has_host_access=_docker_has_host_access(_env_config))
+    from tools.durable_execution_approval import durable_execution_context, capture_code_execution_state
+    execution_args = dict(code=code, task_id=task_id, enabled_tools=enabled_tools, reset=reset)
+    with durable_execution_context("execute_code.execute", execution_args,
+                                   execution_state=capture_code_execution_state(execution_args)):
+        _guard = check_execute_code_guard(code, env_type, has_host_access=_docker_has_host_access(_env_config))
     if not _guard.get("approved", False):
+        if _guard.get("status") in {"approval_pending", "invalidated"}:
+            return json.dumps({key: value for key, value in _guard.items() if key != "approved"})
         return _error_result(_guard.get("message") or "execute_code blocked by approval guard.",
                              user_summary=_guard.get("user_summary"))
     # Clear a stale interrupt bit that landed during the blocking approval-wait so it can't

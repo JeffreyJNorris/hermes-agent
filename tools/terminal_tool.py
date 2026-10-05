@@ -1001,6 +1001,8 @@ def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *,
         return _ApprovalVerdict(approved_run=True)
     approval = _check_all_guards(command, env_type, has_host_access=_docker_has_host_access(config))
     if not approval["approved"]:
+        if approval.get("status") in {"approval_pending", "invalidated"}:
+            raise _Rejected(json.dumps({key: value for key, value in approval.items() if key != "approved"}))
         if approval.get("status") == "pending_approval":  # gateway ask mode
             raise _Rejected(_error_json(
                 "", status="pending_approval",
@@ -1221,7 +1223,11 @@ def _run_foreground(
     workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize."""
-    max_retries = 3
+    from tools.durable_execution_approval import durable_execution_active
+    # A transport error may follow command submission. An approved durable
+    # operation must never retry that ambiguous dispatch behind the ticket.
+    durable = durable_execution_active()
+    max_retries = 0 if durable else 3
     env_type, eff, effective_timeout = plan.env_type, plan.effective_task_id, plan.effective_timeout
 
     # Clean interrupt slate for an approved command, ONCE before the retry
@@ -1250,6 +1256,9 @@ def _run_foreground(
             )
             break
         except Exception as e:
+            if durable:
+                return _error_json("The backend did not confirm the execution outcome. "
+                                   "The command may have run; it was not retried.", status="unknown")
             if "timeout" in str(e).lower():
                 return _error_json(f"Command timed out after {effective_timeout} seconds", exit_code=124)
             # Retry on transient errors
@@ -1375,6 +1384,23 @@ def terminal_tool(
     children (kept in a separate env cache from the configured backend).
     """
     try:
+        # This request-only prefix is a host operation, independent of the
+        # sandbox backend. Privileged commands always require an exact durable
+        # approval; shell/session allowlists cannot authorize them.
+        if isinstance(command, str) and not _host_local:
+            from tools.host_sudo import parse_host_sudo_command, prepare_host_sudo
+            from tools.durable_execution_approval import defer_prepared_execution
+            try:
+                host_argv = parse_host_sudo_command(command)
+                if host_argv is not None:
+                    import shlex
+                    host_timeout = timeout if timeout is not None else 180
+                    prepared = prepare_host_sudo(host_argv, host_timeout)
+                    return json.dumps(defer_prepared_execution(
+                        prepared, shlex.join(host_argv), "Run this exact command as root on the host.", required=True,
+                    ))
+            except ValueError as exc:
+                return _error_json(str(exc), status="blocked")
         plan = _plan_execution(
             command, task_id=task_id, timeout=timeout, background=background, _host_local=_host_local,
         )
@@ -1421,7 +1447,24 @@ def terminal_tool(
             ))
         # Pre-exec security checks (tirith + dangerous command detection);
         # force=True means the user already confirmed.
-        verdict = _run_approval_guards(command, env_type, plan.config, force=force)
+        from tools.durable_execution_approval import (
+            durable_execution_context, capture_terminal_execution_state, execution_context_matches_consent,
+        )
+        reviewed_cwd = _resolve_command_cwd(
+            workdir=workdir, default_cwd=cwd, session_key=session_key, env_type=env_type,
+            mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd, env=env,
+        )
+        execution_args = dict(
+            command=command, background=background, timeout=plan.effective_timeout,
+            task_id=task_id, session_id=session_id, workdir=reviewed_cwd, pty=pty,
+            notify_on_complete=notify_on_complete, watch_patterns=watch_patterns,
+            heartbeat=heartbeat, persist_on_release=persist_on_release,
+        )
+        with durable_execution_context("terminal.execute", execution_args,
+                                       execution_state=capture_terminal_execution_state(env, env_type)):
+            if not execution_context_matches_consent():
+                return _error_json("The reviewed execution context changed; the command was not run.", status="invalidated")
+            verdict = _run_approval_guards(command, env_type, plan.config, force=force)
 
         pty_disabled = pty and _command_requires_pipe_stdin(command)
         if plan.promoted_from_foreground_timeout is not None:
