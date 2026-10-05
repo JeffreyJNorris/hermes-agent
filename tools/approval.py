@@ -938,12 +938,14 @@ def _presence(approval_callback=None) -> tuple:
     HERMES_INTERACTIVE=1 for sudo prompts, and a gateway sets HERMES_EXEC_ASK=1 at startup and
     passes its environ to every external cron worker (#110932) — in neither can a human answer
     the card, so the gate must resolve from ``approvals.<ctx>_mode`` instead of parking on a
-    pending approval. Unattended *platforms* keep ``is_ask``: api_server relies on it for the
-    ``/v1/runs`` approval bridge (``approval.request`` → ``POST /v1/runs/{id}/approval``)."""
+    pending approval. Webhook platforms likewise have no approval reply surface. Only
+    api_server preserves ``is_ask`` among unattended platforms: it relies on the ``/v1/runs``
+    approval bridge (``approval.request`` → ``POST /v1/runs/{id}/approval``)."""
     approval_callback = _resolve_cli_approval_callback(approval_callback)
     is_cli, is_gateway = _is_interactive_cli(), _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
-    if _is_single_query_approval_context() or _is_cron_approval_context():
+    if (_is_single_query_approval_context() or _is_cron_approval_context()
+            or (_is_unattended_platform_approval_context() and _get_session_platform() != "api_server")):
         is_cli = is_gateway = is_ask = False
     return approval_callback, is_cli, is_gateway, is_ask
 
