@@ -1,6 +1,6 @@
 # Local Discord brief cards
 
-The email and security brief presentation integration lives in the standalone repository `/home/jeff/projects/hermes-discord-cards`, on local `main` at `9c88f479456a54d7638305173c7e5c6b682197bd`. Its code, regression tests and non-secret deployment snapshots are versioned there. It is installed as `~/.hermes/plugins/discord-cards`; it does not vendor the integration into Hermes core or add a model tool.
+The email and security brief presentation integration lives in the standalone repository `/home/jeff/projects/hermes-discord-cards`, on local `main` at `51398f42fcf01ed08ccef06ec747ec5802a64214`. Its code, regression tests and non-secret deployment snapshots are versioned there. It is installed as `~/.hermes/plugins/discord-cards`; it does not vendor the integration into Hermes core or add a model tool.
 
 The plugin registers the delivery-only `discord-card` platform against existing native plugin APIs. It uses the existing Discord bot credential, validates Components V2, verifies message readback and records private per-channel delivery receipts. Email and security renderers produce cards and equivalent Obsidian Markdown from structured input. Security reports preserve narrative and can continue in numbered messages. Stable delivery keys update the same date's messages, with pending-send reconciliation and verified removal of obsolete generated parts.
 
